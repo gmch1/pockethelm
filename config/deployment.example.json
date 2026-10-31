@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 2,
+  "adminSsh": "root@jump.example.invalid",
+  "remoteBase": "/root/.local/share/codex-remote",
+  "deviceUser": "pockethelm",
+  "targetAlias": "development-host",
+  "targetHelper": "/home/developer/.local/share/codex-remote/server.py",
+  "proxyPath": "/home/developer/.local/bin/codex-remote-proxy",
+  "codexBinary": "/home/developer/.codex/packages/app-server-daemon/current/bin/codex",
+  "profile": {
+    "name": "My development environment",
+    "environmentId": "development",
+    "configVersion": 2,
+    "useJump": true,
+    "jumpHost": "jump.example.invalid",
+    "jumpPort": 22,
+    "jumpUser": "pockethelm",
+    "host": "127.0.0.1",
+    "port": 22000,
+    "user": "developer",
+    "root": "/home/developer/projects",
+    "binary": "codex",
+    "socket": "",
+    "useDeviceKey": true
+  }
+}

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests and source export
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install pairing dependencies
+        run: python -m pip install -r scripts/pairing/requirements.txt
+      - name: Test pairing
+        run: python -m unittest discover -s scripts/pairing -p 'test_*.py' -v
+      - name: Test ZCode bridge
+        run: python -m unittest discover -s scripts/zcode -p 'test_*.py' -v
+      - name: Validate source export
+        run: python scripts/export_source.py --out "$RUNNER_TEMP/pockethelm-source.tar.gz"
+
+  android:
+    name: Android build, unit tests and lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK packages
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"'
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Build and verify
+        run: ./gradlew --no-daemon --stacktrace --max-workers=2 :app:testDebugUnitTest :app:lintRelease :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Upload test and lint reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-reports
+          path: |
+            android/app/build/reports/
+            android/app/build/test-results/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 7

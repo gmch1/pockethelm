@@ -1,0 +1,24 @@
+node_modules/
+.DS_Store
+*.log
+local.properties
+.gradle/
+.kotlin/
+build/
+__pycache__/
+*.pyc
+artifacts/*.apk
+.pairing-venv/
+# Personal deployments, keys, real-device artifacts and local signing inputs.
+artifacts/
+.local/
+*.keystore
+*.jks
+*.pem
+*.key
+.env
+.env.*
+!*.example.*
+config/deployment.json
+config/signing.properties
+security_best_practices_report.md
