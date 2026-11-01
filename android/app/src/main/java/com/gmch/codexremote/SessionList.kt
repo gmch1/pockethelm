@@ -48,11 +48,15 @@ internal fun CompactSessionRow(title: String, status: String, updatedAt: Long,
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text(title, fontSize = 14.sp, lineHeight = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(status, fontSize = 10.sp, lineHeight = 14.sp, color = when (status) {
-                    "失败" -> MaterialTheme.colorScheme.error
-                    "执行中" -> MaterialTheme.colorScheme.primary
-                    else -> MaterialTheme.colorScheme.onSurfaceVariant
-                }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (status.isNotBlank()) Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    if (status == "执行中") androidx.compose.material3.CircularProgressIndicator(Modifier.size(9.dp), strokeWidth = 1.dp)
+                    Text(status, fontSize = 10.sp, lineHeight = 14.sp, color = when (status) {
+                        "失败" -> MaterialTheme.colorScheme.error
+                        "执行中" -> MaterialTheme.colorScheme.primary
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
             }
             Text(relativeActivityTime(updatedAt), fontSize = 11.sp, lineHeight = 16.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

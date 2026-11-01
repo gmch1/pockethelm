@@ -10,11 +10,13 @@ import json
 import math
 from pathlib import Path
 import re
+import signal
 import sys
 import time
 import uuid
 import zlib
 from wire import Client, WireError, MAX_FRAME
+from session_index import SessionIndexes
 
 MAX_LINE = 256 * 1024
 
@@ -117,6 +119,8 @@ class Bridge:
         self.target = None
         self.subscription = None
         self.listener = None
+        self.indexes = SessionIndexes(self, Assembler)
+        self.client.event_handler = self.indexes.event
 
     def call(self, channel, method, *args):
         return self.client.call(channel, method, list(args))
@@ -211,10 +215,12 @@ class Bridge:
 
     def projects(self):
         tree = self.call('project', 'readTree')
-        return {'projects': [{'id': p['id'], 'name': p['name'], 'roots': [r['rootPath'] for r in p['roots']]}
+        result = {'projects': [{'id': p['id'], 'name': p['name'], 'roots': [r['rootPath'] for r in p['roots']]}
             for p in tree['projects'] if not p.get('deleted')],
             'sessions': [pick(t, ['taskId', 'title', 'workspacePath', 'workspaceIdentity', 'projectId', 'updatedAt', 'status'])
             for t in tree['tasks'] if not t.get('archived')]}
+        self.indexes.set_sessions(result['sessions'])
+        return result
 
     def snapshot(self, params):
         target = self.session_target(params)
@@ -284,8 +290,12 @@ class Bridge:
             self.call('zcode-agent', 'initializeConversationV4', {'kind': 'clientHello', 'protocolVersion': 3,
                 'clientId': client_id, 'clientKind': 'mobileApp', 'appVersion': 'pockethelm-zcode-experimental'})
             self.client_id = client_id
-            return {'engine': 'zcode', 'bridgeVersion': 1, 'permission': 'Full access', 'protocolVersion': 3}
+            return {'engine': 'zcode', 'bridgeVersion': 1, 'permission': 'Full access', 'protocolVersion': 3, 'sessionsIndex': True}
         require(self.client_id is not None, '请先初始化连接')
+        if method == 'sessions/status':
+            return self.indexes.read()
+        if method == 'sessions/pause':
+            return self.indexes.pause()
         if method == 'catalog':
             return self.catalog()
         if method == 'projects':
@@ -354,6 +364,7 @@ class Bridge:
 
 def main():
     client = None
+    bridge = None
     try:
         client = Client()
         bridge = Bridge(client)
@@ -388,9 +399,17 @@ def main():
     except Exception:
         print('PocketHelm: ZCode bridge unavailable; check local ZCode Server.', file=sys.stderr)
     finally:
+        # SSH EOF / normal termination releases native subscriptions explicitly.
+        if bridge:
+            try:
+                bridge.indexes.pause()
+            except Exception:
+                pass
         if client:
             client.close()
 
 
 if __name__ == '__main__':
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, lambda *_: sys.exit(0))
     main()

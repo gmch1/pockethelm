@@ -27,7 +27,7 @@ def install(config):
     root = Path.home() / '.local/share/pockethelm/zcode'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
-    for name in ('bridge.py', 'wire.py'):
+    for name in ('bridge.py', 'wire.py', 'session_index.py'):
         atomic(root / name, (Path(__file__).parent / name).read_text(), 0o600)
     atomic(Path(config['proxyPath']), dispatcher(config['codexBinary'], root / 'bridge.py'), 0o700)
     print('ZCode bridge installed; existing Codex route preserved.')

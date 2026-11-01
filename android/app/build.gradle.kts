@@ -12,8 +12,8 @@ android {
         applicationId = "com.gmch.codexremote"
         minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.4.3"
+        versionCode = 17
+        versionName = "0.4.7"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     signingConfigs {

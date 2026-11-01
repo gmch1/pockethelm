@@ -84,6 +84,7 @@ class Client:
         self.serial = 0
         self.buffer = b''
         self.events = []
+        self.event_handler = None
         self.deadline = time.monotonic() + 20
         try:
             token = (Path.home() / '.zcode/server/run/ingress-token').read_text().strip()
@@ -198,6 +199,8 @@ class Client:
                 return body
 
     def event(self, header, body):
+        if self.event_handler and self.event_handler(header[1], body):
+            return
         self.events.append((header[1], body))
         if len(self.events) > 1024:
             raise WireError('Event backlog exceeded')
@@ -213,7 +216,7 @@ class Client:
         self.deadline = time.monotonic() + 20
         payload = encode([103, identity]) + b'\x00'
         self.frame(struct.pack('!BIII', 1, 0, 0, len(payload)) + payload)
-        self.events.clear()
+        self.events[:] = [(listener, body) for listener, body in self.events if listener != identity]
 
     def close(self):
         if self.process is not None:

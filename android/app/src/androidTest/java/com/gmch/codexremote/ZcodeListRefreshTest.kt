@@ -52,7 +52,7 @@ class ZcodeListRefreshTest {
         setup(); refreshTo("running")
         state.value = state.value.copy(phase = "running")
         instrumentation.runOnMainSync { vm.back() }
-        await { it.selected == null && it.sessionsFresh && !it.busy }
+        await { it.selected == null && it.sessionsFresh && it.sessions.firstOrNull()?.status == "running" }
         assertEquals(listOf("a", "b"), state.value.sessions.map { it.id })
         assertEquals("running", state.value.sessions.first().status)
     }
@@ -61,7 +61,7 @@ class ZcodeListRefreshTest {
         setup("running"); refreshTo("completed")
         state.value = state.value.copy(phase = "completedSuccess")
         instrumentation.runOnMainSync { vm.back() }
-        await { it.sessionsFresh && it.selected == null && !it.busy }
+        await { it.sessionsFresh && it.selected == null && it.sessions.firstOrNull()?.status == "completed" }
         assertEquals("completed", state.value.sessions.first().status)
     }
 

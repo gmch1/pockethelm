@@ -74,8 +74,7 @@ internal fun ZcodeDirectoryPicker(state: ZcodeBrowserState, vm: ZcodeViewModel) 
                                 verticalAlignment = Alignment.CenterVertically) {
                                 TextButton({ vm.browseBrowser(state.parent) },
                                     enabled = canNavigate && state.hasParent) { Text("返回上级") }
-                                FilterChip(state.showHidden, { vm.browserShowHidden(!state.showHidden) },
-                                    enabled = !state.adding, label = { Text("隐藏目录") })
+                                SelectionChip(state.showHidden, { vm.browserShowHidden(!state.showHidden) }, "隐藏目录", enabled = !state.adding)
                             }
                             OutlinedTextField(state.filter, vm::browserFilter, Modifier.fillMaxWidth(),
                                 singleLine = true, placeholder = { Text("按名称筛选") })

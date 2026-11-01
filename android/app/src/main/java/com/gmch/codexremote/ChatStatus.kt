@@ -43,7 +43,7 @@ fun codexAgentRun(connected: Boolean, runtime: String): AgentRun = when {
 fun zcodeAgentRun(connected: Boolean, phase: String, interactionCount: Int = 0): AgentRun = when {
     !connected -> AgentRun.Offline
     interactionCount > 0 -> AgentRun.WaitingInteraction
-    phase == "running" -> AgentRun.Running
+    phase in setOf("running", "prewarming") -> AgentRun.Running
     phase == "waiting" -> AgentRun.Waiting
     else -> AgentRun.Idle
 }
@@ -76,9 +76,8 @@ private val transientReceiptNotices = setOf(
  * unknown (including blank) returns empty for the UI to fall back to its placeholder.
  */
 fun zcodeSessionStatusLabel(status: String): String = when (status.trim().lowercase()) {
-    "running", "active", "inprogress", "executing" -> "执行中"
+    "running", "prewarming", "active", "inprogress", "executing" -> "执行中"
     "waiting", "pending" -> "等待中"
-    "prewarming" -> "准备中"
     "completed", "completedsuccess", "done", "success", "finished" -> "已完成"
     "completedinterrupted", "interrupted", "cancelled", "canceled", "stopped" -> "已中断"
     "error", "failed" -> "失败"

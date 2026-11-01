@@ -25,18 +25,24 @@ class Vault(context: Context) : SecretReader {
     }
     @Synchronized fun put(name: String, value: String?) {
         if (value == null) { check(prefs.edit().remove(name).commit()); return }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key); updateAAD(name.toByteArray()) }
-        val bytes = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+        val bytes = encrypt(name, value.toByteArray(Charsets.UTF_8))
         check(prefs.edit().putString(name, Base64.encodeToString(bytes, Base64.NO_WRAP)).commit()) { "无法保存本地数据" }
+    }
+    @Synchronized internal fun encrypt(name: String, value: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key); updateAAD(name.toByteArray()) }
+        return cipher.iv + cipher.doFinal(value)
     }
     @Synchronized override fun get(name: String): String? {
         val encoded = prefs.getString(name, null) ?: return null
-        val bytes = Base64.decode(encoded, Base64.NO_WRAP)
+        return decrypt(name, Base64.decode(encoded, Base64.NO_WRAP)).toString(Charsets.UTF_8)
+    }
+    @Synchronized internal fun decrypt(name: String, bytes: ByteArray): ByteArray {
+        require(bytes.size >= 28)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
             init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
             updateAAD(name.toByteArray())
         }
-        return cipher.doFinal(bytes.copyOfRange(12, bytes.size)).toString(Charsets.UTF_8)
+        return cipher.doFinal(bytes.copyOfRange(12, bytes.size))
     }
 }
 

@@ -27,31 +27,18 @@ fun ExecutionControls(state: UiState, vm: RemoteViewModel) {
     val settings = state.modelSettings
     val model = state.models.firstOrNull { it.id == settings?.model }
     fun settingsPanel() { showSettings = true; vm.prepareModelSettings(id) }
-    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-        TextButton(::settingsPanel, contentPadding = PaddingValues(horizontal = 6.dp), modifier = Modifier.height(36.dp)) {
-            Text((model?.name ?: settings?.model?.ifBlank { null } ?: "模型").take(24) + " ▾", fontSize = 11.sp, maxLines = 1)
-        }
-        TextButton(::settingsPanel, contentPadding = PaddingValues(horizontal = 6.dp), modifier = Modifier.height(36.dp)) {
-            Text("思考：${effortLabel(settings?.effort)} ▾", fontSize = 11.sp)
-        }
-        TextButton(::settingsPanel, contentPadding = PaddingValues(horizontal = 6.dp), modifier = Modifier.height(36.dp)) {
-            Text(when {
-                settings?.confirmed != true -> "速度待同步"
-                settings.tier == "default" -> "标准 ▾"
-                else -> (model?.speeds?.firstOrNull { it.id == settings.tier }?.name ?: settings.tier) + " ▾"
-            }, fontSize = 11.sp)
-        }
-        TextButton({ showQuota = true; vm.refreshQuota() }, contentPadding = PaddingValues(horizontal = 6.dp), modifier = Modifier.height(36.dp)) {
-            Text(when {
-                !state.connected && state.quota != null -> "额度 · 离线"
-                state.quotaError != null -> "额度 · 待刷新"
-                state.quota?.blocked == true -> "额度受限"
-                state.quota?.remaining != null -> "额度 ${percent(state.quota.remaining!!)}"
-                state.quotaLoading -> "额度加载中"
-                else -> "额度 ▾"
-            }, fontSize = 11.sp)
-        }
-    }
+    ChatSettingsBar(
+        summary = listOf(model?.name ?: settings?.model?.ifBlank { null } ?: "模型", effortLabel(settings?.effort),
+            when { settings?.confirmed != true -> "速度待同步"; settings.tier == "default" -> "标准"
+                else -> model?.speeds?.firstOrNull { it.id == settings.tier }?.name ?: settings.tier }).joinToString(" · "),
+        quota = when {
+            !state.connected && state.quota != null -> "额度 · 离线"
+            state.quotaError != null -> "额度 · 待刷新"
+            state.quota?.blocked == true -> "额度受限"
+            state.quota?.remaining != null -> "额度 ${percent(state.quota.remaining!!)}"
+            state.quotaLoading -> "额度加载中"
+            else -> "额度 ▾"
+        }, settings = ::settingsPanel, showQuota = { showQuota = true; vm.refreshQuota() })
     if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.fillMaxWidth().heightIn(max = 600.dp).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("模型与速度", style = MaterialTheme.typography.titleLarge)
@@ -129,13 +116,13 @@ private fun SettingsEditor(id: String, current: ModelSettings, models: List<Mode
     }
     Text("思考深度", style = MaterialTheme.typography.titleSmall)
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        option?.efforts?.forEach { effort -> FilterChip(effective.effort == effort, { draft = draft.copy(effort = effort) }, enabled = enabled, label = { Text(effortLabel(effort)) }) }
+        option?.efforts?.forEach { effort -> SelectionChip(effective.effort == effort, { draft = draft.copy(effort = effort) }, effortLabel(effort), enabled) }
     }
     if (effective.effort == "ultra") Text("Ultra 包含自动任务委派能力。", fontSize = 12.sp)
     Text("执行速度", style = MaterialTheme.typography.titleSmall)
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        FilterChip(draft.tier == "default", { draft = draft.copy(tier = "default") }, enabled = enabled, label = { Text("标准") })
-        option?.speeds?.forEach { speed -> FilterChip(draft.tier == speed.id, { draft = draft.copy(tier = speed.id) }, enabled = enabled, label = { Text(speed.name) }) }
+        SelectionChip(draft.tier == "default", { draft = draft.copy(tier = "default") }, "标准", enabled)
+        option?.speeds?.forEach { speed -> SelectionChip(draft.tier == speed.id, { draft = draft.copy(tier = speed.id) }, speed.name, enabled) }
     }
     Text("加速档会增加额度消耗，具体支持情况以开发机和账号为准。", fontSize = 12.sp)
     Button({ onSave(effective) }, Modifier.fillMaxWidth(), enabled = enabled && effective != current && option != null && effective.effort in option.efforts &&

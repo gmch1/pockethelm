@@ -10,27 +10,21 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -44,14 +38,12 @@ import com.journeyapps.barcodescanner.ScanOptions
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.first
 
 private val Green = Color(0xff226f50)
 private val Ink = Color(0xff182720)
 private val Paper = Color(0xfffbfcf8)
-private val Muted = Color(0xff778575)
-private val Line = Color(0xffe4e9e2)
+private val Muted = Color(0xff58685e)
+private val Line = Color(0xffd8e2da)
 
 class MainActivity : ComponentActivity() {
     private val model: RemoteViewModel by viewModels()
@@ -60,14 +52,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MaterialTheme(colorScheme = lightColorScheme(primary = Green, onPrimary = Color.White,
-                background = Paper, surface = Paper, onSurface = Ink, onBackground = Ink,
-                primaryContainer = Color(0xffe7f0df), secondaryContainer = Color(0xffeaf1e3), outlineVariant = Line)) {
+            PocketHelmTheme {
                 EngineApp(model, zcode)
             }
         }
     }
-    override fun onStart() { super.onStart(); if (zcode.active) zcode.foreground() else model.foreground() }
+    override fun onStart() { super.onStart(); model.keepConnection(); zcode.keepConnection(); if (model.state.value.engine == "zcode") zcode.enter() else model.foreground() }
     override fun onStop() { model.background(); zcode.background(); super.onStop() }
 }
 
@@ -78,60 +68,26 @@ internal fun RemoteApp(vm: RemoteViewModel) {
     var newThread by remember { mutableStateOf(false) }
     var details by remember { mutableStateOf<Pair<String, String>?>(null) }
     var rename by remember { mutableStateOf(false) }
+    val pages = rememberSaveableStateHolder()
     val chat = state.selected != null && state.tab == 0
-    val compactScreen = LocalConfiguration.current.screenHeightDp < 480
     BackHandler(chat) { vm.back() }
-    Scaffold(containerColor = Paper,
-        topBar = {
-            Column {
-                TopAppBar(windowInsets = WindowInsets(0, 0, 0, 0), expandedHeight = if (compactScreen) 48.dp else 64.dp, title = {
-                    Column {
-                        // Decorative location label: dropped on short screens to give chat room.
-                        if (!compactScreen) Text(if (chat) state.selected!!.project else listOf("WORKSPACE", "ACTIVITY", "ENVIRONMENTS")[state.tab], fontSize = 10.sp, color = Muted, letterSpacing = 2.sp)
-                        Text(if (chat) state.selected!!.title else listOf("会话", "任务中心", "连接")[state.tab],
-                            fontSize = if (chat || compactScreen) 18.sp else 26.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                }, navigationIcon = { if (chat) IconButton(onClick = vm::back) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回会话") } },
-                    actions = {
-                        IconButton(onClick = vm::refresh, enabled = !state.busy) { Icon(Icons.Outlined.Refresh, "刷新") }
-                        if (chat) IconButton(onClick = { rename = true }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Edit, "重命名") }
-                    }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Paper))
-                if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Green)
-            }
-        },
-        bottomBar = {
-            if (!chat && compactScreen) Row(Modifier.fillMaxWidth().navigationBarsPadding(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                listOf("会话", "任务", "连接").forEachIndexed { i, label ->
-                    TextButton({ vm.tab(i) }, Modifier.weight(1f)) {
-                        Text(label, color = if (state.tab == i) Green else Muted)
-                    }
-                }
-            } else if (!chat) NavigationBar(containerColor = Paper) {
-                listOf("会话" to Icons.Outlined.Forum, "任务" to Icons.Outlined.Checklist, "连接" to Icons.Outlined.Dns).forEachIndexed { i, pair ->
-                    NavigationBarItem(state.tab == i, onClick = { vm.tab(i) }, icon = { Icon(pair.second, pair.first) }, label = { Text(pair.first) })
-                }
-            }
-        }
-    ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-            if (state.error != null) {
-                Surface(color = Color(0xfff9ebe5), modifier = Modifier.fillMaxWidth()) {
-                    Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(state.error!!, Modifier.weight(1f), fontSize = 12.sp, maxLines = 5, overflow = TextOverflow.Ellipsis)
-                        IconButton(onClick = { details = "连接与执行信息" to state.error!! }) { Icon(Icons.Outlined.Info, "详细信息") }
-                        IconButton(onClick = vm::dismissError) { Icon(Icons.Outlined.Close, "关闭错误") }
-                    }
-                }
-            }
+    WorkspaceScaffold(
+        title = if (chat) state.selected!!.title else listOf("会话", "任务中心", "连接")[state.tab],
+        subtitle = if (chat) state.selected!!.project else state.profile.name,
+        chat = chat, tab = state.tab, busy = state.busy, back = vm::back, refresh = vm::refresh, selectTab = vm::tab,
+        actions = { if (chat) IconButton({ rename = true }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Edit, "重命名") } }
+    ) {
+        WorkspaceError(state.error, vm::dismissError) { title, text -> details = title to text }
+            pages.SaveableStateProvider("${state.profile.resumeIdentity}:${if (chat) "chat:${state.selected!!.id}" else "tab:${state.tab}"}") {
             when {
                 chat -> key(state.selected!!.id) {
                     ChatScreen(state, vm) { title, text -> details = title to text }
                 }
                 state.tab == 0 -> SessionScreen(state, vm) { newThread = true }
-                state.tab == 1 -> TasksScreen(state, vm)
+                state.tab == 1 -> TasksScreen(state, vm) { newThread = true }
                 else -> ConnectionScreen(state, vm)
             }
-        }
+            }
     }
     if (newThread) NewThreadDialog(state, onClose = { newThread = false }) { cwd, title -> newThread = false; vm.createThread(cwd, title) }
     if (rename) {
@@ -151,6 +107,10 @@ internal fun RemoteApp(vm: RemoteViewModel) {
             }
         }
     }
+}
+
+@Composable
+internal fun HostTrustDialog(state: UiState, vm: RemoteViewModel) {
     state.challenge?.let { challenge ->
         AlertDialog(onDismissRequest = vm::cancelTrust, title = { Text(if (challenge.changed) "主机身份已改变" else "首次连接主机") },
             text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -164,182 +124,29 @@ internal fun RemoteApp(vm: RemoteViewModel) {
 }
 
 @Composable
-private fun ConnectionStrip(state: UiState, vm: RemoteViewModel) {
-    Surface(shape = RoundedCornerShape(12.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Line), color = Color.White,
-        modifier = Modifier.fillMaxWidth().clickable { vm.tab(2) }) {
-        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Outlined.Computer, null, tint = if (state.connected) Green else Muted, modifier = Modifier.size(18.dp))
-            Text(state.profile.name, Modifier.weight(1f).padding(start = 9.dp), fontSize = 12.sp)
-            Text(if (state.connected) "已连接" else "离线 · 缓存", fontSize = 10.sp, color = Muted)
-        }
-    }
-}
-
-@Composable
 private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit) {
-    val compact = LocalConfiguration.current.screenHeightDp < 480
-    var search by rememberSaveable { mutableStateOf("") }
-    var showSearch by rememberSaveable { mutableStateOf(false) }
-    var project by rememberSaveable { mutableStateOf("") }
-    val listState = rememberLazyListState()
-    LaunchedEffect(search, project, compact) { listState.scrollToItem(0) }
-    val projects = state.sessions.map { it.cwd }.distinct()
-    val sessions = state.sessions.filter { (compact || project.isEmpty() || it.cwd == project) && (it.title.contains(search, true) || it.cwd.contains(search, true)) }
-    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
-        if (compact) {
-            Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (showSearch) OutlinedTextField(search, { search = it }, Modifier.weight(1f), placeholder = { Text("搜索会话或项目", fontSize = 13.sp) },
-                    trailingIcon = { IconButton({ showSearch = false; search = "" }) { Icon(Icons.Outlined.Close, "关闭搜索") } },
-                    singleLine = true, shape = RoundedCornerShape(12.dp))
-                else {
-                    IconButton({ showSearch = true }) { Icon(Icons.Outlined.Search, "搜索会话") }
-                    Text("最近会话 · ${sessions.size} 个 · ${if (state.connected) "已连接" else "离线缓存"}", Modifier.weight(1f), fontSize = 12.sp, color = Muted)
-                }
-                Button(onNew, enabled = state.connected && !state.busy) { Text("新建会话") }
-            }
-        } else {
-        ConnectionStrip(state, vm)
-        OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth().padding(top = 12.dp), placeholder = { Text("搜索会话或项目", fontSize = 13.sp) },
-            leadingIcon = { Icon(Icons.Outlined.Search, null) }, singleLine = true, shape = RoundedCornerShape(12.dp))
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            FilterChip(project.isEmpty(), { project = "" }, label = { Text("全部项目") })
-            projects.forEach { path -> FilterChip(project == path, { project = path }, label = { Text(path.trimEnd('/').substringAfterLast('/')) }) }
-        }
-        }
-        if (!compact) Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(if (compact) "最近会话 · ${if (state.connected) "已连接" else "离线缓存"}" else "最近会话", fontSize = 12.sp, color = Muted)
-            Text("${sessions.size} 个 · ${if (state.connected) syncTime(state.lastSync) else "状态待刷新"}", fontSize = 10.sp, color = Muted)
-        }
-        LazyColumn(Modifier.weight(1f), state = listState, verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            if (sessions.isEmpty()) item {
-                when {
-                    // In-flight first load must not read as an empty workspace.
-                    state.sessions.isEmpty() && state.busy -> LoadingState("正在加载会话…", "首次连接会拉取最近的会话列表。")
-                    !state.saved -> EmptyState("连接你的开发机", "在连接页扫描开发机的连接码，自动完成配对。")
-                    !state.connected -> EmptyState("连接后加载会话", "点击顶部刷新或到连接页重连。")
-                    state.sessions.isEmpty() && state.error != null -> Column(Modifier.fillMaxWidth().padding(vertical = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("会话加载失败：${state.error}", fontSize = 12.sp, color = Muted, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                        Button(vm::refresh, enabled = state.connected && !state.busy) { Text("重试") }
-                    }
-                    else -> EmptyState("暂无匹配的会话", "可刷新列表或选择其他项目。")
-                }
-            }
-            recentProjectGroups(sessions, { it.updatedAt }, { it.cwd }).forEach { (path, group) ->
-                item(key = "project-$path") { ProjectHeading(group.first().project, path, group.size) }
-                items(group, key = { it.id }) { SessionCard(it) { vm.openThread(it) } }
-            }
-            if (state.cursor != null) item { TextButton(vm::moreSessions, Modifier.fillMaxWidth(), enabled = state.connected && !state.busy) { Text("加载更多会话") } }
-            item { Spacer(Modifier.height(8.dp)) }
-        }
-        if (!compact) Button(onNew, Modifier.fillMaxWidth().padding(vertical = 12.dp), enabled = state.connected && !state.busy, shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(14.dp)) {
-            Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(7.dp)); Text("新建会话")
-        }
-    }
+    WorkspaceSessions(state.sessions.map { it.workspace() }, state.connected, state.busy, state.sessionsCached,
+        state.profile.name, state.error, state.connected && !state.busy,
+        open = { id -> state.sessions.find { it.id == id }?.let(vm::openThread) }, create = onNew,
+        connection = { vm.tab(2) }, refresh = vm::refresh, more = if (state.cursor != null) ({ vm.moreSessions(); Unit }) else null)
 }
 
 @Composable
-private fun SessionCard(session: SessionInfo, onClick: () -> Unit) {
-    CompactSessionRow(session.title, session.status, session.updatedAt * 1000, onClick = onClick)
-}
-
-@Composable
-private fun StatusBadge(text: String) {
-    val bad = text == "失败"
-    Surface(shape = RoundedCornerShape(6.dp), color = if (bad) Color(0xfff8e9e3) else Color(0xffeaf2e7)) {
-        Text(text, Modifier.padding(horizontal = 7.dp, vertical = 3.dp), fontSize = 10.sp, color = if (bad) Color(0xffa75544) else Green)
-    }
-}
-
-@Composable
-private fun TasksScreen(state: UiState, vm: RemoteViewModel) {
-    val compact = LocalConfiguration.current.screenHeightDp < 480
-    var filter by rememberSaveable { mutableStateOf("全部") }
-    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
-        Text(if (state.connected) "YOLO 默认 · 前台自动同步" else "离线快照 · 刷新后确认状态", fontSize = 11.sp, color = Muted)
-        if (compact) Text(listOf("执行中", "已完成", "失败").joinToString(" · ") { label -> "$label ${state.sessions.count { it.status == label }}" }, fontSize = 12.sp, color = Green)
-        else Row(Modifier.padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("执行中", "已完成", "失败").forEach { label ->
-                Surface(Modifier.weight(1f), shape = RoundedCornerShape(12.dp), color = Color.White, border = androidx.compose.foundation.BorderStroke(1.dp, Line)) {
-                    Column(Modifier.padding(13.dp)) {
-                        Text(state.sessions.count { it.status == label }.toString(), fontSize = 27.sp)
-                        Text(label, fontSize = 11.sp, color = Muted)
-                    }
-                }
-            }
-        }
-        Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("全部", "执行中", "已完成", "失败", "已中断").forEach { label -> FilterChip(filter == label, { filter = label }, label = { Text(label) }) }
-        }
-        Text("当前已加载会话的最近执行", fontSize = 11.sp, color = Muted, modifier = Modifier.padding(bottom = 12.dp))
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            val list = state.sessions.filter { filter == "全部" || it.status == filter }
-            if (list.isEmpty()) item {
-                if (state.sessions.isEmpty() && state.busy) LoadingState("正在加载会话…", "首次连接会拉取最近的会话列表。")
-                else EmptyState("暂无任务", "任务状态来自开发机，点击顶部刷新。")
-            }
-            items(list, key = { it.id }) { SessionCard(it) { vm.openThread(it) } }
-            if (state.cursor != null) item { TextButton(vm::moreSessions, enabled = state.connected && !state.busy) { Text("加载更多") } }
-            item { Spacer(Modifier.height(12.dp)) }
-        }
-    }
+private fun TasksScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit) {
+    WorkspaceSessions(state.sessions.map { it.workspace() }, state.connected, state.busy, state.sessionsCached,
+        state.profile.name, state.error, state.connected && !state.busy,
+        open = { id -> state.sessions.find { it.id == id }?.let(vm::openThread) }, create = onNew,
+        connection = { vm.tab(2) }, refresh = vm::refresh, more = if (state.cursor != null) ({ vm.moreSessions(); Unit }) else null, tasks = true)
 }
 
 @Composable
 private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, String) -> Unit) {
     val session = state.selected!!
-    // The compact composer also kicks in while the keyboard is up, so chat and send stay visible.
-    val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
-    val compact = imeBottom > 0 || LocalConfiguration.current.screenHeightDp < 480
     var steer by rememberSaveable(session.id) { mutableStateOf(false) }
     var confirmUncertain by remember { mutableStateOf(false) }
-    val list = rememberLazyListState()
-    var followLatest by rememberSaveable { mutableStateOf(true) }
-    var jumpToMessage by remember { mutableStateOf<String?>(null) }
-    // Server history merged with local outgoing bubbles and queue entries; the bubble for a
-    // just-sent message exists here immediately, without faking server history.
-    val rows = remember(state.items, state.queue, state.outgoing) { readingRows(buildChatRows(state.items, state.outgoing, state.queue)) }
-    val userRows = remember(rows) { rows.filter { it.isUserRow } }
-    LaunchedEffect(list) {
-        list.interactionSource.interactions.collectLatest { interaction ->
-            when (interaction) {
-                is DragInteraction.Start -> followLatest = false
-                is DragInteraction.Stop, is DragInteraction.Cancel -> {
-                    withFrameNanos { }
-                    snapshotFlow { list.isScrollInProgress }.first { !it }
-                    followLatest = !list.canScrollForward
-                }
-            }
-        }
-    }
-    // The first history snapshot can arrive before LazyColumn has measured it.
-    // Target a tail item using the new data count, including when the last reply is tall.
-    val tailIndex = (if (state.historyCursor != null) 1 else 0) +
-        maxOf(1, rows.size) + (if (state.diff.isNotBlank()) 1 else 0)
-    LaunchedEffect(followLatest, tailIndex, rows.lastOrNull(), imeBottom) {
-        if (followLatest && rows.isNotEmpty()) list.scrollToItem(tailIndex)
-    }
-    LaunchedEffect(jumpToMessage, rows, state.historyCursor) {
-        val id = jumpToMessage ?: return@LaunchedEffect
-        val index = rows.indexOfFirst { it.id == id }
-        if (index >= 0) {
-            list.scrollToItem(index + if (state.historyCursor != null) 1 else 0)
-            jumpToMessage = null
-        }
-    }
     Column(Modifier.fillMaxSize()) {
-        val run = codexAgentRun(state.connected, session.runtime)
-        if (!compact) Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            StatusBadge("YOLO · 默认发送模式")
-            Spacer(Modifier.weight(1f)); RunStatusRow(run, agentRunLabel(run, session.status))
-        } else if (run != AgentRun.Idle) {
-            RunStatusRow(run, agentRunLabel(run, session.status), Modifier.padding(horizontal = 18.dp, vertical = 4.dp))
-        }
-        if (userRows.isNotEmpty() || state.historyCursor != null) UserMessageBar(
-            messages = userRows, hasMore = state.historyCursor != null, loading = state.historyLoading,
-            canLoad = state.connected, compact = compact,
-            onLoadMore = { followLatest = false; vm.moreHistory() },
-            onJump = { id -> followLatest = false; jumpToMessage = id }
-        )
+        ChatRunHeader(codexAgentRun(state.connected, session.runtime), session.status, state.historyCached, state.connected,
+            session.runtime == "active", state.connected && !state.busy && session.activeTurnId.isNotBlank(), vm::interrupt)
         if (pendingProtectionVisible(state.uncertain != null, state.sending)) Surface(color = Color(0xfffaf0dc)) {
             Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
                 Text("上一条消息的接收结果待核对，草稿已保留。刷新会自动核对最近历史和队列。", fontSize = 12.sp)
@@ -353,86 +160,19 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
             text = { Text("确认已检查会话历史和队列。解除后仍保留草稿，由你决定是否再次发送；不会自动重发。") },
             confirmButton = { TextButton({ vm.clearUncertain(); confirmUncertain = false }) { Text("已核对，解除") } },
             dismissButton = { TextButton({ confirmUncertain = false }) { Text("返回") } })
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list,
-            // Compact screens: tight vertical padding and gaps so the tail is real content, not spacing.
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = if (compact) 4.dp else 16.dp),
-            verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 14.dp)) {
-            if (state.historyCursor != null) item { TextButton({ followLatest = false; vm.moreHistory() }, Modifier.fillMaxWidth(), enabled = state.connected && !state.busy) { Text(if (state.historyLoading) "加载中…" else "加载更早的消息") } }
-            when (timelineView(rows.size, state.historyLoading, state.historyError)) {
-                TimelineView.Loading -> item(key = "timeline-loading") { Text("正在加载会话内容…", fontSize = 12.sp, color = Muted, modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
-                TimelineView.Error -> item(key = "timeline-error") {
-                    Column(Modifier.fillMaxWidth().padding(vertical = 24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("会话内容加载失败：${state.historyError}", fontSize = 12.sp, color = Muted, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                        Button(vm::retryHistory, enabled = state.connected && !state.busy) { Text("重试") }
-                    }
-                }
-                TimelineView.Empty -> item { EmptyState("开始这次工作", "输入任务后在开发机上按 YOLO 执行。") }
-                TimelineView.Content -> {}
-            }
-            items(rows, key = { it.key }) { row ->
-                when {
-                    row.activity.isNotEmpty() -> ActivitySummary(row.activity, detail)
-                    row.item != null -> TimelineCard(row.item, detail = detail)
-                    row.outgoing != null -> OutgoingCard(row.outgoing, detail)
-                    row.queued != null -> {
-                        val queued = row.queued
-                        Surface(color = Color(0xfff0f3ec), shape = RoundedCornerShape(12.dp)) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text("已在开发机排队", fontSize = 10.sp, color = Green)
-                                Text(queued.text, fontSize = 13.sp)
-                                TextButton({ vm.deleteQueued(queued) }, enabled = state.connected && !state.busy) { Text("移出队列") }
-                            }
-                        }
-                    }
-                }
-            }
-            if (state.diff.isNotBlank()) item { OutlinedButton({ detail("当前执行差异", state.diff) }, Modifier.fillMaxWidth()) { Icon(Icons.Outlined.Difference, null); Text("查看本轮修改") } }
-            item(key = "chat-tail") { Spacer(Modifier.height(1.dp)) }
-        }
-        if (!followLatest) TextButton({ jumpToMessage = null; followLatest = true }, Modifier.align(Alignment.CenterHorizontally).height(if (compact) 32.dp else 40.dp), contentPadding = PaddingValues(0.dp)) {
-            Icon(Icons.Outlined.ArrowDownward, null, Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp)); Text("回到最新")
-        }
+        ChatTimeline(session.id, "Codex", state.items, state.outgoing, state.queue, state.historyCursor != null,
+            state.historyLoading, state.historyError, state.connected, state.busy, Modifier.weight(1f),
+            vm::moreHistory, vm::retryHistory, detail, state.diff, vm::deleteQueued)
         ExecutionControls(state, vm)
-        // One stable TextField across compact/noncompact: branching into two separate fields
-        // destroyed the editing one when the keyboard toggled compact, dropping focus mid-input.
-        // Compact keeps a single row (short-screen message area); extra controls are only ever
-        // appended AFTER the TextField so its slot in the composition never moves.
-        Surface(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), color = Color.White, shape = RoundedCornerShape(16.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Line)) {
-            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = if (compact) 2.dp else 10.dp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
-                    TextField(state.draft, vm::draft, Modifier.weight(1f).heightIn(max = if (compact) 88.dp else 160.dp),
-                        placeholder = { Text("描述任务，或补充要求…", fontSize = 13.sp) },
-                        colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White,
-                            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent),
-                        maxLines = if (compact) 2 else 5)
-                    if (compact && session.runtime == "active") {
-                        FilterChip(steer, { steer = !steer }, label = { Text(if (steer) "介入" else "排队", fontSize = 11.sp) })
-                        IconButton(vm::interrupt, enabled = state.connected && !state.busy && session.activeTurnId.isNotBlank()) {
-                            Icon(Icons.Outlined.Stop, "中断", tint = Color(0xffb65446))
-                        }
-                    }
-                    FilledIconButton({ vm.send(steer && session.runtime == "active") }, enabled = state.connected && !state.busy && !state.sending && state.draft.isNotBlank() && state.uncertain == null) {
-                        if (state.sending) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
-                        else Icon(Icons.AutoMirrored.Outlined.Send, "发送消息")
-                    }
-                }
-                if (!compact) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    if (session.runtime == "active") {
-                        FilterChip(steer, { steer = !steer }, label = { Text(if (steer) "介入当前任务" else "排队发送", fontSize = 11.sp) })
-                        TextButton(vm::interrupt, enabled = state.connected && !state.busy && session.activeTurnId.isNotBlank(),
-                            contentPadding = PaddingValues(horizontal = 8.dp)) { Text("中断", fontSize = 11.sp, color = Color(0xffb65446)) }
-                    } else Text("发送并执行", fontSize = 11.sp, color = Muted)
-                    Spacer(Modifier.weight(1f))
-                }
-            }
-        }
+        ChatComposer(state.draft, vm::draft, state.sending,
+            state.connected && !state.busy && !state.sending && state.draft.isNotBlank() && state.uncertain == null,
+            steer, { steer = it }, { vm.send(steer && session.runtime == "active") })
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun UserMessageBar(
+internal fun UserMessageBar(
     messages: List<ChatRow>, hasMore: Boolean, loading: Boolean, canLoad: Boolean, compact: Boolean,
     onLoadMore: () -> Unit, onJump: (String) -> Unit
 ) {
@@ -442,7 +182,7 @@ private fun UserMessageBar(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f).clickable {
                 if (latest != null) onJump(latest.id) else showMessages = true
-            }.padding(horizontal = 18.dp, vertical = if (compact) 4.dp else 8.dp)) {
+            }.padding(horizontal = 16.dp, vertical = if (compact) 4.dp else 8.dp)) {
                 if (!compact) Text("你的消息 · 点击定位", fontSize = 10.sp, color = Green)
                 Text(latest?.text?.take(300)?.ifBlank { "查看消息" } ?: "加载更早的消息", fontSize = 12.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -572,7 +312,8 @@ internal fun OutgoingCard(message: OutgoingMessage, detail: (String, String) -> 
 }
 
 @Composable
-private fun ConnectionScreen(state: UiState, vm: RemoteViewModel) {
+internal fun ConnectionScreen(state: UiState, vm: RemoteViewModel,
+    reconnect: () -> Unit = { vm.connect() }, disconnect: () -> Unit = { vm.disconnect() }) {
     var profile by remember(state.profile) { mutableStateOf(state.profile) }
     var advanced by rememberSaveable { mutableStateOf(false) }
     val scanner = rememberLauncherForActivityResult(ScanContract()) { result -> result.contents?.let(vm::pair) }
@@ -581,9 +322,9 @@ private fun ConnectionScreen(state: UiState, vm: RemoteViewModel) {
     var jumpPass by remember { mutableStateOf("") }
     val importTarget = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { uri -> vm.importKey(uri, false) } }
     val importJump = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { uri -> vm.importKey(uri, true) } }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Surface(color = Color(0xffeaf1e3), shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Icon(Icons.Outlined.Computer, null, tint = Green)
                 Text(state.profile.name, style = MaterialTheme.typography.titleLarge)
                 Text(state.status, color = Muted, fontSize = 12.sp)
@@ -600,9 +341,9 @@ private fun ConnectionScreen(state: UiState, vm: RemoteViewModel) {
         }
         OutlinedButton({ qrImage.launch("image/*") }, Modifier.fillMaxWidth(), enabled = !state.busy) { Text("从二维码图片连接") }
         if (state.saved) {
-            OutlinedButton(vm::connect, Modifier.fillMaxWidth(), enabled = !state.busy) { Text(if (state.connected) "刷新连接" else "连接已配对的开发机") }
+            OutlinedButton(reconnect, Modifier.fillMaxWidth(), enabled = !state.busy) { Text(if (state.connected) "刷新连接" else "连接已配对的开发机") }
         }
-        if (state.connected) OutlinedButton({ vm.disconnect() }, Modifier.fillMaxWidth()) { Text("断开连接") }
+        if (state.connected) OutlinedButton(disconnect, Modifier.fillMaxWidth()) { Text("断开连接") }
         Text("连接码由开发机生成，5 分钟有效；请只扫描你信任的电脑提供的连接码。", color = Muted, fontSize = 11.sp)
         TextButton({ advanced = !advanced }) { Text(if (advanced) "收起手动连接设置" else "手动连接设置") }
         if (advanced) {

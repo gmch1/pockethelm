@@ -27,6 +27,7 @@ class TestPrefsApp(val namespace: String) : Application() {
         private set
     fun attach(base: Context) {
         prefsContext = object : ContextWrapper(base) {
+            override fun getNoBackupFilesDir() = java.io.File(base.cacheDir, "resume_test_$namespace")
             override fun getSharedPreferences(name: String, mode: Int) =
                 super.getSharedPreferences("zcode_load_test_$namespace-$name", mode)
         }

@@ -249,7 +249,10 @@ class ZcodeSendRealtimeTest {
             scriptSend(gate = sendGate) { obj("status" to "accepted") }
             instrumentation.runOnMainSync { vm.send() }
             assertTrue(await { it.outgoing.size == 1 && it.outgoing[0].state == OutgoingState.SENDING })
-            instrumentation.runOnMainSync { vm.leave() }
+            // Leaving the screen now keeps the channel briefly; explicitly simulate a real disconnect.
+            instrumentation.runOnMainSync {
+                ZcodeViewModel::class.java.getDeclaredMethod("disconnect").apply { isAccessible = true }.invoke(vm)
+            }
             assertTrue(await { it.outgoing.isNotEmpty() && it.outgoing[0].state == OutgoingState.UNCERTAIN })
             assertEquals("结果待确认", outgoingStatusLabel(vm.state.value.outgoing[0]))
             assertTrue(vm.state.value.pending)
