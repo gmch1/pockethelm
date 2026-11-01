@@ -79,17 +79,17 @@ internal fun RemoteApp(vm: RemoteViewModel) {
     var details by remember { mutableStateOf<Pair<String, String>?>(null) }
     var rename by remember { mutableStateOf(false) }
     val chat = state.selected != null && state.tab == 0
+    val compactScreen = LocalConfiguration.current.screenHeightDp < 480
     BackHandler(chat) { vm.back() }
     Scaffold(containerColor = Paper,
         topBar = {
             Column {
-                val compactScreen = LocalConfiguration.current.screenHeightDp < 480
-                TopAppBar(windowInsets = WindowInsets(0, 0, 0, 0), title = {
+                TopAppBar(windowInsets = WindowInsets(0, 0, 0, 0), expandedHeight = if (compactScreen) 48.dp else 64.dp, title = {
                     Column {
                         // Decorative location label: dropped on short screens to give chat room.
-                        if (!(chat && compactScreen)) Text(if (chat) state.selected!!.project else listOf("WORKSPACE", "ACTIVITY", "ENVIRONMENTS")[state.tab], fontSize = 10.sp, color = Muted, letterSpacing = 2.sp)
+                        if (!compactScreen) Text(if (chat) state.selected!!.project else listOf("WORKSPACE", "ACTIVITY", "ENVIRONMENTS")[state.tab], fontSize = 10.sp, color = Muted, letterSpacing = 2.sp)
                         Text(if (chat) state.selected!!.title else listOf("会话", "任务中心", "连接")[state.tab],
-                            fontSize = if (chat) 18.sp else 26.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            fontSize = if (chat || compactScreen) 18.sp else 26.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }, navigationIcon = { if (chat) IconButton(onClick = vm::back) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "返回会话") } },
                     actions = {
@@ -100,7 +100,13 @@ internal fun RemoteApp(vm: RemoteViewModel) {
             }
         },
         bottomBar = {
-            if (!chat) NavigationBar(containerColor = Paper) {
+            if (!chat && compactScreen) Row(Modifier.fillMaxWidth().navigationBarsPadding(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                listOf("会话", "任务", "连接").forEachIndexed { i, label ->
+                    TextButton({ vm.tab(i) }, Modifier.weight(1f)) {
+                        Text(label, color = if (state.tab == i) Green else Muted)
+                    }
+                }
+            } else if (!chat) NavigationBar(containerColor = Paper) {
                 listOf("会话" to Icons.Outlined.Forum, "任务" to Icons.Outlined.Checklist, "连接" to Icons.Outlined.Dns).forEachIndexed { i, pair ->
                     NavigationBarItem(state.tab == i, onClick = { vm.tab(i) }, icon = { Icon(pair.second, pair.first) }, label = { Text(pair.first) })
                 }
@@ -173,6 +179,7 @@ private fun ConnectionStrip(state: UiState, vm: RemoteViewModel) {
 private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit) {
     val compact = LocalConfiguration.current.screenHeightDp < 480
     var search by rememberSaveable { mutableStateOf("") }
+    var showSearch by rememberSaveable { mutableStateOf(false) }
     var project by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
     LaunchedEffect(search, project, compact) { listState.scrollToItem(0) }
@@ -181,8 +188,13 @@ private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
         if (compact) {
             Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(search, { search = it }, Modifier.weight(1f), placeholder = { Text("搜索会话或项目", fontSize = 13.sp) },
-                    leadingIcon = { Icon(Icons.Outlined.Search, null) }, singleLine = true, shape = RoundedCornerShape(12.dp))
+                if (showSearch) OutlinedTextField(search, { search = it }, Modifier.weight(1f), placeholder = { Text("搜索会话或项目", fontSize = 13.sp) },
+                    trailingIcon = { IconButton({ showSearch = false; search = "" }) { Icon(Icons.Outlined.Close, "关闭搜索") } },
+                    singleLine = true, shape = RoundedCornerShape(12.dp))
+                else {
+                    IconButton({ showSearch = true }) { Icon(Icons.Outlined.Search, "搜索会话") }
+                    Text("最近会话 · ${sessions.size} 个 · ${if (state.connected) "已连接" else "离线缓存"}", Modifier.weight(1f), fontSize = 12.sp, color = Muted)
+                }
                 Button(onNew, enabled = state.connected && !state.busy) { Text("新建会话") }
             }
         } else {
@@ -194,11 +206,11 @@ private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit
             projects.forEach { path -> FilterChip(project == path, { project = path }, label = { Text(path.trimEnd('/').substringAfterLast('/')) }) }
         }
         }
-        Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        if (!compact) Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(if (compact) "最近会话 · ${if (state.connected) "已连接" else "离线缓存"}" else "最近会话", fontSize = 12.sp, color = Muted)
             Text("${sessions.size} 个 · ${if (state.connected) syncTime(state.lastSync) else "状态待刷新"}", fontSize = 10.sp, color = Muted)
         }
-        LazyColumn(Modifier.weight(1f), state = listState, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        LazyColumn(Modifier.weight(1f), state = listState, verticalArrangement = Arrangement.spacedBy(3.dp)) {
             if (sessions.isEmpty()) item {
                 when {
                     // In-flight first load must not read as an empty workspace.
@@ -212,7 +224,10 @@ private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit
                     else -> EmptyState("暂无匹配的会话", "可刷新列表或选择其他项目。")
                 }
             }
-            items(sessions, key = { it.id }) { SessionCard(it) { vm.openThread(it) } }
+            recentProjectGroups(sessions, { it.updatedAt }, { it.cwd }).forEach { (path, group) ->
+                item(key = "project-$path") { ProjectHeading(group.first().project, path, group.size) }
+                items(group, key = { it.id }) { SessionCard(it) { vm.openThread(it) } }
+            }
             if (state.cursor != null) item { TextButton(vm::moreSessions, Modifier.fillMaxWidth(), enabled = state.connected && !state.busy) { Text("加载更多会话") } }
             item { Spacer(Modifier.height(8.dp)) }
         }
@@ -224,18 +239,7 @@ private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit
 
 @Composable
 private fun SessionCard(session: SessionInfo, onClick: () -> Unit) {
-    Surface(onClick = onClick, shape = RoundedCornerShape(14.dp), border = androidx.compose.foundation.BorderStroke(1.dp, Line), color = Color.White) {
-        Column(Modifier.fillMaxWidth().padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Outlined.Folder, null, Modifier.size(16.dp), tint = Muted)
-                Text(session.project, Modifier.weight(1f).padding(start = 6.dp), fontSize = 11.sp, color = Muted, maxLines = 1)
-                StatusBadge(session.status)
-            }
-            Text(session.title, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text(session.cwd, fontSize = 10.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(formatTime(session.updatedAt), fontSize = 10.sp, color = Muted)
-        }
-    }
+    CompactSessionRow(session.title, session.status, session.updatedAt * 1000, onClick = onClick)
 }
 
 @Composable
@@ -293,7 +297,7 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
     var jumpToMessage by remember { mutableStateOf<String?>(null) }
     // Server history merged with local outgoing bubbles and queue entries; the bubble for a
     // just-sent message exists here immediately, without faking server history.
-    val rows = remember(state.items, state.queue, state.outgoing) { buildChatRows(state.items, state.outgoing, state.queue) }
+    val rows = remember(state.items, state.queue, state.outgoing) { readingRows(buildChatRows(state.items, state.outgoing, state.queue)) }
     val userRows = remember(rows) { rows.filter { it.isUserRow } }
     LaunchedEffect(list) {
         list.interactionSource.interactions.collectLatest { interaction ->
@@ -367,6 +371,7 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
             }
             items(rows, key = { it.key }) { row ->
                 when {
+                    row.activity.isNotEmpty() -> ActivitySummary(row.activity, detail)
                     row.item != null -> TimelineCard(row.item, detail = detail)
                     row.outgoing != null -> OutgoingCard(row.outgoing, detail)
                     row.queued != null -> {
@@ -459,6 +464,32 @@ private fun UserMessageBar(
                 TextButton(onLoadMore, Modifier.fillMaxWidth(), enabled = canLoad && !loading) {
                     Text(if (loading) "加载中…" else "加载更早的消息")
                 }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ActivitySummary(items: List<TimelineItem>, detail: (String, String) -> Unit) {
+    val failed = activityHasFailure(items)
+    var expanded by remember { mutableStateOf(false) }
+    TextButton(onClick = { expanded = true }, modifier = Modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp)) {
+        Icon(if (failed) Icons.Outlined.ErrorOutline else Icons.Outlined.MoreHoriz,
+            null, Modifier.size(18.dp), tint = if (failed) MaterialTheme.colorScheme.error else Muted)
+        Text(activityLabel(items), Modifier.weight(1f).padding(horizontal = 8.dp), fontSize = 12.sp,
+            color = if (failed) MaterialTheme.colorScheme.error else Muted,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Start)
+        Icon(Icons.Outlined.ChevronRight, "展开工作过程", Modifier.size(18.dp), tint = Muted)
+    }
+    if (expanded) ModalBottomSheet(onDismissRequest = { expanded = false }, containerColor = Paper,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Text("工作过程", Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.titleMedium)
+        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 480.dp),
+            contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(items, key = { it.id }) { item ->
+                TimelineCard(item) { title, text -> expanded = false; detail(title, text) }
             }
         }
     }

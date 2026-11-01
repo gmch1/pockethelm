@@ -60,11 +60,46 @@ fun reconcileOutgoingList(
 /** One renderable row of the chat timeline: server item, local outgoing bubble, or queue entry. */
 data class ChatRow(
     val key: String, val item: TimelineItem? = null,
-    val outgoing: OutgoingMessage? = null, val queued: QueuedMessage? = null
+    val outgoing: OutgoingMessage? = null, val queued: QueuedMessage? = null,
+    val activity: List<TimelineItem> = emptyList()
 ) {
     val id: String get() = item?.id ?: outgoing?.clientId ?: queued?.id.orEmpty()
     val text: String get() = outgoing?.text ?: queued?.text ?: item?.text.orEmpty()
     val isUserRow: Boolean get() = item?.kind == "userMessage" || outgoing != null || queued != null
+}
+
+/** Presentation only: preserve the original history and never fold a user's message or answer. */
+fun readingRows(rows: List<ChatRow>): List<ChatRow> {
+    val result = mutableListOf<ChatRow>()
+    val activity = mutableListOf<TimelineItem>()
+    fun flush() {
+        if (activity.isNotEmpty()) {
+            result.add(ChatRow("activity-${activity.first().id}", activity = activity.toList()))
+            activity.clear()
+        }
+    }
+    val processKinds = setOf("reasoning", "commandExecution", "fileChange", "mcpToolCall",
+        "dynamicToolCall", "webSearch", "collabAgentToolCall", "contextCompaction")
+    rows.forEach { row ->
+        val item = row.item
+        if (item?.kind == "reasoning" && item.text.isBlank()) return@forEach
+        if (item != null && item.kind in processKinds) activity.add(item)
+        else { flush(); result.add(row) }
+    }
+    flush()
+    return result
+}
+
+fun activityHasFailure(items: List<TimelineItem>) = items.any {
+    it.status.lowercase() in setOf("failed", "error", "declined", "denied")
+}
+
+fun activityLabel(items: List<TimelineItem>): String {
+    val reasoning = items.count { it.kind == "reasoning" }
+    val operations = items.size - reasoning
+    val label = listOfNotNull("思考".takeIf { reasoning > 0 },
+        "$operations 项操作".takeIf { operations > 0 }).joinToString(" · ")
+    return "工作过程 · $label" + if (activityHasFailure(items)) " · 有失败" else ""
 }
 
 /**

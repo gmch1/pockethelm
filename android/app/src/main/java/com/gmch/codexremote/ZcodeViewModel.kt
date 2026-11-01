@@ -16,6 +16,7 @@ data class ZcodeState(
     val connected: Boolean = false, val busy: Boolean = false, val error: String? = null,
     val providers: List<ZProvider> = emptyList(), val selection: ZSelection? = null, val selectionGuard: String = "",
     val projects: List<ZProject> = emptyList(), val sessions: List<ZSession> = emptyList(),
+    val sessionsFresh: Boolean = false,
     val selected: ZSession? = null, val items: List<TimelineItem> = emptyList(),
     val historyLoading: Boolean = false, val historyError: String? = null, val sending: Boolean = false,
     val outgoing: List<OutgoingMessage> = emptyList(),
@@ -136,7 +137,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         // In-flight requests lose their channel: outcome unknown, never a failure.
         outgoingBySession.keys.toList().forEach { markOutgoingUncertain(it) }
         mutable.update {
-            it.copy(connected = false, busy = false, sending = false, historyLoading = false,
+            it.copy(connected = false, busy = false, sending = false, historyLoading = false, sessionsFresh = false,
                 // A session opened but never loaded must not fall back to a blank timeline.
                 historyError = if (it.selected != null && it.items.isEmpty() && it.historyLoading)
                     "连接已断开，未能加载会话内容，重连后重试" else it.historyError,
@@ -198,8 +199,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             selectionGuard = it.selectionGuard.ifBlank { providers.find { p -> p.id == chosen?.provider }?.guard.orEmpty() }) }
     }
     private suspend fun loadProjects() {
+        val startGeneration = generation
+        mutable.update { it.copy(sessionsFresh = false) }
         val data = call("projects")
-        mutable.update { it.copy(projects = data.optJSONArray("projects").objects().map { p ->
+        if (generation != startGeneration) return
+        mutable.update { it.copy(sessionsFresh = true, projects = data.optJSONArray("projects").objects().map { p ->
             ZProject(p.getString("id"), p.getString("name"), p.optJSONArray("roots").strings())
         }, sessions = data.optJSONArray("sessions").objects().map(ZSession::parse)
             // Most recently active first; stable sort keeps peers without timestamps in place.
@@ -341,9 +345,16 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun back() {
         if (mutable.value.busy) return
+        if (mutable.value.selected == null) return
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
-        mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false, historyError = null, outgoing = emptyList()) }
+        mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false, historyError = null, outgoing = emptyList(), sessionsFresh = false) }
         older = emptyList()
+        // One bulk refresh on navigation, not another polling loop. Keep stale data labelled
+        // as such if offline or the request fails; never present the old status as current.
+        val startGeneration = generation
+        if (mutable.value.connected) action {
+            if (generation == startGeneration && mutable.value.selected == null) loadProjects()
+        }
     }
     fun draft(value: String) {
         mutable.update { it.copy(draft = value) }

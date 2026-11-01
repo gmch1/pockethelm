@@ -50,6 +50,7 @@ class ZcodeSendRealtimeTest {
         }
         state.value = ZcodeState(connected = true)
         bridge = FakeRpcBridge(vm)
+        bridge.scripted["projects"] = { obj("projects" to JSONArray(), "sessions" to JSONArray()) }
         bridge.install()
     }
 

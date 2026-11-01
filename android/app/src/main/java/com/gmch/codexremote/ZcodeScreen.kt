@@ -17,6 +17,7 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -41,7 +42,7 @@ internal fun EngineApp(codex: RemoteViewModel, zcode: ZcodeViewModel) {
         else { zcode.leave(); codex.foreground() }
     }
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(engine == "codex", { engine = "codex" }, label = { Text("Codex") })
             FilterChip(engine == "zcode", { engine = "zcode" }, label = { Text("ZCode · 实验") })
         }
@@ -57,10 +58,13 @@ internal fun EngineApp(codex: RemoteViewModel, zcode: ZcodeViewModel) {
 private fun ZcodeScreen(vm: ZcodeViewModel, connection: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     var newSession by remember { mutableStateOf(false) }
+    var search by rememberSaveable { mutableStateOf("") }
+    var showSearch by rememberSaveable { mutableStateOf(false) }
+    val compact = LocalConfiguration.current.screenHeightDp < 480
     var detail by remember { mutableStateOf<Pair<String, String>?>(null) }
     var unlock by remember { mutableStateOf(false) }
     BackHandler(state.selected != null) { vm.back() }
-    Scaffold(topBar = { TopAppBar(windowInsets = WindowInsets(0, 0, 0, 0), title = {
+    Scaffold(topBar = { TopAppBar(windowInsets = WindowInsets(0, 0, 0, 0), expandedHeight = if (compact) 48.dp else 64.dp, title = {
         Text(state.selected?.title ?: "ZCode 会话", maxLines = 1, overflow = TextOverflow.Ellipsis)
     }, navigationIcon = { if (state.selected != null) TextButton(vm::back, enabled = !state.busy) { Text("返回") } },
         actions = {
@@ -91,11 +95,19 @@ private fun ZcodeScreen(vm: ZcodeViewModel, connection: () -> Unit) {
             }
             if (state.selected == null) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    if (compact) IconButton({ showSearch = !showSearch; if (!showSearch) search = "" }) { Icon(Icons.Outlined.Search, "搜索会话") }
                     TextButton(vm::openBrowser, enabled = state.connected && !state.busy) { Text("添加项目目录") }
                     Button({ newSession = true }, enabled = state.connected && !state.busy && !state.pending) { Text("新建会话") }
                 }
-                Text("进入会话后选择计划、模型和推理强度。", fontSize = 12.sp, modifier = Modifier.padding(vertical = 8.dp))
-                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (!compact || showSearch) OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    placeholder = { Text("搜索会话或项目", fontSize = 13.sp) }, singleLine = true,
+                    leadingIcon = { Icon(Icons.Outlined.Search, null) })
+                val sessions = state.sessions.filter { it.title.contains(search, true) || it.path.contains(search, true) ||
+                    state.projects.find { p -> p.id == it.project }?.name?.contains(search, true) == true }
+                if (!state.sessionsFresh && state.sessions.isNotEmpty())
+                    Text(if (state.busy) "正在更新列表…" else "列表待刷新，显示上次记录", fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     if (state.sessions.isEmpty()) item {
                         // Distinguish connecting / loading / failed / truly empty.
                         Text(when {
@@ -106,21 +118,17 @@ private fun ZcodeScreen(vm: ZcodeViewModel, connection: () -> Unit) {
                             else -> "暂无会话，连接后刷新或新建。"
                         }, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    items(state.sessions, key = { it.path + ":" + it.identity + ":" + it.id }) { session ->
-                        Surface(onClick = { vm.open(session) }, enabled = state.connected && !state.busy,
-                            shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surface,
-                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-                            Column(Modifier.fillMaxWidth().padding(14.dp)) {
-                                Text(session.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                Text(session.path, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp)
-                                val label = zcodeSessionStatusLabel(session.status)
-                                Text(if (label.isNotBlank()) label else "状态进入后刷新", fontSize = 10.sp,
-                                    color = when (label) {
-                                        "执行中" -> MaterialTheme.colorScheme.primary
-                                        "失败" -> MaterialTheme.colorScheme.error
-                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                    })
-                            }
+                    if (sessions.isEmpty() && state.sessions.isNotEmpty()) item { Text("暂无匹配的会话", fontSize = 12.sp) }
+                    recentProjectGroups(sessions, { it.updatedAt }, { "${it.project}:${it.identity}:${it.path}" }).forEach { (key, group) ->
+                        val first = group.first()
+                        item(key = "project-$key") {
+                            ProjectHeading(state.projects.find { it.id == first.project }?.name
+                                ?: first.path.trimEnd('/').substringAfterLast('/'), first.path, group.size)
+                        }
+                        items(group, key = { it.path + ":" + it.identity + ":" + it.id }) { session ->
+                            CompactSessionRow(session.title,
+                                if (state.sessionsFresh) zcodeSessionStatusLabel(session.status).ifBlank { "状态未知" } else "状态待刷新",
+                                session.updatedAt, enabled = state.connected && !state.busy) { vm.open(session) }
                         }
                     }
                 }
@@ -129,6 +137,16 @@ private fun ZcodeScreen(vm: ZcodeViewModel, connection: () -> Unit) {
                 val compact = imeVisible || LocalConfiguration.current.screenHeightDp < 480
                 var showSettings by remember { mutableStateOf(false) }
                 val run = zcodeAgentRun(state.connected, state.phase, state.interactionCount)
+                if (compact) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    RunStatusRow(run, agentRunLabel(run, phaseLabel(state.phase)), Modifier.weight(1f))
+                    TextButton({ showSettings = true }) {
+                        Text(state.selection?.let { "${it.model} · ${it.level}" } ?: "计划与模型",
+                            Modifier.widthIn(max = 180.dp), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    TextButton({ showSettings = true; vm.quota() }) { Text("额度", fontSize = 11.sp) }
+                    if (state.executionId.isNotBlank()) TextButton(vm::stop,
+                        enabled = state.connected && !state.busy && !state.pending && !state.commandInFlight) { Text("停止") }
+                } else {
                 // Run status and stop stay pinned; only the settings summary scrolls.
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                     RunStatusRow(run, "${state.permission.ifBlank { "读取中" }} · ${agentRunLabel(run, phaseLabel(state.phase))}", Modifier.weight(1f))
@@ -150,14 +168,13 @@ private fun ZcodeScreen(vm: ZcodeViewModel, connection: () -> Unit) {
                     if (state.providers.find { it.id == state.selection?.provider }?.let { it.guard != state.selectionGuard } == true)
                         Text("额度来源已变化", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
                 }
+                }
+                if (compact && state.providers.find { it.id == state.selection?.provider }?.let { it.guard != state.selectionGuard } == true)
+                    Text("额度来源已变化，请重新选择计划", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
                 if (state.interactionCount > 0) Text("ZCode 正在等待交互；本实验版尚未接入该交互类型。",
                     color = MaterialTheme.colorScheme.error, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 if (state.notice.isNotBlank()) Text(state.notice, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 key(state.selected!!.id) { ZcodeTimeline(state, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b } }
-                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(state.delivery == "queue", { vm.delivery("queue") }, label = { Text("排队", fontSize = 11.sp) })
-                    FilterChip(state.delivery == "guide", { vm.delivery("guide") }, label = { Text("插入当前任务", fontSize = 11.sp) })
-                }
                 ZcodeComposer(state, vm, compact)
                 if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false },
                     sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
@@ -213,10 +230,18 @@ private fun zcodeSettingsSummary(state: ZcodeState): String {
 /** One row in both modes: borderless input + send; only the input max height adapts. */
 @Composable
 private fun ZcodeComposer(state: ZcodeState, vm: ZcodeViewModel, compact: Boolean) {
+    var chooseDelivery by remember { mutableStateOf(false) }
     val canSend = state.connected && !state.busy && !state.pending && !state.sending && state.draft.isNotBlank() && state.selection != null
     Surface(Modifier.padding(vertical = 6.dp), color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(16.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.Bottom) {
+            Box(Modifier.padding(bottom = 6.dp)) {
+                TextButton({ chooseDelivery = true }) { Text(if (state.delivery == "guide") "插入 ▾" else "排队 ▾", fontSize = 11.sp) }
+                DropdownMenu(chooseDelivery, { chooseDelivery = false }) {
+                    DropdownMenuItem(text = { Text("排队") }, onClick = { vm.delivery("queue"); chooseDelivery = false })
+                    DropdownMenuItem(text = { Text("插入当前任务") }, onClick = { vm.delivery("guide"); chooseDelivery = false })
+                }
+            }
             TextField(state.draft, vm::draft, Modifier.weight(1f).heightIn(max = if (compact) 88.dp else 160.dp),
                 placeholder = { Text("发消息给 ZCode", fontSize = 13.sp) },
                 colors = TextFieldDefaults.colors(
@@ -281,14 +306,14 @@ private fun ZChoice(label: String, enabled: Boolean, options: List<Pair<String, 
 }
 
 @Composable
-private fun ZcodeTimeline(state: ZcodeState, modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit) {
+internal fun ZcodeTimeline(state: ZcodeState, modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit) {
     val list = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var follow by remember { mutableStateOf(true) }
     // Server history merged with local outgoing bubbles and queue entries: a just-sent or
     // queued message shows as a full user bubble here, deduped by client id, and stays
     // reachable from the sticky user-message navigation.
-    val rows = remember(state.items, state.outgoing, state.queue) { buildChatRows(state.items, state.outgoing, state.queue) }
+    val rows = remember(state.items, state.outgoing, state.queue) { readingRows(buildChatRows(state.items, state.outgoing, state.queue)) }
     // Only real drags pause following; programmatic scrolls emit no drag interactions.
     LaunchedEffect(list) {
         list.interactionSource.interactions.collectLatest { interaction ->
@@ -338,6 +363,7 @@ private fun ZcodeTimeline(state: ZcodeState, modifier: Modifier, history: () -> 
             }
             items(rows, key = { it.key }) { row ->
                 when {
+                    row.activity.isNotEmpty() -> ActivitySummary(row.activity, detail)
                     row.item != null -> TimelineCard(row.item, agentName = "ZCode", detail = detail)
                     row.outgoing != null -> OutgoingCard(row.outgoing, detail)
                     row.queued != null -> OutgoingCard(OutgoingMessage(
