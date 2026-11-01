@@ -179,4 +179,16 @@ class ChatStatusTest {
         assertEquals("已开始执行", noticeForPhase("running", "已开始执行"))
         assertEquals("已开始执行", noticeForPhase("prewarming", "已开始执行"))
     }
+
+    @Test fun sessionListStatusMapsKnownEnumsAndFallsBackOnUnknown() {
+        assertEquals("执行中", zcodeSessionStatusLabel("running"))
+        assertEquals("执行中", zcodeSessionStatusLabel("InProgress"))
+        assertEquals("已完成", zcodeSessionStatusLabel("done"))
+        assertEquals("已中断", zcodeSessionStatusLabel("Cancelled"))
+        assertEquals("失败", zcodeSessionStatusLabel("failed"))
+        assertEquals("空闲", zcodeSessionStatusLabel(" idle "))
+        // Unknown or blank upstream enums must hide, letting the card show its placeholder.
+        assertEquals("", zcodeSessionStatusLabel(""))
+        assertEquals("", zcodeSessionStatusLabel("some-future-enum"))
+    }
 }

@@ -25,12 +25,27 @@ data class ZDirectoryListing(val path: String, val parent: String, val hasParent
             })
     }
 }
-data class ZSession(val id: String, val title: String, val path: String, val identity: String = "", val project: String = "", val status: String = "") {
+data class ZSession(val id: String, val title: String, val path: String, val identity: String = "", val project: String = "",
+                    val status: String = "", val updatedAt: Long = 0) {
     fun target() = obj("sessionId" to id, "workspacePath" to path, "workspaceIdentity" to identity.takeIf { it.isNotBlank() })
     companion object {
         fun parse(j: JSONObject) = ZSession(j.string("taskId"), j.string("title", "新会话").ifBlank { "新会话" },
-            j.string("workspacePath"), j.string("workspaceIdentity"), j.string("projectId"), j.string("status"))
+            j.string("workspacePath"), j.string("workspaceIdentity"), j.string("projectId"), j.string("status"),
+            zcodeTimestamp(j.opt("updatedAt")))
     }
+}
+
+/**
+ * Tolerant timestamp from the bulk task listing: epoch seconds or millis as a number,
+ * ISO-8601 as a string; anything absent or unparseable becomes 0 so it sorts last
+ * without disturbing the relative order of its peers.
+ */
+internal fun zcodeTimestamp(value: Any?): Long = when (value) {
+    is Number -> value.toLong().let { if (it in 1 until 100_000_000_000L) it * 1000 else it }
+    is String -> runCatching { java.time.Instant.parse(value.trim()).toEpochMilli() }
+        .getOrElse { runCatching { java.time.LocalDateTime.parse(value.trim().replace(" ", "T"))
+            .toInstant(java.time.ZoneOffset.UTC).toEpochMilli() }.getOrDefault(0L) }
+    else -> 0L
 }
 fun zcodeProviders(j: JSONObject) = j.optJSONArray("providers").objects().map { p ->
     ZProvider(p.getString("id"), p.getString("name"), p.string("planKind"), p.getString("guard"),

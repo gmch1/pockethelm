@@ -71,6 +71,22 @@ private val transientReceiptNotices = setOf(
     "已开始执行", "ZCode 已排队，等待当前任务完成", "已插入当前任务", "命令已接收")
 
 /**
+ * Status of a ZCode session card, from the bridge's bulk readTree listing. The upstream
+ * enum is not part of this repo, so known variants map to short Chinese and anything
+ * unknown (including blank) returns empty for the UI to fall back to its placeholder.
+ */
+fun zcodeSessionStatusLabel(status: String): String = when (status.trim().lowercase()) {
+    "running", "active", "inprogress", "executing" -> "执行中"
+    "waiting", "pending" -> "等待中"
+    "prewarming" -> "准备中"
+    "completed", "completedsuccess", "done", "success", "finished" -> "已完成"
+    "completedinterrupted", "interrupted", "cancelled", "canceled", "stopped" -> "已中断"
+    "error", "failed" -> "失败"
+    "draft", "idle" -> "空闲"
+    else -> ""
+}
+
+/**
  * Once the engine reaches a terminal phase, an earlier send receipt ("已开始执行") is stale
  * and must not contradict 已完成/失败/已中断. Model-selection hints, real errors, and the
  * pending protection live elsewhere and pass through untouched.

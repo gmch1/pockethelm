@@ -201,7 +201,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val data = call("projects")
         mutable.update { it.copy(projects = data.optJSONArray("projects").objects().map { p ->
             ZProject(p.getString("id"), p.getString("name"), p.optJSONArray("roots").strings())
-        }, sessions = data.optJSONArray("sessions").objects().map(ZSession::parse)) }
+        }, sessions = data.optJSONArray("sessions").objects().map(ZSession::parse)
+            // Most recently active first; stable sort keeps peers without timestamps in place.
+            .sortedByDescending { it.updatedAt }) }
     }
     // Directory picker: all transitions go through the ZcodeBrowser reducer; this wiring owns
     // RPCs. Epochs discard results from closed dialogs or superseded requests, and requested

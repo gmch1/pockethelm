@@ -113,7 +113,13 @@ private fun ZcodeScreen(vm: ZcodeViewModel, connection: () -> Unit) {
                             Column(Modifier.fillMaxWidth().padding(14.dp)) {
                                 Text(session.title, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 Text(session.path, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp)
-                                Text("状态进入后刷新", fontSize = 10.sp)
+                                val label = zcodeSessionStatusLabel(session.status)
+                                Text(if (label.isNotBlank()) label else "状态进入后刷新", fontSize = 10.sp,
+                                    color = when (label) {
+                                        "执行中" -> MaterialTheme.colorScheme.primary
+                                        "失败" -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    })
                             }
                         }
                     }
