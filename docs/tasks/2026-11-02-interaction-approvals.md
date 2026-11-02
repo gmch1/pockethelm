@@ -1,6 +1,6 @@
 # 交互类型接入：Codex 审批应答 + ZCode 提问应答
 
-状态：待 review（Codex 直接修复完成；自动化、真机与真实 ZCode 交互链路验证通过）
+状态：待 review（R9/R10 已修复并完成定向验证；未合并或发布商店）
 
 ## 需求与验收 由 Codex 维护
 
@@ -320,8 +320,44 @@ c5b5bfc 初次代码验收结论（保留历史，修复结果见下）：**代�
 - 本轮不升级商店版本，不合并 main；按任务流程提交、推送 `interaction-approvals` 并交付待 review。商店仍为原版。
 
 
+
+## 第二轮代码复查（56363f5，2026-11-02）
+
+- 范围：复查当前任务分支整体实现与修复提交，重点检查应答代次、待确认记录、快照版本、上游数据边界和输入表单。此次没有修改产品代码或测试代码。
+- 原 R1/R3/R4 的 P1 问题未发现回归；当前远程 CI（Actions run 41413680286）Android 与 Python/source export 两个 job 均 success。沿用已有 76 项真机证据，不重复跑未改源码的整套测试。
+- 结论：新增两项 P2，建议修复后再合并/发布。不能将已有自动化通过解释为下面边界已被覆盖。
+
+### R9 敏感回答没有向输入法声明密码类型（P2）
+
+- 状态：已修复，自查与定向验证通过，待 review。
+- 位置：`ZcodeScreen.kt:264–266`（简单 freeText）及 `:310–315`（结构化问题的自定义回答）。两处只设置 `PasswordVisualTransformation`，没有为 sensitive 输入配置 KeyboardOptions。
+- 触发与影响：服务端设置 `sensitive=true` 时，屏幕显示密码遮蔽，但传给 IME 的仍为默认普通文本类型，自动纠错也默认开启。遵循 Android 输入类型的输入法仍可能提供普通文本预测/学习，和「敏感内容不落盘」的界面承诺不匹配。这里没有声称已观测到某个具体输入法保存答案。
+- 核对证据：本项目依赖的 AndroidX Foundation 1.8.0 官方 sources jar：BasicTextField.kt:738–742 将 visualTransformation 和 keyboardOptions.toImeOptions 分开传递；CoreTextField.kt:453–461 的密码判断用于 semantics；KeyboardOptions.kt 的默认自动纠错为 true，默认 keyboardType 为 Text。现有真机测试只检查 AccessibilityNodeInfo.isPassword，它证明遮蔽/语义成立，不能证明 EditorInfo 的输入类型。
+- 修复与验收：两类 sensitive 输入都显式使用密码 keyboardType，关闭自动纠错（必要时关闭个性化学习）；非敏感输入保留正常键盘。增加聚焦后的 EditorInfo/inputType 验证，不只检查 isPassword 或截图。不要把视觉遮蔽等同于输入法密码模式。
+
+### R10 合法的空选项纯文本提问被标成 oversized（P2）
+
+- 状态：已修复，自查与定向验证通过，待 review。
+- 位置：`scripts/zcode/bridge.py:232–239` 及 `project_questions():145`。
+- 触发与影响：`userInput` 的 `freeText=true` 同时携带 `options:[]` 或 `questions:[]`，当前因数组必须非空而进入 `supported:false / unsupportedReason:oversized`，手机无法输入回答。相同请求仅省略这两个空数组时却正常。服务端 shared snapshot.ts 的 userInputRequestPayloadSchema 对这两个可选数组均没有非空约束；这是合法的纯文本形态，并非超限数据。
+- 最小复现（本轮直接运行，未改仓库测试）：向 project_interaction 输入固定 interactionId、kind=userInput、payload.kind=userInput/prompt/freeText=true。仅 freeText 返回 supported=true；加入 options=[] 返回 supported=false/oversized；改为 questions=[] 也返回 supported=false/oversized。
+- 修复与验收：区分「不存在结构化问题/选项，允许自由输入」和「已有结构化内容不合法或超限」。freeText=true 的空数组应走简单文本应答；非空但非法/超限的结构化题目不能静默降级或裁掉后继续提交。补三个等价形态的 Python 投影断言，以及至少一个通过真实 bridge 投影后在 App 输入并发送 freeText 的测试。
+
+
+## R9/R10 修复交付（2026-11-02）
+
+- 基线 `56363f5`，由 Codex 按用户要求直接修复。R9：简单回答与结构化自定义回答共用 KeyboardOptions；sensitive 使用 Password 并关闭自动纠错，普通输入保留默认配置。R10：freeText=true 时将空 questions/options 视为合法纯文本形态；非空但非法/超限的数据仍严格拒绝，不静默降级。
+- 新增共享契约夹具 `android/app/src/androidTest/assets/free-text-interactions.json`，覆盖省略数组、空 options、空 questions、两者均空。Python 通过真实 `Bridge.dispatch(session/read)` 验证投影与夹具一致；Android 将同一投影经 FakeRpcBridge/RpcClient 送入实际 UI，逐项输入、点击发送并核对 freeText 应答。此项是跨端契约与 UI 测试，不冒充真实 agent/SSH 端到端；此前真实链路证据仍见上一轮记录。
+- Python bridge **40 项通过**，包含空 questions + 非空 options 保留、非法结构和 freeText=false 不绕过校验。JVM **92 通过、1 跳过**（可选 SSH fixture 未提供）；签名 release、release androidTest 构建及 lintRelease 通过；源码导出检查通过。开发机 bridge 已部署，与仓库 bridge.py 哈希一致。
+- Android 13 真机定向 **4 项全部通过**：`sensitiveEditorsExposePasswordInputTypeToIme`、`bridgeProjectedEmptyArraysAllowFreeTextSubmissionUi`、`simpleDraftSurvivesDismissAndIncompleteWindowAndFocusSnoozes`、`reviewSingleChoiceCustomAnswerUi`。IME 用例读取聚焦 Compose View 创建输入连接时提供的 EditorInfo，覆盖两类输入的敏感/普通四种配置，断言密码类型与自动纠错标志；没有仅凭遮蔽截图判定。
+- 初次测试失败后曾怀疑设备被其他任务占用；用户提示后检查未发现活跃 instrumentation，仅有其他 App 前台和本项目残留进程，不能据此前台页面断言存在并发操作。清理本项目测试进程后继续定位，修正测试对复用无障碍节点密码标记的依赖，以及 ACTION_SET_TEXT 后未等待发送按钮启用的竞态；最终四项回归通过。失败日志保留，不计为通过。
+- 私有证据：`~/.local/state/pockethelm/interaction-r9-r10-20261102/`，最终真机日志 `targeted-final.txt`，构建日志 `build.log` / `test-rebuild.log`。未重复跑源码未变的全量真机集或新建原生 agent 会话。
+- 已测且已安装产品 APK SHA-256：`7819f4e835d686088400e7331f98d9b017de20d35aa590fc900c052366f05860`。最终源码快照 SHA-256：`8aaa996d1bc22c57712b15fa70d09a38e6f53bcd56a6dadea7d431c811efc978`（按路径排序，路径 + NUL + 内容 + NUL；范围 git 跟踪的 android/ 与 scripts/zcode/，含新增 fixture）。产品源码构建后未变，仅调整测试等待与文档。
+- 已卸载 androidTest、移除本轮临时 APK/截图缓存，AppOps 10021/10032 恢复原值 ignore；拉取已安装 APK 校验哈希一致。保留修复版 App 和用户数据。提交并推送原 `interaction-approvals` 分支，触发远程 CI；版本仍为 0.4.12/22，不合并或发布商店。
+
+
 ## 发布或完成 由 Codex 维护
 
-- 最终代码与测试产物一致性：基线、源码快照及已安装 APK 哈希见上；最终仅文档和测试断言变化，产品 APK 未重建。
+- 最终代码与测试产物一致性：以最新「R9/R10 修复交付」的源码快照、已测/已安装 APK 哈希及定向验证为准；上一轮哈希仅保留作历史证据。
 - 发布版本、APK SHA-256 与商店验证：本次为任务分支修复交付，版本维持 0.4.12/22，未合并或发布商店。
-- 完成时间及说明：2026-11-02；R1–R8 修复记录齐全，交付 `interaction-approvals` 分支待 review。
+- 完成时间及说明：2026-11-02；R1–R10 修复记录齐全，交付 `interaction-approvals` 分支待 review。

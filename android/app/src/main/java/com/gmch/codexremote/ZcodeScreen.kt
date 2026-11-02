@@ -6,6 +6,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -17,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import kotlinx.coroutines.delay
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -250,6 +252,10 @@ private fun zcodeUnsupportedReason(reason: String) = when (reason) {
 }
 
 /** Simple interactions (permission or option-only userInput): optionId / freeText answers. */
+private fun interactionKeyboardOptions(sensitive: Boolean) = if (sensitive)
+    KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false)
+else KeyboardOptions.Default
+
 @Composable
 private fun ZcodeSimpleInteraction(interaction: ZInteraction, session: ZSession, vm: ZcodeViewModel, disabled: Boolean, form: InteractionFormState) {
     if (interaction.summary.isNotBlank()) Text(interaction.summary, fontSize = 13.sp)
@@ -263,7 +269,8 @@ private fun ZcodeSimpleInteraction(interaction: ZInteraction, session: ZSession,
     if (interaction.freeText) {
         OutlinedTextField(form.text, { form.text = it; vm.noteInteractionTouch(session, interaction) },
             Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) vm.noteInteractionTouch(session, interaction) }, enabled = !disabled, label = { Text(if (interaction.sensitive) "输入（敏感内容不落盘）" else "输入回答") },
-            visualTransformation = if (interaction.sensitive) PasswordVisualTransformation() else VisualTransformation.None)
+            visualTransformation = if (interaction.sensitive) PasswordVisualTransformation() else VisualTransformation.None,
+            keyboardOptions = interactionKeyboardOptions(interaction.sensitive))
         TextButton({ vm.interactFreeText(session, interaction, form.text) }, enabled = !disabled && form.text.isNotBlank()) { Text("发送") }
     }
 }
@@ -312,7 +319,8 @@ private fun ZcodeQuestionForm(
             form.drafts[question.question] = draft.copy(customAnswer = value, selectedValues = if (question.multiSelect) draft.selectedValues else emptyList())
         }, Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) vm.noteInteractionTouch(session, interaction) },
             label = { Text("自定义回答") }, enabled = !disabled,
-            visualTransformation = if (interaction.sensitive) PasswordVisualTransformation() else VisualTransformation.None)
+            visualTransformation = if (interaction.sensitive) PasswordVisualTransformation() else VisualTransformation.None,
+            keyboardOptions = interactionKeyboardOptions(interaction.sensitive))
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             if (index > 0) TextButton({ form.index = index - 1 }, enabled = !disabled) { Text("上一题") }
             if (index < questions.size - 1) TextButton({ form.index = index + 1 }, enabled = !disabled) { Text("下一题") }

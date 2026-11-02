@@ -29,6 +29,39 @@ def user_input_interaction(interaction_id='i-1', **payload):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_free_text_fixture_matches_real_session_read_projection(self):
+        # Android reads this same bridge-generated artifact through its actual RpcClient/UI.
+        fixture = Path(__file__).resolve().parents[2] / 'android/app/src/androidTest/assets/free-text-interactions.json'
+        cases = json.loads(fixture.read_text())
+        self.assertEqual(len(cases), 4)
+        for case in cases:
+            with self.subTest(payload=case['snapshot']['pendingInteractions'][0]['payload']):
+                bridge = Bridge(Mock()); bridge.client_id = 'pockethelm-test'
+                bridge.snapshot = Mock(return_value=case['snapshot'])
+                actual = bridge.dispatch('session/read', {})
+                self.assertEqual(actual, case['sessionRead'])
+                detail = actual['interactions'][0]
+                self.assertTrue(detail['supported'])
+                self.assertTrue(detail['freeText'])
+                self.assertFalse(detail.get('questions'))
+                self.assertFalse(detail.get('options'))
+
+    def test_empty_questions_preserve_nonempty_simple_options(self):
+        detail = project_interactions([user_input_interaction(questions=[],
+            options=[{'optionId': 'continue', 'label': '继续'}])])[0][0]
+        self.assertTrue(detail['supported'])
+        self.assertEqual(detail['options'], [{'optionId': 'continue', 'label': '继续'}])
+
+    def test_free_text_does_not_bypass_invalid_structured_payload(self):
+        for fields in ({'questions': {}}, {'questions': ''}, {'questions': [None]},
+                       {'questions': [{'question': 'Q', 'options': []}]},
+                       {'questions': [], 'options': {}}, {'questions': [], 'options': [None]},
+                       {'questions': [], 'options': [{'optionId': 'x' * 1025}]},
+                       {'questions': [], 'freeText': False}, {'options': [], 'freeText': False}):
+            with self.subTest(fields=fields):
+                detail = project_interactions([user_input_interaction(**fields)])[0][0]
+                self.assertFalse(detail['supported'])
+
     def quota_bridge(self, kind):
         bridge = Bridge(Mock()); bridge.client_id = 'test'
         chosen = {'providerId': 'account:bigmodel-' + kind, 'modelId': 'model'}

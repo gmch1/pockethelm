@@ -619,6 +619,117 @@ class ApprovalInteractionTest {
         }
     }
 
+    @androidx.test.filters.SdkSuppress(minSdkVersion = 29)
+    @Test fun sensitiveEditorsExposePasswordInputTypeToIme() = runBlocking {
+        freshCodex(); freshZcode()
+        val variants = listOf(
+            zFreeTextInteraction.copy(id = "plain-simple", sensitive = false),
+            zFreeTextInteraction.copy(id = "secret-simple"),
+            zFormInteraction.copy(id = "secret-form", sensitive = true),
+            zFormInteraction.copy(id = "plain-form", sensitive = false))
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                codexState.value = UiState(engine = "zcode", saved = false)
+                zState.value = zState.value.copy(interactions = listOf(variants.first()), interactionCount = 1, interactionsComplete = true)
+                ZcodeViewModel::class.java.getDeclaredField("historySyncedAt").apply { isAccessible = true }.set(zvm, System.currentTimeMillis())
+                activity.setContent { PocketHelmTheme { EngineApp(codex, zvm) } }
+            }
+            reviewOpenBanner("ZCode 等待输入")
+            instrumentation.runOnMainSync { zvm.leave() }
+            variants.forEach { interaction ->
+                instrumentation.runOnMainSync { zState.value = zState.value.copy(interactions = listOf(interaction)) }
+                val label = if (interaction.questions.isNotEmpty()) "自定义回答"
+                    else if (interaction.sensitive) "输入（敏感内容不落盘）" else "输入回答"
+                reviewAwait { reviewNodes().any { it.text?.toString() == label } }
+                instrumentation.waitForIdleSync(); delay(400)
+                // The same Compose node is reused across variants. Select the visible
+                // editor; assert the IME contract below instead of cached accessibility flags.
+                reviewAwait { reviewNodes().any { it.isEditable } }
+                val editor = reviewNodes().first { it.isEditable }
+                assertTrue(editor.performAction(AccessibilityNodeInfo.ACTION_FOCUS))
+                var actual: android.view.inputmethod.EditorInfo? = null
+                reviewAwait { actual = focusedEditorInfo(); actual != null }
+                val info = actual!!
+                assertEquals(android.text.InputType.TYPE_CLASS_TEXT, info.inputType and android.text.InputType.TYPE_MASK_CLASS)
+                assertEquals(interaction.id,
+                    if (interaction.sensitive) android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD else android.text.InputType.TYPE_TEXT_VARIATION_NORMAL,
+                    info.inputType and android.text.InputType.TYPE_MASK_VARIATION)
+                if (interaction.sensitive) assertEquals("Sensitive input must disable autocorrect", 0,
+                    info.inputType and android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT)
+                else assertTrue("Normal input keeps autocorrect", info.inputType and android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT != 0)
+            }
+        }
+    }
+
+    /** Ask the focused Compose view for the EditorInfo delivered to IME, including sheet windows. */
+    @androidx.annotation.RequiresApi(29)
+    private fun focusedEditorInfo(): android.view.inputmethod.EditorInfo? {
+        var result: android.view.inputmethod.EditorInfo? = null
+        instrumentation.runOnMainSync {
+            fun visit(view: android.view.View) {
+                if (result != null || !view.hasWindowFocus()) return
+                if (view.onCheckIsTextEditor()) {
+                    val info = android.view.inputmethod.EditorInfo()
+                    if (view.onCreateInputConnection(info) != null) result = info
+                }
+                if (view is android.view.ViewGroup) for (i in 0 until view.childCount) visit(view.getChildAt(i))
+            }
+            android.view.inspector.WindowInspector.getGlobalWindowViews().forEach(::visit)
+        }
+        return result
+    }
+
+    @Test fun bridgeProjectedEmptyArraysAllowFreeTextSubmissionUi() = runBlocking {
+        freshCodex(); freshZcode()
+        val cases = JSONArray(instrumentation.context.assets.open("free-text-interactions.json").bufferedReader().use { it.readText() }).objects()
+        val snapshot = AtomicReference(cases.first().getJSONObject("sessionRead"))
+        val sent = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        zBridge.scripted["session/read"] = { JSONObject(snapshot.get().toString()) }
+        zBridge.scripted["session/interact"] = { request ->
+            sent.add(request.getJSONObject("params"))
+            snapshot.set(JSONObject(snapshot.get().toString()).apply {
+                put("revision", optLong("revision") + 1); put("interactions", JSONArray()); put("interactionCount", 0)
+            })
+            obj("status" to "accepted")
+        }
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                codexState.value = UiState(engine = "zcode", saved = false)
+                zState.value = zState.value.copy(interactions = emptyList(), interactionCount = 0)
+                ZcodeViewModel::class.java.getDeclaredField("historySyncedAt").apply { isAccessible = true }.set(zvm, System.currentTimeMillis())
+                activity.setContent { PocketHelmTheme { EngineApp(codex, zvm) } }
+            }
+            cases.forEachIndexed { index, fixture ->
+                snapshot.set(fixture.getJSONObject("sessionRead"))
+                instrumentation.runOnMainSync { zvm.retryLoad() }
+                assertTrue(awaitZ { it.interactions.singleOrNull()?.id == "free-text-$index" })
+                reviewOpenBanner("ZCode 等待输入")
+                instrumentation.runOnMainSync { zvm.leave() }
+                reviewAwait { reviewNodes().any { it.text?.toString() == "输入回答" } }
+                instrumentation.waitForIdleSync(); delay(300)
+                val text = "fixture-answer-$index"
+                val editor = reviewNodes().first { it.isEditable }
+                assertTrue(editor.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, android.os.Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                }))
+                // ACTION_SET_TEXT returns before recomposition enables Send.
+                reviewAwait {
+                    var button = reviewNodes().firstOrNull { it.text?.toString() == "发送" }
+                    while (button != null && !button.isClickable && button.parent != null) button = button.parent
+                    button?.isClickable == true && button.isEnabled
+                }
+                reviewClick("发送")
+                assertTrue(awaitZ { it.interactions.isEmpty() && it.interactSubmitting.isEmpty() })
+                assertEquals(index + 1, sent.size)
+                assertEquals("free-text-$index", sent[index].getString("interactionId"))
+                val answer = sent[index].getJSONObject("answer")
+                assertEquals(setOf("freeText"), answer.keys().asSequence().toSet())
+                assertEquals(text, answer.getString("freeText"))
+                reviewAwait { reviewNodes().none { it.text?.toString() == "输入回答" } }
+            }
+        }
+    }
+
     /** Optional live fixture, transported over an adb reverse tunnel to a loopback-only
      * bridge. Only the provisioned test session is allowed by the fixture server. */
     @Test fun realZcodeQuestionUi() = runBlocking {

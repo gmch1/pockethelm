@@ -229,14 +229,18 @@ def project_interaction(interaction):
             detail['freeText'] = payload.get('freeText') is True
             detail['sensitive'] = payload.get('sensitive') is True
             detail['toolName'] = display_text(payload.get('toolName'), 200)
-            if payload.get('questions') is not None:
-                detail['questions'] = project_questions(payload['questions'])
+            questions = payload.get('questions')
+            # Empty optional arrays are a valid free-text shape, not malformed structured
+            # questions. Nonempty/invalid structures still go through strict validation.
+            if questions is not None and not (questions == [] and detail['freeText']):
+                detail['questions'] = project_questions(questions)
                 index = payload.get('currentQuestionIndex')
                 if type(index) is int and 0 <= index < len(detail['questions']):
                     detail['currentQuestionIndex'] = index
             elif payload.get('options') is not None:
                 options = payload['options']
-                require(isinstance(options, list) and 0 < len(options) <= INTERACTION_OPTIONS_MAX, '交互选项无效')
+                require(isinstance(options, list) and len(options) <= INTERACTION_OPTIONS_MAX
+                    and (len(options) > 0 or detail['freeText']), '交互选项无效')
                 detail['options'] = [{'optionId': string(option.get('optionId'), INTERACTION_ID_MAX),
                     'label': display_text(option.get('label'), 512)}
                     for option in options if isinstance(option, dict)]

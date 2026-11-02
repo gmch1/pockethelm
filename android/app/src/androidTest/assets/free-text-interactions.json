@@ -1,0 +1,276 @@
+[
+  {
+    "snapshot": {
+      "sessionId": "s1",
+      "revision": 10,
+      "logEpoch": "e1",
+      "meta": {
+        "title": "t"
+      },
+      "config": {
+        "mode": "yolo",
+        "modelSelection": null
+      },
+      "control": {
+        "phase": "waiting",
+        "canStop": false,
+        "activeWorks": []
+      },
+      "rows": {
+        "window": [],
+        "totalCount": 0
+      },
+      "queue": {
+        "items": []
+      },
+      "pendingInteractions": [
+        {
+          "interactionId": "free-text-0",
+          "kind": "userInput",
+          "payload": {
+            "kind": "userInput",
+            "prompt": "输入回答以继续",
+            "freeText": true
+          }
+        }
+      ]
+    },
+    "sessionRead": {
+      "id": "s1",
+      "title": "t",
+      "revision": 10,
+      "logEpoch": "e1",
+      "selection": null,
+      "mode": "yolo",
+      "phase": "waiting",
+      "canStop": false,
+      "executionId": "",
+      "items": [],
+      "totalRows": 0,
+      "firstRowId": null,
+      "hasMore": false,
+      "queue": [],
+      "interactionCount": 1,
+      "interactions": [
+        {
+          "kind": "userInput",
+          "interactionId": "free-text-0",
+          "prompt": "输入回答以继续",
+          "freeText": true,
+          "sensitive": false,
+          "toolName": "",
+          "supported": true
+        }
+      ],
+      "interactionsComplete": true,
+      "lastError": ""
+    }
+  },
+  {
+    "snapshot": {
+      "sessionId": "s1",
+      "revision": 20,
+      "logEpoch": "e1",
+      "meta": {
+        "title": "t"
+      },
+      "config": {
+        "mode": "yolo",
+        "modelSelection": null
+      },
+      "control": {
+        "phase": "waiting",
+        "canStop": false,
+        "activeWorks": []
+      },
+      "rows": {
+        "window": [],
+        "totalCount": 0
+      },
+      "queue": {
+        "items": []
+      },
+      "pendingInteractions": [
+        {
+          "interactionId": "free-text-1",
+          "kind": "userInput",
+          "payload": {
+            "kind": "userInput",
+            "prompt": "输入回答以继续",
+            "freeText": true,
+            "options": []
+          }
+        }
+      ]
+    },
+    "sessionRead": {
+      "id": "s1",
+      "title": "t",
+      "revision": 20,
+      "logEpoch": "e1",
+      "selection": null,
+      "mode": "yolo",
+      "phase": "waiting",
+      "canStop": false,
+      "executionId": "",
+      "items": [],
+      "totalRows": 0,
+      "firstRowId": null,
+      "hasMore": false,
+      "queue": [],
+      "interactionCount": 1,
+      "interactions": [
+        {
+          "kind": "userInput",
+          "interactionId": "free-text-1",
+          "prompt": "输入回答以继续",
+          "freeText": true,
+          "sensitive": false,
+          "toolName": "",
+          "options": [],
+          "supported": true
+        }
+      ],
+      "interactionsComplete": true,
+      "lastError": ""
+    }
+  },
+  {
+    "snapshot": {
+      "sessionId": "s1",
+      "revision": 30,
+      "logEpoch": "e1",
+      "meta": {
+        "title": "t"
+      },
+      "config": {
+        "mode": "yolo",
+        "modelSelection": null
+      },
+      "control": {
+        "phase": "waiting",
+        "canStop": false,
+        "activeWorks": []
+      },
+      "rows": {
+        "window": [],
+        "totalCount": 0
+      },
+      "queue": {
+        "items": []
+      },
+      "pendingInteractions": [
+        {
+          "interactionId": "free-text-2",
+          "kind": "userInput",
+          "payload": {
+            "kind": "userInput",
+            "prompt": "输入回答以继续",
+            "freeText": true,
+            "questions": []
+          }
+        }
+      ]
+    },
+    "sessionRead": {
+      "id": "s1",
+      "title": "t",
+      "revision": 30,
+      "logEpoch": "e1",
+      "selection": null,
+      "mode": "yolo",
+      "phase": "waiting",
+      "canStop": false,
+      "executionId": "",
+      "items": [],
+      "totalRows": 0,
+      "firstRowId": null,
+      "hasMore": false,
+      "queue": [],
+      "interactionCount": 1,
+      "interactions": [
+        {
+          "kind": "userInput",
+          "interactionId": "free-text-2",
+          "prompt": "输入回答以继续",
+          "freeText": true,
+          "sensitive": false,
+          "toolName": "",
+          "supported": true
+        }
+      ],
+      "interactionsComplete": true,
+      "lastError": ""
+    }
+  },
+  {
+    "snapshot": {
+      "sessionId": "s1",
+      "revision": 40,
+      "logEpoch": "e1",
+      "meta": {
+        "title": "t"
+      },
+      "config": {
+        "mode": "yolo",
+        "modelSelection": null
+      },
+      "control": {
+        "phase": "waiting",
+        "canStop": false,
+        "activeWorks": []
+      },
+      "rows": {
+        "window": [],
+        "totalCount": 0
+      },
+      "queue": {
+        "items": []
+      },
+      "pendingInteractions": [
+        {
+          "interactionId": "free-text-3",
+          "kind": "userInput",
+          "payload": {
+            "kind": "userInput",
+            "prompt": "输入回答以继续",
+            "freeText": true,
+            "questions": [],
+            "options": []
+          }
+        }
+      ]
+    },
+    "sessionRead": {
+      "id": "s1",
+      "title": "t",
+      "revision": 40,
+      "logEpoch": "e1",
+      "selection": null,
+      "mode": "yolo",
+      "phase": "waiting",
+      "canStop": false,
+      "executionId": "",
+      "items": [],
+      "totalRows": 0,
+      "firstRowId": null,
+      "hasMore": false,
+      "queue": [],
+      "interactionCount": 1,
+      "interactions": [
+        {
+          "kind": "userInput",
+          "interactionId": "free-text-3",
+          "prompt": "输入回答以继续",
+          "freeText": true,
+          "sensitive": false,
+          "toolName": "",
+          "options": [],
+          "supported": true
+        }
+      ],
+      "interactionsComplete": true,
+      "lastError": ""
+    }
+  }
+]
