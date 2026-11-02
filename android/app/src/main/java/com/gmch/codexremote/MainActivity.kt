@@ -25,6 +25,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -130,14 +131,19 @@ internal fun HostTrustDialog(state: UiState, vm: RemoteViewModel) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, String) -> Unit) {
     val session = state.selected!!
     var steer by rememberSaveable(session.id) { mutableStateOf(false) }
     var confirmUncertain by remember { mutableStateOf(false) }
+    // Only this thread's approvals render here; other threads keep their cards in state.
+    val approvals = state.approvals.filter { it.threadId == session.id }
+    var approvalSheet by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
-        ChatRunHeader(codexAgentRun(state.connected, session.runtime), session.status, state.historyCached, state.connected,
+        ChatRunHeader(codexAgentRun(state.connected, session.runtime, approvals.size), session.status, state.historyCached, state.connected,
             session.runtime == "active", state.connected && !state.busy && session.activeTurnId.isNotBlank(), vm::interrupt)
+        if (approvals.isNotEmpty()) InteractionBanner(approvalLabel(approvals), approvals.size) { approvalSheet = true }
         if (pendingProtectionVisible(state.uncertain != null, state.sending)) Surface(color = Color(0xfffaf0dc)) {
             Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
                 Text("上一条消息的接收结果待核对，草稿已保留。刷新会自动核对最近历史和队列。", fontSize = 12.sp)
@@ -158,6 +164,78 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
         ChatComposer(state.draft, vm::draft, state.sending,
             state.connected && !state.busy && !state.sending && state.draft.isNotBlank() && state.uncertain == null,
             steer, { steer = it }, { vm.send(steer && session.runtime == "active") })
+    }
+    if (approvalSheet && approvals.isNotEmpty()) {
+        CodexApprovalSheet(approvals, state.items, state.connected && !state.busy, vm::decide) { approvalSheet = false }
+    }
+}
+
+private fun approvalLabel(approvals: List<PendingApproval>): String {
+    val titles = approvals.map { approvalTitle(it.kind) }.distinct()
+    return titles.singleOrNull() ?: "审批"
+}
+
+private fun approvalTitle(kind: String) = when (kind) {
+    "writeStdin" -> "向运行中进程输入"; "fileChange" -> "文件改动审批"; else -> "命令审批"
+}
+
+private val decisionLabels = linkedMapOf("accept" to "允许", "acceptForSession" to "本会话允许", "decline" to "拒绝")
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CodexApprovalSheet(
+    approvals: List<PendingApproval>, items: List<TimelineItem>, enabled: Boolean,
+    decide: (PendingApproval, String) -> Unit, onDismiss: () -> Unit
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            approvals.forEach { approval ->
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(approvalTitle(approval.kind), style = MaterialTheme.typography.titleLarge)
+                    if (approval.cwd.isNotBlank()) Text("目录：${approval.cwd}", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (approval.kind == "fileChange" && approval.grantRoot.isNotBlank())
+                        Text("授权目录：${approval.grantRoot}", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    // Compact by default, expandable in full: never authorize against a clipped command.
+                    ApprovalBody(approval, items)
+                    when {
+                        approval.sent -> Text("已发送，等待服务器确认", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                        approval.decisions.isEmpty() -> Text(
+                            if (approval.hasObjectDecisions) "该审批包含当前客户端不支持的决策类型（如策略修改），请在原终端处理。"
+                            else "该审批没有当前客户端可用的决策选项，请在原终端处理。",
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                        else -> Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            approval.decisions.forEach { decision ->
+                                TextButton({ decide(approval, decision) }, enabled = enabled) {
+                                    Text(decisionLabels[decision] ?: decision, color = if (decision == "decline") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            }
+        }
+    }
+}
+
+/** Monospace body, collapsed to a few lines by default with an explicit expand toggle.
+ *  File changes append the timeline item's own text (same thread only, by itemId). */
+@Composable
+private fun ApprovalBody(approval: PendingApproval, items: List<TimelineItem>) {
+    val itemText = if (approval.kind == "fileChange") items.firstOrNull { it.id == approval.itemId }?.text.orEmpty() else ""
+    val body = listOf(approval.body, itemText).filter { it.isNotBlank() }.joinToString("\n\n")
+    if (body.isBlank()) return
+    var expanded by remember(approval.key) { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceContainer)
+        .clickable { expanded = !expanded }.padding(10.dp)) {
+        SelectionContainer {
+            Text(body, fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                maxLines = if (expanded) Int.MAX_VALUE else 6, overflow = TextOverflow.Ellipsis)
+        }
+        Text(if (expanded) "收起" else "展开完整内容", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(top = 4.dp))
     }
 }
 

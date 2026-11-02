@@ -400,6 +400,25 @@ internal fun ChatRunHeader(run: AgentRun, label: String, cached: Boolean, connec
     }
 }
 
+/**
+ * Shared compact entry for pending interactions on both engines: one line under the run
+ * header with the pending count; full content and answer controls open in a bottom sheet,
+ * so nothing is stacked over the timeline.
+ */
+@Composable
+internal fun InteractionBanner(label: String, count: Int, onClick: () -> Unit) {
+    Surface(color = Color(0xfffdeccd), modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().clickable(onClickLabel = "查看待交互内容", onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Outlined.PanToolAlt, null, Modifier.size(14.dp), tint = Color(0xff8a5a00))
+            Spacer(Modifier.width(6.dp))
+            Text("待交互 $count · $label", Modifier.weight(1f), fontSize = 12.sp, color = Color(0xff6b4700),
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Icon(Icons.Outlined.ChevronRight, null, Modifier.size(16.dp), tint = Color(0xff8a5a00))
+        }
+    }
+}
+
 @Composable
 internal fun ChatSettingsBar(summary: String, quota: String, settings: () -> Unit, showQuota: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {

@@ -87,4 +87,67 @@ class ProtocolTest {
             assertTrue("调用方取消必须仍是取消：${job.getCompletionExceptionOrNull()}", job.isCancelled)
         } finally { client.close(); server.close(); source.close() }
     }
+
+    @Test fun respondEchoesRequestIdWithTypePreserved() = runBlocking {
+        val source = PipedInputStream(); val server = PipedOutputStream(source)
+        val output = ByteArrayOutputStream()
+        val client = RpcClient(source, output, {}, {})
+        try {
+            client.respond(7, obj("decision" to "accept"))           // numeric id stays numeric
+            client.respond("7", obj("decision" to "decline"))        // string id stays string
+            val lines = output.toString().lines().filter { it.isNotBlank() }
+            assertEquals(2, lines.size)
+            assertEquals(7, JSONObject(lines[0]).getInt("id"))
+            assertEquals("accept", JSONObject(lines[0]).getJSONObject("result").string("decision"))
+            assertEquals("7", JSONObject(lines[1]).getString("id"))
+            assertEquals("decline", JSONObject(lines[1]).getJSONObject("result").string("decision"))
+        } finally { client.close(); server.close(); source.close() }
+    }
+
+    @Test fun approvalKeysKeepNumberAndStringIdsDistinct() {
+        assertEquals("n:7", PendingApproval.keyOf(7))
+        assertEquals("s:7", PendingApproval.keyOf("7"))
+        assertNotEquals(PendingApproval.keyOf(7), PendingApproval.keyOf("7"))
+        // Same numeric value in Int or Long form is the same id; only the string form differs.
+        assertEquals(PendingApproval.keyOf(7L), PendingApproval.keyOf(7))
+    }
+
+    @Test fun approvalParsingCoversKindsDecisionsAndDefaults() {
+        val decisions = org.json.JSONArray()
+            .put("accept").put("decline").put(obj("acceptWithExecpolicyAmendment" to obj()))
+        val command = obj("id" to 11, "method" to "item/commandExecution/requestApproval",
+            "params" to obj("threadId" to "t1", "turnId" to "u1", "itemId" to "c1",
+                "kind" to "command", "command" to "rm -rf build", "cwd" to "/w",
+                "availableDecisions" to decisions))
+        val parsed = PendingApproval.parse(command, 3)!!
+        assertEquals("n:11", parsed.key); assertEquals(11, parsed.rawId)
+        assertEquals(3, parsed.generation); assertEquals("command", parsed.kind)
+        assertEquals(listOf("accept", "decline"), parsed.decisions)
+        assertTrue(parsed.hasObjectDecisions)
+
+        val writeStdin = obj("id" to "s-1", "method" to "item/commandExecution/requestApproval",
+            "params" to obj("threadId" to "t1", "turnId" to "u1", "itemId" to "c2",
+                "kind" to "writeStdin", "command" to "y"))
+        assertEquals("writeStdin", PendingApproval.parse(writeStdin, 3)!!.kind)
+
+        val fileChange = obj("id" to 12, "method" to "item/fileChange/requestApproval",
+            "params" to obj("threadId" to "t1", "turnId" to "u1", "itemId" to "f1",
+                "reason" to "修改配置", "grantRoot" to "/w/config"))
+        val file = PendingApproval.parse(fileChange, 3)!!
+        assertEquals("fileChange", file.kind); assertEquals("/w/config", file.grantRoot)
+        // Absent availableDecisions: the full supported set renders.
+        assertEquals(PendingApproval.DECISIONS, file.decisions)
+
+        val other = obj("id" to 13, "method" to "item/permissions/requestApproval", "params" to obj())
+        assertNull("未知交互类型不消费", PendingApproval.parse(other, 3))
+
+        // An advertised list with only object-form decisions must yield NO renderable
+        // buttons — presence of the field is not the same as absence.
+        val objectOnly = obj("id" to 14, "method" to "item/commandExecution/requestApproval",
+            "params" to obj("threadId" to "t1", "turnId" to "u1", "itemId" to "c3", "command" to "x",
+                "availableDecisions" to org.json.JSONArray().put(obj("acceptWithExecpolicyAmendment" to obj()))))
+        val unsupported = PendingApproval.parse(objectOnly, 3)!!
+        assertTrue(unsupported.advertised)
+        assertTrue(unsupported.decisions.isEmpty())
+    }
 }

@@ -103,4 +103,63 @@ class ZcodeModelsTest {
         assertEquals(listOf("ok"), listing.directories.map { it.name })
         assertEquals(listOf("/opt/ok"), listing.directories.map { it.path })
     }
+
+    // ---- Interaction answering (task 2026-11-02-interaction-approvals) ----
+
+    @Test fun interactionParsingKeepsIdentityAndUnsupportedFlags() {
+        val data = JSONObject("""{"interactions":[
+          {"interactionId":"i-1","kind":"userInput","supported":true,"prompt":"选一个","freeText":true,
+           "sensitive":true,"toolName":"AskUserQuestion","currentQuestionIndex":1,
+           "questions":[{"question":"Q1？","header":"第一题","options":[{"value":"a","label":"A"}]},
+                        {"question":"Q2？","header":"第二题","multiSelect":true,"options":[{"value":"b","label":"B"}]}],
+           "answerDrafts":{"Q1？":["a"]},
+           "autoResolution":{"state":"visibleCountdown","deadlineAt":1793600000000}},
+          {"interactionId":"i-2","kind":"workspaceHookReview","supported":false,"unsupportedReason":"unsupported_kind"}
+        ]}""")
+        val interactions = zcodeInteractions(data)
+        assertEquals(2, interactions.size)
+        val first = interactions[0]
+        assertTrue(first.supported); assertTrue(first.sensitive); assertEquals("AskUserQuestion", first.toolName)
+        assertEquals(2, first.questions.size); assertFalse(first.questions[0].multiSelect)
+        assertTrue(first.questions[1].multiSelect)
+        assertEquals(mapOf("Q1？" to listOf("a")), first.answerDrafts)
+        assertEquals(1, first.currentQuestionIndex)
+        assertEquals("visibleCountdown", first.autoResolution?.state)
+        val second = interactions[1]
+        assertFalse(second.supported); assertEquals("unsupported_kind", second.unsupportedReason)
+    }
+
+    /** Mirrors the official buildElicitationResponseContent shape exactly. */
+    @Test fun interactionContentMatchesOfficialAnswerShape() {
+        val q1 = ZQuestion("用哪个数据库？", "数据库", listOf(ZQuestionOption("postgres", "PostgreSQL"), ZQuestionOption("mysql", "MySQL")), multiSelect = false)
+        val q2 = ZQuestion("包含哪些模块？", "模块", listOf(ZQuestionOption("api", "API"), ZQuestionOption("web", "Web")), multiSelect = true)
+        val drafts = mapOf(
+            "用哪个数据库？" to ZFormDraft(listOf("postgres")),
+            "包含哪些模块？" to ZFormDraft(listOf("api"), "自定义模块"))
+        val content = buildInteractionContent(listOf(q1, q2), drafts)
+        // answers joins each question's values with ", " — including the custom answer.
+        assertEquals("postgres", content.getJSONObject("answers").string("用哪个数据库？"))
+        assertEquals("api, 自定义模块", content.getJSONObject("answers").string("包含哪些模块？"))
+        // answer_N keeps multi-select as array, single as plain string.
+        assertEquals("postgres", content.getString("answer_0"))
+        val second = content.getJSONArray("answer_1")
+        assertEquals(listOf("api", "自定义模块"), (0 until second.length()).map { second.getString(it) })
+        // Multi-question form has no legacy single "answer" key.
+        assertFalse(content.has("answer"))
+        assertTrue(interactionFormAnswered(listOf(q1, q2), drafts))
+    }
+
+    @Test fun singleQuestionContentAddsLegacyAnswerKeyAndUnansweredOmitted() {
+        val q = ZQuestion("继续吗？", "确认", listOf(ZQuestionOption("yes", "继续")), multiSelect = true)
+        val content = buildInteractionContent(listOf(q), mapOf("继续吗？" to ZFormDraft(listOf("yes"))))
+        assertEquals("yes", content.getJSONObject("answers").string("继续吗？"))
+        assertEquals("yes", content.getJSONArray("answer_0").getString(0))
+        // Single-question form also carries the legacy "answer" key as an array for multi-select.
+        assertEquals("yes", content.getJSONArray("answer").getString(0))
+        // An entirely unanswered form produces no answer keys and does not gate submit.
+        val empty = buildInteractionContent(listOf(q), emptyMap())
+        assertEquals(0, empty.getJSONObject("answers").length())
+        assertFalse(empty.has("answer_0")); assertFalse(empty.has("answer"))
+        assertFalse(interactionFormAnswered(listOf(q), emptyMap()))
+    }
 }

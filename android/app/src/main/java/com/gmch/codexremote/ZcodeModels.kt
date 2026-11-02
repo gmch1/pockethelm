@@ -1,5 +1,6 @@
 package com.gmch.codexremote
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 data class ZModel(val id: String, val levels: List<String>)
@@ -132,3 +133,87 @@ fun zcodeQuotaSummary(j: JSONObject, model: String): String {
     } else limits.firstOrNull { it.optInt("unit") == 3 } ?: limits.firstOrNull()
     return limit?.let { quotaRemainingPercent(it, start) }?.let { "剩余 ${quotaPercentText(it)}" } ?: "额度 ▾"
 }
+
+data class ZInteractionOption(val optionId: String, val label: String, val kind: String = "")
+data class ZQuestionOption(val value: String, val label: String, val description: String = "")
+data class ZQuestion(val question: String, val header: String, val options: List<ZQuestionOption>, val multiSelect: Boolean)
+data class ZAutoResolution(val state: String, val deadlineAt: Long = 0, val snoozedAt: Long = 0)
+data class ZInteraction(
+    val id: String, val kind: String, val supported: Boolean, val unsupportedReason: String = "",
+    val toolName: String = "", val summary: String = "", val prompt: String = "",
+    val freeText: Boolean = false, val sensitive: Boolean = false,
+    val options: List<ZInteractionOption> = emptyList(), val questions: List<ZQuestion> = emptyList(),
+    val currentQuestionIndex: Int = 0, val autoResolution: ZAutoResolution? = null,
+    val answerDrafts: Map<String, List<String>> = emptyMap()
+) {
+    /** Display title for banner and form header. */
+    val title get() = when (kind) {
+        "permission" -> "ZCode 权限确认"
+        "userInput" -> if (questions.isNotEmpty()) "ZCode 提问" else "ZCode 等待输入"
+        "workspaceHookReview" -> "工作区变更审查"
+        else -> "待交互"
+    }
+    companion object {
+        fun parse(j: JSONObject) = ZInteraction(
+            id = j.string("interactionId"), kind = j.string("kind"),
+            supported = j.optBoolean("supported"), unsupportedReason = j.string("unsupportedReason"),
+            toolName = j.string("toolName"), summary = j.string("summary"), prompt = j.string("prompt"),
+            freeText = j.optBoolean("freeText"), sensitive = j.optBoolean("sensitive"),
+            options = j.optJSONArray("options").objects().map {
+                ZInteractionOption(it.string("optionId"), it.string("label"), it.string("kind")) },
+            questions = j.optJSONArray("questions").objects().map { q ->
+                ZQuestion(q.string("question"), q.string("header"),
+                    q.optJSONArray("options").objects().map { ZQuestionOption(it.string("value"), it.string("label"), it.string("description")) },
+                    q.optBoolean("multiSelect")) },
+            currentQuestionIndex = j.optInt("currentQuestionIndex"),
+            autoResolution = j.optJSONObject("autoResolution")
+                ?.let { ZAutoResolution(it.string("state"), it.optLong("deadlineAt"), it.optLong("snoozedAt")) },
+            answerDrafts = j.optJSONObject("answerDrafts")?.let { drafts ->
+                drafts.keys().asSequence().associateWith { key -> drafts.optJSONArray(key)?.strings() ?: emptyList() }
+            } ?: emptyMap())
+    }
+}
+
+fun zcodeInteractions(j: JSONObject): List<ZInteraction> =
+    j.optJSONArray("interactions").objects().map { ZInteraction.parse(it) }
+
+/** Per-question in-memory form state; never persisted, even between snapshots of one interaction. */
+data class ZFormDraft(val selectedValues: List<String> = emptyList(), val customAnswer: String = "")
+
+private fun formAnswers(question: ZQuestion, draft: ZFormDraft?): List<String> {
+    val custom = draft?.customAnswer?.trim().orEmpty()
+    return (draft?.selectedValues ?: emptyList()) + (if (custom.isNotEmpty()) listOf(custom) else emptyList())
+}
+
+/**
+ * Builds the accept content exactly in the official client's shape
+ * (ElicitationDialog.buildElicitationResponseContent): only questions the user actually
+ * answered appear; `answers` joins with ", "; `answer_N` keeps multi-select as an array and
+ * single-select as one string; a single question also gets the legacy `answer` key.
+ * Callers must ensure at least one question is answered — this client disables submit
+ * otherwise (the bridge rejects an all-empty accept).
+ */
+fun buildInteractionContent(questions: List<ZQuestion>, drafts: Map<String, ZFormDraft>): JSONObject {
+    fun answersFor(question: ZQuestion) = formAnswers(question, drafts[question.question])
+    val content = JSONObject()
+    val answers = JSONObject()
+    questions.forEach { question ->
+        val values = answersFor(question)
+        if (values.isNotEmpty()) answers.put(question.question, values.joinToString(", "))
+    }
+    content.put("answers", answers)
+    questions.forEachIndexed { index, question ->
+        val values = answersFor(question)
+        if (values.isNotEmpty()) content.put("answer_$index", if (question.multiSelect) JSONArray(values) else values.first())
+    }
+    if (questions.size == 1) {
+        val values = answersFor(questions.first())
+        if (values.isNotEmpty()) content.put("answer", if (questions.first().multiSelect) JSONArray(values) else values.first())
+    }
+    return content
+}
+
+/** True when at least one question has a real answer — gates the submit button. */
+fun interactionFormAnswered(questions: List<ZQuestion>, drafts: Map<String, ZFormDraft>): Boolean =
+    questions.any { formAnswers(it, drafts[it.question]).isNotEmpty() }
+

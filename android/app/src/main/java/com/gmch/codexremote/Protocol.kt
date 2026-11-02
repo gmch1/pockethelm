@@ -77,6 +77,68 @@ data class QueuedMessage(val id: String, val clientId: String, val text: String)
     }
 }
 
+/**
+ * A server-initiated approval request awaiting this client's answer. The request id is
+ * echoed back verbatim when answering: [key] keeps number 7 and string "7" distinct, and
+ * [generation] binds the card to the connection it arrived on so a stale answer can never
+ * be written to a new connection.
+ */
+data class PendingApproval(
+    val key: String, val rawId: Any, val generation: Int, val kind: String,
+    val threadId: String, val turnId: String, val itemId: String,
+    val body: String, val cwd: String, val grantRoot: String,
+    val stringDecisions: List<String>, val hasObjectDecisions: Boolean,
+    val advertised: Boolean, val sent: Boolean = false
+) {
+    /** Buttons this client may render: the supported set, intersected with the server's
+     *  list when it advertised one. An advertised list with no renderable entries means
+     *  this client cannot answer at all — not a license to show every button. */
+    val decisions: List<String> get() =
+        if (!advertised) DECISIONS else DECISIONS.filter { it in stringDecisions }
+
+    companion object {
+        val DECISIONS = listOf("accept", "acceptForSession", "decline")
+
+        /** Type-sensitive identity: JSON number 7 and string "7" are different requests. */
+        fun keyOf(id: Any?) = when (id) {
+            is String -> "s:$id"
+            is Int, is Long -> "n:$id"
+            else -> "u:${id?.javaClass?.simpleName ?: "null"}:$id"
+        }
+
+        fun parse(message: JSONObject, generation: Int): PendingApproval? {
+            val method = message.string("method")
+            if (!message.has("id")) return null
+            val p = message.optJSONObject("params") ?: JSONObject()
+            val kind = when (method) {
+                "item/commandExecution/requestApproval" ->
+                    if (p.string("kind") == "writeStdin") "writeStdin" else "command"
+                "item/fileChange/requestApproval" -> "fileChange"
+                else -> return null
+            }
+            // Elements are the decisions themselves: plain strings, or object-form policy
+            // amendments this client cannot render (surfaced via hasObjectDecisions).
+            val advertised = p.optJSONArray("availableDecisions")
+            val strings = mutableListOf<String>()
+            var hasObjects = false
+            if (advertised != null) (0 until advertised.length()).forEach { i ->
+                when (val element = advertised.opt(i)) {
+                    is String -> strings.add(element)
+                    else -> if (element != null) hasObjects = true
+                }
+            }
+            return PendingApproval(
+                key = keyOf(message.opt("id")), rawId = message.opt("id")!!, generation = generation,
+                kind = kind, threadId = p.string("threadId"), turnId = p.string("turnId"),
+                itemId = p.string("itemId"),
+                body = if (kind == "fileChange") p.string("reason") else p.string("command"),
+                cwd = p.string("cwd"), grantRoot = p.string("grantRoot"),
+                stringDecisions = strings.distinct(), hasObjectDecisions = hasObjects,
+                advertised = advertised != null)
+        }
+    }
+}
+
 /** Called at the snapshot's position in the RPC stream, before subsequent deltas. */
 internal fun applyHistorySnapshot(
     timeline: MutableMap<String, TimelineItem>, snapshot: List<TimelineItem>, baseline: Map<String, TimelineItem>
@@ -167,6 +229,9 @@ class RpcClient(
         write(obj("method" to "initialized"))
         return result
     }
+
+    /** Answer a server-initiated request. The id must be echoed back verbatim, including type. */
+    suspend fun respond(id: Any, result: JSONObject) = write(obj("id" to id, "result" to result))
 
     suspend fun write(message: JSONObject) = writes.withLock {
         withContext(Dispatchers.IO) {

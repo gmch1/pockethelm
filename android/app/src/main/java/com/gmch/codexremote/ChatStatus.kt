@@ -33,8 +33,9 @@ fun timelineView(itemCount: Int, loading: Boolean, error: String?): TimelineView
 
 enum class AgentRun { Idle, Running, Waiting, WaitingInteraction, Offline }
 
-fun codexAgentRun(connected: Boolean, runtime: String): AgentRun = when {
+fun codexAgentRun(connected: Boolean, runtime: String, pendingApprovals: Int = 0): AgentRun = when {
     !connected -> AgentRun.Offline
+    pendingApprovals > 0 -> AgentRun.WaitingInteraction
     runtime == "active" -> AgentRun.Running
     else -> AgentRun.Idle
 }

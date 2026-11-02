@@ -35,7 +35,8 @@ data class UiState(
     val models: List<ModelOption> = emptyList(), val modelsLoading: Boolean = false, val modelsError: String? = null,
     val historyLoading: Boolean = false, val historyError: String? = null, val sending: Boolean = false,
     val modelSettings: ModelSettings? = null, val settingsNotice: String? = null,
-    val quota: AccountQuota? = null, val quotaLoading: Boolean = false, val quotaError: String? = null
+    val quota: AccountQuota? = null, val quotaLoading: Boolean = false, val quotaError: String? = null,
+    val approvals: List<PendingApproval> = emptyList()
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
@@ -191,7 +192,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 historyError = if (it.selected != null && it.items.isEmpty() && it.historyLoading)
                     "连接已断开，未能加载会话内容，重连后重试" else it.historyError,
                 status = reason, challenge = null,
-                modelsLoading = false, quotaLoading = false, modelSettings = it.modelSettings?.copy(confirmed = false))
+                modelsLoading = false, quotaLoading = false, modelSettings = it.modelSettings?.copy(confirmed = false),
+                // Local cards die with the connection; the server keeps the request for
+                // other clients and a stale answer must never reach a new connection.
+                approvals = emptyList())
         }
     }
 
@@ -839,15 +843,50 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         client().call("thread/name/set", obj("threadId" to id, "name" to name.trim()))
         loadThreadGuarded(id); loadSessions(false)
     }
+    /** Answer a pending approval on the connection it arrived on. */
+    fun decide(approval: PendingApproval, decision: String) = action {
+        // Captured under the action mutex: the connection object and the request must both
+        // still be the ones the card was rendered from.
+        val generation = epoch
+        val connection = client()
+        val current = mutable.value.approvals.firstOrNull { it.key == approval.key && it.generation == generation }
+            ?: return@action // Resolved elsewhere or the connection changed: card is already gone.
+        check(!current.sent) { "该审批已应答，等待服务器确认" }
+        check(current.threadId == mutable.value.selected?.id) { "会话已切换，请重新确认" }
+        check(decision in current.decisions) { "该审批不支持此决策" }
+        connection.respond(current.rawId, obj("decision" to decision))
+        // A write succeeding only means the answer left this device. Flip to sent only while
+        // the same generation still owns the card — a resolved notification processed during
+        // the write must not resurrect it.
+        mutable.update { state ->
+            if (generation == epoch && state.approvals.any { it.key == current.key })
+                state.copy(approvals = state.approvals.map { if (it.key == current.key) it.copy(sent = true) else it })
+            else state
+        }
+    }
 
     private fun handle(message: JSONObject) {
         val method = message.string("method")
         val p = message.optJSONObject("params") ?: obj()
         val threadId = p.string("threadId")
         if (message.has("id")) {
-            // This client has no approval workflow. Do not consume another client's pending callback.
-            mutable.update { it.copy(error = "服务器请求交互（$method）。当前客户端仅支持 YOLO 自动执行；请在原终端处理该请求。") }
+            // Server-initiated request. Approvals we can render enter the pending list;
+            // anything else is left unconsumed so another client stays free to answer it.
+            val approval = PendingApproval.parse(message, epoch)
+            if (approval != null) {
+                mutable.update { state ->
+                    state.copy(approvals = state.approvals.filterNot { it.key == approval.key } + approval)
+                }
+            } else {
+                mutable.update { it.copy(error = "服务器请求交互（$method）。当前客户端不支持该交互类型；请在原终端处理该请求。") }
+            }
             return
+        }
+        if (method == "serverRequest/resolved") {
+            // Another client answered (or the server cancelled): withdraw the card by its
+            // type-sensitive request id. Never matches a differently-typed id.
+            val resolvedKey = PendingApproval.keyOf(p.opt("requestId"))
+            mutable.update { it.copy(approvals = it.approvals.filterNot { it.key == resolvedKey && it.threadId == threadId }) }
         }
         if (method == "thread/settings/updated") p.optJSONObject("threadSettings")?.let { acceptSettings(threadId, ModelSettings.parse(it)) }
         if (method == "account/rateLimits/updated") refreshQuota(fromEvent = true)
@@ -870,6 +909,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             fun update(s: SessionInfo) = if (s.id != threadId) s else s.copy(runtime = if (status == "inProgress") "active" else "idle",
                 lastTurnStatus = status, activeTurnId = if (status == "inProgress") turn.string("id") else "")
             mutable.update { it.copy(sessions = it.sessions.map(::update), selected = it.selected?.let(::update)) }
+            if (status != "inProgress") {
+                // The turn ended: its approvals can no longer be answered meaningfully.
+                val endedTurn = turn.string("id")
+                mutable.update { it.copy(approvals = it.approvals.filterNot { it.threadId == threadId && it.turnId == endedTurn }) }
+            }
             if (threadId == mutable.value.selected?.id && turn.optJSONObject("error") != null) {
                 mutable.update { it.copy(error = turn.optJSONObject("error")?.string("message")) }
             }

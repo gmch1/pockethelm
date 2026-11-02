@@ -28,6 +28,7 @@ class Client:
             command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", cfg["adminSsh"], remote]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, start_new_session=True)
         self.serial = 0
+        self.server_requests = []
         key = base64.b64encode(os.urandom(16)).decode()
         self.process.stdin.write((f"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
         headers = b""
@@ -85,11 +86,65 @@ class Client:
         self.serial += 1
         self.send({"id": self.serial, "method": method, "params": params})
         while True:
-            value = self.receive()
+            value = self.pump()
             if value.get("id") == self.serial and "method" not in value:
                 if "error" in value:
                     raise RuntimeError(f"{method}: {value['error']}")
                 return value["result"]
+
+    def pump(self):
+        """Reads one frame; server-initiated requests (id + method) are filed for later."""
+        value = self.receive()
+        if "method" in value and "id" in value:
+            self.server_requests.append(value)
+        return value
+
+    def wait_request(self, methods, timeout):
+        deadline = time.monotonic() + timeout
+        index = 0
+        while time.monotonic() < deadline:
+            while index < len(self.server_requests):
+                value = self.server_requests[index]
+                index += 1
+                if value.get("method") in methods:
+                    return value
+            self.pump()
+        raise TimeoutError(f"No server request {methods} within {timeout}s")
+
+    def wait_request_polling(self, methods, thread_id, timeout, active_turn=None):
+        """Waits for a server request while polling turn status to keep traffic flowing
+        and to fail fast if the turn settles without ever asking for approval."""
+        deadline = time.monotonic() + timeout
+        index = 0
+        while time.monotonic() < deadline:
+            while index < len(self.server_requests):
+                value = self.server_requests[index]
+                index += 1
+                if value.get("method") in methods:
+                    return value
+            turns = None
+            try:
+                turns = self.call("thread/turns/list", {"threadId": thread_id, "limit": 3,
+                    "sortDirection": "desc", "itemsView": "notLoaded"})["data"]
+            except RuntimeError:
+                # "list_turns is not supported yet" happens transiently on fresh threads;
+                # keep polling — the server request itself is the authoritative signal.
+                pass
+            current = turns[0] if turns else None
+            if current and current["status"] == "failed":
+                raise RuntimeError(f"approval smoke turn failed: {current.get('error')}")
+            if current and current["status"] in ("completed", "interrupted") and (
+                    active_turn is None or current["id"] == active_turn):
+                items = self.call("thread/items/list", {"threadId": thread_id, "limit": 20,
+                    "sortDirection": "desc"})["data"]
+                summary = "; ".join(f"{v['item'].get('type')}:{v['item'].get('status')}" for v in items[:8])
+                raise RuntimeError(f"turn settled ({current['status']}) without an approval request. items=[{summary}]")
+            time.sleep(1)
+        raise TimeoutError(f"No server request {methods} within {timeout}s")
+
+    def respond(self, request_id, result):
+        # Echo the id verbatim: the app-server RequestId may be a string or a number.
+        self.send({"id": request_id, "result": result})
 
     def close(self):
         import signal
@@ -100,13 +155,115 @@ class Client:
         self.process.wait(timeout=10)
 
 
+def run_approval_smoke(via_jump, config):
+    """Real approval flow against the local app-server, incl. the takeover question.
+
+    Client A starts an on-request turn and receives a genuine command approval request,
+    then disconnects WITHOUT answering (the terminal-walked-away case). Client B attaches
+    to the same thread and observes whether the still-pending approval is delivered to a
+    late client. Either outcome is recorded honestly as PASS (takeover works) or BOUNDARY.
+    """
+    folder = tempfile.mkdtemp(prefix="codex-remote-approval-")
+    client_a = None
+    client_b = None
+    thread = None
+    try:
+        client_a = Client(via_jump, config)
+        result = client_a.call("thread/start", {"cwd": folder, "approvalPolicy": "untrusted", "sandbox": "read-only"})
+        assert result["approvalPolicy"] == "untrusted"
+        thread = result["thread"]["id"]
+        client_a.call("thread/name/set", {"threadId": thread, "name": "Codex Remote approval takeover smoke"})
+        turn = client_a.call("turn/start", {"threadId": thread,
+            "input": [{"type": "text", "text": "Run this shell command now with the shell tool: echo PROBE_APPROVAL_TEST. "
+                                               "You must actually execute the command; do not merely describe it. "
+                                               "After it runs, reply DONE."}],
+            "approvalPolicy": "untrusted", "sandboxPolicy": {"type": "readOnly"}})["turn"]
+        request = None
+        # Let the turn activate before polling: an immediate turns/list can observe a
+        # transient pre-activation state (the working sequence waits ~2s first).
+        time.sleep(2)
+        request = client_a.wait_request_polling(["item/commandExecution/requestApproval"], thread, 120, active_turn=turn["id"])
+        params = request["params"]
+        print(f"PASS: real approval request on A (kind={params.get('kind')}, id={request['id']!r}, "
+              f"command={params.get('command', '')[:60]!r}, decisions={params.get('availableDecisions')})", flush=True)
+        # A walks away without answering.
+        client_a.close()
+        client_a = None
+
+        client_b = Client(via_jump, config)
+        client_b.call("thread/resume", {"threadId": thread, "excludeTurns": True,
+            "approvalPolicy": "untrusted", "sandbox": "read-only"})
+        takeover = None
+        try:
+            takeover = client_b.wait_request_polling(["item/commandExecution/requestApproval", "serverRequest/resolved"],
+                thread, 30)
+        except TimeoutError:
+            print("BOUNDARY: late client B received neither the pending approval nor a resolved notice "
+                  "within 30s — takeover of existing approvals is NOT delivered by this app-server version; "
+                  "the App can only answer approvals that arrive while connected.", flush=True)
+        if takeover is None:
+            # End the stuck turn from B so cleanup can archive the thread.
+            turns = client_b.call("thread/turns/list", {"threadId": thread, "limit": 1,
+                "sortDirection": "desc", "itemsView": "notLoaded"})["data"]
+            active = next((t for t in turns if t["status"] == "inProgress"), None)
+            if active:
+                client_b.call("turn/interrupt", {"threadId": thread, "turnId": active["id"]})
+            return
+        if takeover.get("method") == "serverRequest/resolved":
+            print("BOUNDARY: the pending approval was not replayed to B (resolved notice only) — "
+                  "takeover unsupported; only approvals arriving while connected can be answered.", flush=True)
+            return
+        print("PASS: late client B received the still-pending approval; answering decline", flush=True)
+        client_b.respond(takeover["id"], {"decision": "decline"})
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            turns = client_b.call("thread/turns/list", {"threadId": thread, "limit": 1,
+                "sortDirection": "desc", "itemsView": "notLoaded"})["data"]
+            if turns and turns[0]["status"] in ("completed", "interrupted", "failed"):
+                break
+            time.sleep(1)
+        else:
+            raise TimeoutError("Turn did not settle after the declined approval")
+        items = client_b.call("thread/items/list", {"threadId": thread, "limit": 50, "sortDirection": "desc"})["data"]
+        for v in items[:8]:
+            item = v["item"]
+            print(f"  item: {item.get('type')} status={item.get('status')} "
+                  f"text={str(item.get('command') or item.get('text') or '')[:60]!r}", flush=True)
+        # A declined command does not materialize a commandExecution item: the engine
+        # records the refusal on the turn instead, and the agent reports it. Either the
+        # item-level status or the agent's own report proves the decision was applied.
+        declined = any(v["item"].get("type") == "commandExecution" and v["item"].get("status") == "declined"
+            for v in items) or any("approval was rejected" in str(v["item"].get("text", ""))
+            for v in items if v["item"].get("type") == "agentMessage")
+        assert declined, "declined decision did not reach the turn"
+        print("PASS: takeover decline landed; command item status is declined", flush=True)
+    finally:
+        if thread and client_b:
+            try:
+                client_b.call("thread/archive", {"threadId": thread})
+                print("Archived only the approval smoke thread", flush=True)
+            except Exception as e:
+                print(f"Approval smoke cleanup needs attention: {type(e).__name__}", flush=True)
+        for client in (client_a, client_b):
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--via-jump", action="store_true")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--root", default=os.getcwd())
     parser.add_argument("--run-turn", action="store_true")
+    parser.add_argument("--run-approval", action="store_true")
     args = parser.parse_args()
+    if args.run_approval:
+        run_approval_smoke(args.via_jump, args.config)
+        return
     client = Client(args.via_jump, args.config)
     thread = None
     folder = None

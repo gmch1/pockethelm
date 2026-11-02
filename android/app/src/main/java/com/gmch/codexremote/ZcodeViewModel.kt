@@ -15,6 +15,9 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.util.UUID
 
+/** Bound for unconfirmed interaction answers kept per environment (task 2026-11-02). */
+private const val INTERACT_RECORDS_MAX = 128
+
 data class ZcodeState(
     val connected: Boolean = false, val busy: Boolean = false, val error: String? = null,
     val providers: List<ZProvider> = emptyList(), val selection: ZSelection? = null, val selectionGuard: String = "",
@@ -30,7 +33,15 @@ data class ZcodeState(
     val commandInFlight: Boolean = false,
     val notice: String = "", val beforeRow: Double? = null, val logEpoch: String = "", val revision: Long = 0,
     val permission: String = "", val currentSelection: ZSelection? = null,
-    val browser: ZcodeBrowserState = ZcodeBrowserState()
+    val browser: ZcodeBrowserState = ZcodeBrowserState(),
+    // Interaction answering (task 2026-11-02): details only flow when the bridge advertises
+    // the capability; otherwise the legacy count-only placeholder stays.
+    val interactionsEnabled: Boolean = false,
+    val interactions: List<ZInteraction> = emptyList(),
+    val interactionsComplete: Boolean = false,
+    val interactSubmitting: Set<String> = emptySet(),
+    val interactionNotice: String = "",
+    val snoozeUnconfirmed: Set<String> = emptySet()
 )
 
 class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
@@ -176,6 +187,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             profile = next
             listSyncedAt = 0; historySyncedAt = 0
             older = emptyList(); outgoingBySession.clear(); pending = null
+            // Environment switch: records in memory belong to the old environment (their
+            // vault blob is per-environment and will not reload); drop them wholesale.
+            viewModelScope.launch { updateInteractRecords { emptyList() } }
+            snoozeStates.clear()
             mutable.value = ZcodeState()
         }
         if (!mutable.value.connected) { connect(); return }
@@ -222,12 +237,17 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { old?.close() }
         // In-flight requests lose their channel: outcome unknown, never a failure.
         outgoingBySession.keys.toList().forEach { markOutgoingUncertain(it) }
+        // Snooze attempts are generation-scoped: an old connection's in-flight state and
+        // backoff budget die with it. Answer records survive in the vault for recovery.
+        snoozeStates.clear()
         mutable.update {
             it.copy(connected = false, busy = false, sending = false, historyLoading = false, sessionsFresh = false, liveStatuses = emptyList(),
                 // A session opened but never loaded must not fall back to a blank timeline.
                 historyError = if (it.selected != null && it.items.isEmpty() && it.historyLoading)
                     "连接已断开，未能加载会话内容，重连后重试" else it.historyError,
-                commandInFlight = false)
+                commandInFlight = false,
+                interactionsEnabled = false, interactions = emptyList(), interactionsComplete = false,
+                interactSubmitting = emptySet(), interactionNotice = "", snoozeUnconfirmed = emptySet())
         }
     }
     fun connect() {
@@ -264,8 +284,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 val hello = call("initialize", obj("clientId" to clientId))
                 check(hello.string("engine") == "zcode" && hello.optInt("bridgeVersion") == 1) { "请在开发机安装 ZCode 桥接器" }
                 supportsSessionIndex = hello.optBoolean("sessionsIndex")
-                mutable.update { it.copy(connected = true) }
+                // Optional capability: an older bridge without it keeps the count-only placeholder.
+                interactSupport = hello.optJSONObject("capabilities")?.optBoolean("interactions") == true
+                mutable.update { it.copy(connected = true, interactionsEnabled = interactSupport) }
                 recoverPending()
+                try { recoverInteractions() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
                 mutable.value.selected?.let { session ->
                     try { readGuarded(session) } catch (e: CancellationException) { throw e }
                     catch (e: Exception) { mutable.update { it.copy(error = e.message ?: "更新会话失败") } }
@@ -281,7 +304,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun refresh() {
         if (!mutable.value.connected) { connect(); return }
-        action { loadCatalog(); loadProjects(); loadStatuses(); recoverPending(); mutable.value.selected?.let { readGuarded(it) }; schedulePoll() }
+        action {
+            loadCatalog(); loadProjects(); loadStatuses(); recoverPending()
+            try { recoverInteractions() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+            mutable.value.selected?.let { readGuarded(it) }; schedulePoll()
+        }
     }
     private suspend fun loadCatalog() {
         val catalog = call("catalog")
@@ -446,7 +473,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             quota = "点击读取额度", quotaSummary = "额度 ▾",
             historyLoading = true, historyError = null, sending = false,
             outgoing = (outgoingBySession[outKey] ?: emptyList()).toList(),
-            draft = vault.get(key("draft", session.id)).orEmpty(), beforeRow = null, notice = "", currentSelection = null, permission = "") }
+            draft = vault.get(key("draft", session.id)).orEmpty(), beforeRow = null, notice = "", currentSelection = null, permission = "",
+            interactions = emptyList(), interactionsComplete = false, interactionNotice = "") }
         // A persisted pending send restores its 待确认 bubble for exactly this session —
         // but never over an existing record: an in-flight SENDING, or a settled
         // ACCEPTED/FAILED receipt, must not be downgraded by replaying the old receipt.
@@ -465,7 +493,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (mutable.value.selected == null) return
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
         mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false,
-            historyError = null, outgoing = emptyList(), sessionsFresh = it.connected && it.sessionsFresh) }
+            historyError = null, outgoing = emptyList(), sessionsFresh = it.connected && it.sessionsFresh,
+            interactions = emptyList(), interactionsComplete = false, interactSubmitting = emptySet(),
+            interactionNotice = "", snoozeUnconfirmed = emptySet()) }
         older = emptyList()
         val epoch = generation
         viewModelScope.launch {
@@ -485,11 +515,20 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         mutable.value.selected?.let { vault.put(key("draft", it.id), value) }
     }
     fun delivery(value: String) { mutable.update { it.copy(delivery = value) } }
-    private suspend fun read(session: ZSession, useSessionSelection: Boolean = false) {
+    private suspend fun read(session: ZSession, useSessionSelection: Boolean = false, checkInteractionIds: List<String> = emptyList()) {
         val startGeneration = generation
-        val data = call("session/read", session.target())
+        val request = session.target()
+        if (checkInteractionIds.isNotEmpty() && interactSupport)
+            request.put("checkInteractionIds", org.json.JSONArray().apply { checkInteractionIds.forEach { put(it) } })
+        val data = call("session/read", request)
         // A read from before a reconnect must not clobber the new connection's state.
-        if (generation != startGeneration || mutable.value.selected?.id != session.id) return
+        if (generation != startGeneration) return
+        // Presence reconciliation binds to the record's own session, not the visible one.
+        if (interactSupport) {
+            reconcileInteractions(session, data)
+            if (mutable.value.selected?.id == session.id) publishInteractState()
+        }
+        if (mutable.value.selected?.id != session.id) return
         historySyncedAt = System.currentTimeMillis()
         val items = zcodeItems(data)
         val revision = data.optLong("revision")
@@ -498,10 +537,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val actual = ZSelection.parse(data.optJSONObject("selection"))
         val queue = queueEntries(data)
         val first = if (data.isNull("firstRowId")) null else data.optDouble("firstRowId")
+        val interactions = if (interactSupport) zcodeInteractions(data) else emptyList()
         mutable.update { it.copy(selected = session.copy(title = data.string("title").ifBlank { session.title }),
             items = (older + items).distinctBy { row -> row.id }, phase = data.string("phase"), queue = queue,
             executionId = if (data.optBoolean("canStop")) data.string("executionId") else "",
             interactionCount = data.optInt("interactionCount"), currentSelection = actual,
+            interactions = interactions, interactionsComplete = data.optBoolean("interactionsComplete"),
             selection = if (useSessionSelection) actual ?: it.selection else it.selection,
             selectionGuard = if (useSessionSelection && actual != null) it.providers.find { p -> p.id == actual.provider }?.guard.orEmpty() else it.selectionGuard,
             permission = if (data.string("mode") == "yolo") "完全访问" else data.string("mode"),
@@ -510,6 +551,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             logEpoch = epoch, revision = revision,
             notice = noticeForPhase(data.string("phase"), data.string("lastError").ifBlank { it.notice })) }
         reconcileOutgoing(session.id)
+        // Snooze intent may predate this snapshot (question arrived first), and a failed
+        // earlier attempt becomes eligible again: re-arm against the fresh state.
+        interactions.forEach { interaction ->
+            if (interaction.id.isNotBlank()) maybeSnooze(session, interaction)
+        }
     }
     fun history() = action {
         val state = mutable.value; val session = state.selected ?: return@action
@@ -701,6 +747,328 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun dismissError() { mutable.update { it.copy(error = null) } }
+
+    // ---- Interaction answering (task 2026-11-02-interaction-approvals) ----
+    // Submit / confirm / recover runs on its own channel: it never touches the message
+    // path's write()/finishAck()/pending protection, never sets the global busy flag, and
+    // persists metadata only — answer text, form drafts and sensitive values stay in memory.
+
+    /** Unconfirmed interaction answers, keyed by the full target identity. */
+    private data class InteractRecord(
+        val workspacePath: String, val workspaceIdentity: String, val sessionId: String,
+        val interactionId: String, val commandId: String, val phase: String,
+        val summary: String, val issuedAt: Long, val noticedStillPending: Boolean = false
+    ) {
+        fun json() = obj("workspacePath" to workspacePath, "workspaceIdentity" to workspaceIdentity,
+            "sessionId" to sessionId, "interactionId" to interactionId, "commandId" to commandId,
+            "phase" to phase, "summary" to summary, "issuedAt" to issuedAt)
+        companion object {
+            fun parse(j: JSONObject) = InteractRecord(j.string("workspacePath"), j.string("workspaceIdentity"),
+                j.string("sessionId"), j.string("interactionId"), j.string("commandId"),
+                j.string("phase").ifBlank { "uncertain" }, j.string("summary"), j.optLong("issuedAt"))
+        }
+    }
+
+    // Snooze bookkeeping is generation-scoped: intent survives snapshot rebuilds inside one
+    // connection, attempts never survive a reconnect. Bounded: 3 tries per interaction.
+    private class SnoozeState(val sessionId: String, val interactionId: String) {
+        var userInteracted = false
+        var inFlight = false
+        var ackAccepted = false
+        var attempts = 0
+        var commandId: String? = null
+        var nextEligibleAt = 0L
+    }
+
+    private val interactMutex = Mutex()
+    private val interactRecords = LinkedHashMap<String, InteractRecord>()
+    private val snoozeStates = HashMap<String, SnoozeState>()
+    private var interactSupport = false
+
+    private fun interactKey(path: String, identity: String, sessionId: String, interactionId: String) =
+        "$path|$identity|$sessionId|$interactionId"
+    private fun interactKey(record: InteractRecord) =
+        interactKey(record.workspacePath, record.workspaceIdentity, record.sessionId, record.interactionId)
+    private fun interactKey(session: ZSession, interactionId: String) =
+        interactKey(session.path, session.identity, session.id, interactionId)
+
+    /** Atomic record-set change: the vault write happens inside the short mutex (disk only,
+     *  never network) and a failed write leaves both store and map untouched. */
+    private suspend fun updateInteractRecords(transform: (List<InteractRecord>) -> List<InteractRecord>) {
+        interactMutex.withLock {
+            val updated = transform(interactRecords.values.toList())
+            check(updated.size <= INTERACT_RECORDS_MAX) { "待确认交互记录过多，请先核对处理" }
+            vault.put(key("pending-interact"), org.json.JSONArray().apply { updated.forEach { put(it.json()) } }.toString())
+            interactRecords.clear()
+            updated.forEach { interactRecords[interactKey(it)] = it }
+        }
+        publishInteractState()
+    }
+
+    private fun publishInteractState() {
+        val selected = mutable.value.selected ?: return
+        val submitting = interactRecords.values
+            .filter { it.sessionId == selected.id && it.workspacePath == selected.path }
+            .map { it.interactionId }.toSet()
+        mutable.update { it.copy(interactSubmitting = submitting) }
+        publishSnoozeHint()
+    }
+
+    private fun publishSnoozeHint() {
+        val selected = mutable.value.selected
+        val unconfirmed = snoozeStates.values
+            .filter { it.userInteracted && !it.ackAccepted && selected?.id == it.sessionId }
+            .map { it.interactionId }.toSet()
+        mutable.update { it.copy(snoozeUnconfirmed = unconfirmed) }
+    }
+
+    /** Submit an answer for a supported interaction. Persist-before-send; uncertain outcomes
+     *  stay disabled until an authoritative snapshot or command/query reconciles them. */
+    fun interact(session: ZSession, interaction: ZInteraction, answer: JSONObject) {
+        if (!interactSupport || !interaction.supported || interaction.id.isBlank()) return
+        noteInteractionTouch(session, interaction)
+        val targetKey = interactKey(session, interaction.id)
+        if (interactRecords.containsKey(targetKey)) {
+            mutable.update { it.copy(interactionNotice = "该交互已有待确认的应答，请先刷新核对") }
+            return
+        }
+        val commandId = UUID.randomUUID().toString()
+        // Non-sensitive receipt summary only: optionId / action name, never free text.
+        val summary = answer.optString("optionId").orEmpty()
+            .ifBlank { answer.optString("action").orEmpty().ifBlank { "freeText" } }
+        val connection = rpc ?: return
+        val generation = this.generation
+        viewModelScope.launch {
+            try {
+                // 1. Persist metadata BEFORE the RPC: a failed write must leave the answer unsent.
+                updateInteractRecords {
+                    it + InteractRecord(session.path, session.identity, session.id, interaction.id,
+                        commandId, "submitting", summary, System.currentTimeMillis())
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                mutable.update { s -> s.copy(interactionNotice = "无法保存应答记录：${e.message}") }
+                return@launch
+            }
+            try {
+                val params = session.target().put("interactionId", interaction.id)
+                    .put("commandId", commandId).put("answer", answer)
+                val ack = connection.call("session/interact", params, timeout = 90_000)
+                if (generation != this@ZcodeViewModel.generation) return@launch // stale channel: recovery owns it now
+                if (ack.string("status") in setOf("accepted", "duplicate", "noop")) {
+                    updateInteractRecords { records -> records.map { r ->
+                        if (interactKey(r) == targetKey) r.copy(phase = "awaiting") else r } }
+                    // Accepted only means the server took the answer; the snapshot must still
+                    // confirm the interaction ended before the buttons come back.
+                    refreshInteraction(session, interaction.id, generation)
+                } else {
+                    updateInteractRecords { records -> records.filterNot { interactKey(it) == targetKey } }
+                    mutable.update { it.copy(interactionNotice = "ZCode 未接受应答：${ack.string("reasonCode", ack.string("status"))}") }
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: RpcException) {
+                if (generation != this@ZcodeViewModel.generation) return@launch
+                // Definite rejection (including -32602 validation): clear and re-enable.
+                updateInteractRecords { records -> records.filterNot { interactKey(it) == targetKey } }
+                mutable.update { it.copy(interactionNotice = "应答被拒绝：${e.message}") }
+            } catch (e: Exception) {
+                if (generation != this@ZcodeViewModel.generation) return@launch
+                // Timeout / transport: outcome unknown. Keep the record and disabled state;
+                // recovery reconciles via command/query. Never resend automatically.
+                updateInteractRecords { records -> records.map { r ->
+                    if (interactKey(r) == targetKey) r.copy(phase = "uncertain") else r } }
+                mutable.update { it.copy(interactionNotice = "应答结果未知，请核对会话后刷新") }
+            }
+        }
+    }
+
+    fun interactOption(session: ZSession, interaction: ZInteraction, optionId: String) =
+        interact(session, interaction, obj("optionId" to optionId))
+    fun interactFreeText(session: ZSession, interaction: ZInteraction, text: String) =
+        interact(session, interaction, obj("freeText" to text))
+    fun interactForm(session: ZSession, interaction: ZInteraction, questions: List<ZQuestion>, drafts: Map<String, ZFormDraft>) =
+        interact(session, interaction, obj("action" to "accept", "content" to buildInteractionContent(questions, drafts)))
+    fun interactDecline(session: ZSession, interaction: ZInteraction) = interact(session, interaction, obj("action" to "decline"))
+    fun interactCancel(session: ZSession, interaction: ZInteraction) = interact(session, interaction, obj("action" to "cancel"))
+
+    /** Manual reconciliation entry: drops this target's unconfirmed flag without replaying
+     *  the old answer; re-answering is a fresh explicit submit (first-wins upstream). */
+    fun releaseInteraction(session: ZSession, interactionId: String) {
+        viewModelScope.launch {
+            try {
+                updateInteractRecords { records -> records.filterNot { interactKey(it) == interactKey(session, interactionId) } }
+                if (mutable.value.selected?.id == session.id) mutable.update { it.copy(interactionNotice = "") }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { }
+        }
+    }
+
+    /** Authoritative re-read carrying checkInteractionIds so a presence=false can clear records. */
+    private fun refreshInteraction(session: ZSession, interactionId: String, generation: Int) {
+        viewModelScope.launch {
+            actions.withLock {
+                if (generation != this@ZcodeViewModel.generation) return@withLock
+                try { read(session, checkInteractionIds = listOf(interactionId)) }
+                catch (e: CancellationException) { throw e }
+                catch (_: Exception) { /* Poll keeps reconciling; the buttons stay disabled meanwhile. */ }
+            }
+        }
+    }
+
+    /**
+     * Clear or keep records against one authoritative snapshot. Only an explicit
+     * presence=false, or absence from an interactionsComplete=true snapshot of the same
+     * target, proves an interaction ended — a truncated window or an unsupported kind never does.
+     */
+    private suspend fun reconcileInteractions(session: ZSession, data: JSONObject) {
+        val presence = data.optJSONArray("interactionPresence")?.objects()
+            ?.associate { it.string("interactionId") to it.optBoolean("pending") } ?: emptyMap()
+        val complete = data.optBoolean("interactionsComplete")
+        val detailIds = data.optJSONArray("interactions")?.objects()?.mapTo(HashSet()) { it.string("interactionId") } ?: emptySet()
+        val targets = interactRecords.values
+            .filter { it.sessionId == session.id && it.workspacePath == session.path && it.workspaceIdentity == session.identity }
+        if (targets.isEmpty()) return
+        var endedIds: List<String> = emptyList()
+        var stillPendingAwaiting = false
+        updateInteractRecords { records ->
+            records.mapNotNull { record ->
+                // Records of other sessions/targets are not this snapshot's business.
+                if (targets.none { interactKey(it) == interactKey(record) }) return@mapNotNull record
+                val ended = when {
+                    presence.containsKey(record.interactionId) && presence[record.interactionId] == false -> true
+                    presence.isNotEmpty() -> false // explicitly pending
+                    complete && record.interactionId !in detailIds -> true
+                    else -> false // truncated window or unchecked read: inconclusive
+                }
+                if (ended) {
+                    endedIds += record.interactionId
+                    null
+                } else {
+                    if (record.phase == "awaiting") stillPendingAwaiting = true
+                    if (record.phase == "awaiting" && !record.noticedStillPending)
+                        record.copy(noticedStillPending = true) else record
+                }
+            }
+        }
+        endedIds.forEach { id ->
+            snoozeStates.remove(interactKey(session, id))
+            snoozeStates.values.removeAll { it.sessionId == session.id && it.interactionId == id }
+        }
+        // Notices belong to the session on screen, never to whichever session reconciled.
+        if (mutable.value.selected?.id == session.id) {
+            val notice = when {
+                endedIds.isNotEmpty() -> "交互已结束"
+                stillPendingAwaiting -> "应答已接收，交互仍在等待；请核对"
+                else -> null
+            }
+            notice?.let { text -> mutable.update { it.copy(interactionNotice = text) } }
+        }
+    }
+
+    /** Reconnect recovery: per record, command/query first, then an authoritative snapshot
+     *  read. An unknown query is a prompt, never a failure, and never triggers a resend. */
+    private suspend fun recoverInteractions() {
+        if (!interactSupport) return
+        val raw = vault.get(key("pending-interact")) ?: return
+        val restored = runCatching {
+            org.json.JSONArray(raw).objects().map { InteractRecord.parse(it) }
+        }.getOrDefault(emptyList())
+        if (restored.isEmpty()) return
+        interactMutex.withLock {
+            interactRecords.clear()
+            restored.forEach { interactRecords[interactKey(it)] = it }
+        }
+        publishInteractState()
+        val generation = this.generation
+        for (record in restored) {
+            try {
+                val query = call("command/query", obj("workspacePath" to record.workspacePath,
+                    "workspaceIdentity" to record.workspaceIdentity.takeIf { it.isNotBlank() },
+                    "sessionId" to record.sessionId, "commandId" to record.commandId))
+                if (generation != this.generation) return
+                val ack = query.optJSONObject("ack")
+                if (ack == null) {
+                    // Result unknown: mark uncertain, prompt on its session only.
+                    updateInteractRecords { records -> records.map { r ->
+                        if (interactKey(r) == interactKey(record)) r.copy(phase = "uncertain") else r } }
+                    if (mutable.value.selected?.id == record.sessionId)
+                        mutable.update { it.copy(interactionNotice = "交互应答结果未知，请核对") }
+                    continue
+                }
+                if (ack.string("status") in setOf("rejected", "stale", "failed")) {
+                    // Definite rejection: nothing was applied, the record can go.
+                    updateInteractRecords { records -> records.filterNot { interactKey(it) == interactKey(record) } }
+                    continue
+                }
+                // accepted/duplicate/noop: confirm against the live snapshot of the same target.
+                val session = ZSession(record.sessionId, record.sessionId, record.workspacePath, record.workspaceIdentity)
+                val data = call("session/read", session.target()
+                    .put("checkInteractionIds", org.json.JSONArray().put(record.interactionId)))
+                if (generation != this.generation) return
+                reconcileInteractions(session, data)
+                if (interactRecords.values.none { interactKey(it) == interactKey(record) } &&
+                    mutable.value.selected?.id == record.sessionId) {
+                    mutable.update { s -> s.copy(interactionNotice = s.interactionNotice.ifBlank { "交互已结束" }) }
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* Transport hiccup: the record stays uncertain for the next refresh. */ }
+        }
+    }
+
+    // ---- autoResolution snooze (task R6): intent first, bounded retries, server-confirmed only ----
+
+    /** Record the user's first touch on an interaction; autoResolution may arrive later. */
+    fun noteInteractionTouch(session: ZSession, interaction: ZInteraction) {
+        if (!interactSupport || interaction.id.isBlank()) return
+        val state = snoozeStates.getOrPut(interactKey(session, interaction.id)) { SnoozeState(session.id, interaction.id) }
+        if (state.userInteracted) return
+        state.userInteracted = true
+        maybeSnooze(session, interaction)
+    }
+
+    private fun maybeSnooze(session: ZSession, interaction: ZInteraction) {
+        if (!interactSupport) return
+        val key = interactKey(session, interaction.id)
+        val state = snoozeStates[key] ?: return
+        val auto = interaction.autoResolution
+            ?: return // Not arrived yet: the intent stays; the next snapshot retries.
+        if (auto.state == "snoozed") return
+        if (!state.userInteracted || state.ackAccepted || state.inFlight || state.attempts >= 3) return
+        if (System.currentTimeMillis() < state.nextEligibleAt) return
+        val connection = rpc ?: return
+        val generation = this.generation
+        state.inFlight = true
+        state.attempts++
+        if (state.commandId == null) state.commandId = UUID.randomUUID().toString()
+        val commandId = state.commandId!!
+        viewModelScope.launch {
+            try {
+                val ack = connection.call("session/interact/snooze", session.target()
+                    .put("interactionId", interaction.id).put("commandId", commandId), timeout = 30_000)
+                if (generation != this@ZcodeViewModel.generation) return@launch
+                val current = snoozeStates[key] ?: return@launch
+                current.inFlight = false
+                if (ack.string("status") in setOf("accepted", "duplicate", "noop")) {
+                    current.ackAccepted = true
+                } else {
+                    // Definite rejection: a later attempt must use a fresh command id.
+                    current.commandId = null
+                    current.nextEligibleAt = System.currentTimeMillis() + snoozeBackoff(current.attempts)
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (generation != this@ZcodeViewModel.generation) return@launch
+                snoozeStates[key]?.let { current ->
+                    current.inFlight = false
+                    // Timeout with unknown outcome: retry reuses this command id (idempotent upstream).
+                    current.nextEligibleAt = System.currentTimeMillis() + snoozeBackoff(current.attempts)
+                }
+            }
+            finally { if (generation == this@ZcodeViewModel.generation) publishSnoozeHint() }
+        }
+        publishSnoozeHint()
+    }
+    private fun snoozeBackoff(failedAttempts: Int) = if (failedAttempts <= 1) 1_000L else 3_000L
     fun releaseUnknown() {
         if (!mutable.value.busy && mutable.value.pendingUnknown) {
             // Manual reconciliation of the GLOBAL pending command: its bubble belongs to the

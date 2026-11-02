@@ -9,9 +9,23 @@ import zlib
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-from bridge import Assembler, Bridge, RequestError, guard_for, project_rows, project_quota
+from bridge import (Assembler, Bridge, RequestError, guard_for, project_rows, project_quota,
+    project_interactions, interaction_answer)
 from wire import Client, WireError, decode, encode
 from install import dispatcher
+
+
+def make_snapshot(pending):
+    return {'sessionId': 's1', 'revision': 7, 'logEpoch': 'e1',
+        'meta': {'title': 't'}, 'config': {'mode': 'yolo', 'modelSelection': None},
+        'control': {'phase': 'waiting', 'canStop': False, 'activeWorks': []},
+        'rows': {'window': [], 'totalCount': 0}, 'queue': {'items': []},
+        'pendingInteractions': pending}
+
+
+def user_input_interaction(interaction_id='i-1', **payload):
+    body = {'kind': 'userInput', 'prompt': '选择部署目标', 'freeText': True, **payload}
+    return {'interactionId': interaction_id, 'kind': 'userInput', 'payload': body}
 
 
 class BridgeTests(unittest.TestCase):
@@ -219,6 +233,153 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn('eval', script)
         self.assertNotIn('bash -c', script)
         self.assertEqual(script.count('SSH_ORIGINAL_COMMAND'), 1)
+
+    # ---- Interactions: projection, completeness, presence (task R7/R8) ----
+
+    def interaction_bridge(self, pending):
+        bridge = Bridge(Mock()); bridge.client_id = 'pockethelm-test'
+        bridge.snapshot = Mock(return_value=make_snapshot(pending))
+        return bridge
+
+    def test_interaction_projection_preserves_identity_verbatim(self):
+        question = '要使用哪个数据库？' * 400  # 3600 chars, inside the 8192 identity bound
+        pending = [user_input_interaction('i-user', questions=[{'question': question,
+            'header': '数据库', 'multiSelect': True, 'options': [
+                {'value': 'postgres', 'label': 'PostgreSQL' * 200, 'description': '推荐的默认选择'},
+                {'value': 'mysql', 'label': 'MySQL'}]},
+            {'question': '备注', 'header': '备注', 'options': [{'value': 'none', 'label': '无'}]}],
+            currentQuestionIndex=1, answerDrafts={question: ['postgres']},
+            sensitive=True, toolName='AskUserQuestion'),
+            {'interactionId': 'i-perm', 'kind': 'permission', 'autoResolution':
+                {'state': 'visibleCountdown', 'startedAt': 1, 'visibleAt': 2, 'deadlineAt': 99},
+                'payload': {'kind': 'permission', 'toolCallId': 'c1', 'toolName': 'Bash',
+                    'summary': 'rm -rf build', 'freeText': False, 'options': [
+                        {'optionId': 'allow-once', 'label': '允许一次', 'kind': 'allowOnce'},
+                        {'optionId': 'deny', 'label': '拒绝', 'kind': 'deny'}]}}]
+        result = self.interaction_bridge(pending).dispatch('session/read', {})
+        self.assertEqual(result['interactionCount'], 2)
+        self.assertTrue(result['interactionsComplete'])
+        user, permission = result['interactions']
+        self.assertTrue(user['supported'])
+        self.assertEqual(user['questions'][0]['question'], question)  # identity verbatim
+        self.assertEqual(user['questions'][0]['options'][0]['value'], 'postgres')
+        self.assertEqual(user['questions'][0]['options'][0]['label'], ('PostgreSQL' * 200)[:512])  # display clipped
+        self.assertNotIn('autoResolution', user)
+        self.assertEqual(user['answerDrafts'], {question: ['postgres']})
+        self.assertEqual(user['currentQuestionIndex'], 1)
+        self.assertTrue(user['sensitive'])
+        self.assertTrue(permission['supported'])
+        self.assertEqual([o['kind'] for o in permission['options']], ['allowOnce', 'deny'])
+        self.assertEqual(permission['autoResolution'], {'state': 'visibleCountdown',
+            'startedAt': 1, 'visibleAt': 2, 'deadlineAt': 99})
+
+    def test_interaction_window_truncation_keeps_presence_authoritative(self):
+        pending = [user_input_interaction(f'i-{n}', prompt=f'问题 {n}') for n in range(5)]
+        bridge = self.interaction_bridge(pending)
+        result = bridge.dispatch('session/read', {'checkInteractionIds': ['i-4', 'i-0', 'missing']})
+        self.assertEqual(len(result['interactions']), 4)
+        self.assertFalse(result['interactionsComplete'])  # truncated window is not proof
+        self.assertEqual(result['interactionPresence'], [
+            {'interactionId': 'i-4', 'pending': True},
+            {'interactionId': 'i-0', 'pending': True},
+            {'interactionId': 'missing', 'pending': False}])
+        # Duplicate IDs and oversized batches are rejected before any snapshot use.
+        for bad in (['i-0', 'i-0'], [f'i-{n}' for n in range(17)], ['i-0', 7]):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/read', {'checkInteractionIds': bad})
+        self.assertEqual(bridge.snapshot.call_count, 1)
+
+    def test_interaction_projection_downgrades_oversized_items_wholesale(self):
+        overlong = 'q' * 8193  # identity bound violated: whole item downgrades, never trimmed
+        pending = [user_input_interaction('i-1', questions=[{'question': overlong,
+            'header': 'h', 'options': [{'value': 'a', 'label': 'A'}]}]),
+            user_input_interaction('i-2', questions=[{'question': 'ok?',
+                'header': 'h', 'options': [{'value': 'a', 'label': 'A'}]}]),
+            {'interactionId': 'i-3', 'kind': 'workspaceHookReview',
+                'payload': {'kind': 'workspaceHookReview'}},
+            {'interactionId': 'x' * 1025, 'kind': 'userInput',
+                'payload': {'kind': 'userInput', 'prompt': 'p', 'freeText': False}},
+            'garbage']
+        result = self.interaction_bridge(pending).dispatch('session/read', {})
+        first, second, hook, long_id = result['interactions']
+        self.assertEqual((first['supported'], first['unsupportedReason']), (False, 'oversized'))
+        self.assertEqual(first['interactionId'], 'i-1')
+        self.assertTrue(second['supported'])
+        self.assertEqual((hook['supported'], hook['unsupportedReason']), (False, 'unsupported_kind'))
+        self.assertEqual(hook['interactionId'], 'i-3')
+        self.assertEqual((long_id['supported'], long_id['unsupportedReason']), (False, 'invalid_id'))
+        self.assertNotIn('interactionId', long_id)
+        self.assertFalse(result['interactionsComplete'])  # unpreservable ID and window cut
+        self.assertEqual(result['interactionCount'], 5)  # count still covers the hidden fifth
+        self.assertEqual(result['items'], [])  # timeline unaffected by interaction downgrade
+
+    def test_session_interact_answer_shapes_and_whitelist(self):
+        client = Mock(); client.call.return_value = {'commandId': 'cmd', 'status': 'accepted'}
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: {'workspacePath': '/w', 'sessionId': 's'})
+        question = '要使用哪个数据库？'
+
+        def envelope():
+            args = client.call.call_args.args
+            self.assertEqual(args[:2], ('zcode-agent', 'sendConversationCommandV4'))
+            return args[2][0]['envelope']
+
+        content = {'answers': {question: 'postgres, 备注'},
+            'answer_0': ['postgres', '备注'], 'answer': ['postgres', '备注']}
+        for answer in ({'optionId': 'allow-once'}, {'freeText': '直接用默认'},
+                {'action': 'accept', 'content': content}, {'action': 'decline'}, {'action': 'cancel'}):
+            client.call.reset_mock()
+            result = bridge.dispatch('session/interact', {'workspacePath': '/w', 'sessionId': 's',
+                'interactionId': 'i-1', 'commandId': 'cmd-0123456789abcdef', 'answer': answer})
+            self.assertEqual(result['status'], 'accepted')
+            built = envelope()
+            self.assertEqual(built['type'], 'resolveInteraction')
+            self.assertEqual(built['payload'], {'interactionId': 'i-1', 'answer': answer})
+            self.assertEqual(built['sessionId'], 's')
+        for bad in ({}, {'optionId': 'a', 'freeText': 'b'}, {'action': 'accept'}, {'action': 'accept', 'content': {}},
+                {'action': 'decline', 'content': content}, {'action': 'accept', 'content': {'other': 1}},
+                {'action': 'accept', 'content': {'answer_16': 'x'}},
+                {'action': 'accept', 'content': {'answers': {'q': ''}}},
+                {'optionId': 'a' * 1025}, {'freeText': 'x' * 16385},
+                {'action': 'accept', 'content': {'answer_0': ['ok', '']}}):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/interact', {'workspacePath': '/w', 'sessionId': 's',
+                    'interactionId': 'i-1', 'commandId': 'cmd-0123456789abcdef', 'answer': bad})
+        client.call.reset_mock()
+        client.call.assert_not_called()  # rejections never reached the wire
+
+    def test_session_interact_rejects_overserialized_accept_answer(self):
+        client = Mock()
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: {'workspacePath': '/w', 'sessionId': 's'})
+        huge = {'answers': {('q1' * 4000): 'a' * 60000, ('q2' * 4000): 'b' * 60000}}
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/interact', {'workspacePath': '/w', 'sessionId': 's',
+                'interactionId': 'i', 'commandId': 'cmd-0123456789abcdef',
+                'answer': {'action': 'accept', 'content': huge}})
+        client.call.assert_not_called()
+
+    def test_snooze_sends_bounded_envelope(self):
+        client = Mock(); client.call.return_value = {'status': 'accepted'}
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: {'workspacePath': '/w', 'sessionId': 's'})
+        result = bridge.dispatch('session/interact/snooze', {'workspacePath': '/w', 'sessionId': 's',
+            'interactionId': 'i-1', 'commandId': 'cmd-0123456789abcdef'})
+        self.assertEqual(result['status'], 'accepted')
+        envelope = client.call.call_args.args[2][0]['envelope']
+        self.assertEqual(envelope['type'], 'snoozeInteractionAutoResolution')
+        self.assertEqual(envelope['payload'], {'interactionId': 'i-1'})
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/interact/snooze', {'workspacePath': '/w', 'sessionId': 's',
+                'interactionId': 'i' * 1025, 'commandId': 'cmd-0123456789abcdef'})
+
+    def test_initialize_advertises_interaction_capability_at_version_one(self):
+        client = Mock()
+        client.call = Mock(side_effect=[{'protocolVersion': 3, 'clientMode': 'web-remote-replayable'}, {}])
+        bridge = Bridge(client)
+        result = bridge.dispatch('initialize', {'clientId': 'pockethelm-zcode-abcdefgh1234'})
+        self.assertEqual(result['bridgeVersion'], 1)
+        self.assertTrue(result['capabilities']['interactions'])
 
 
 if __name__ == '__main__':

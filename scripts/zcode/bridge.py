@@ -20,6 +20,22 @@ from session_index import SessionIndexes
 
 MAX_LINE = 256 * 1024
 
+# Interaction projection limits. Identity fields (interaction/option IDs, option values,
+# question texts that key content.answers) are validated against these bounds and never
+# truncated — a violation downgrades the whole item to supported=false instead of trimming
+# it and letting a deformed answer through. Display-only strings are clipped separately.
+INTERACTION_ID_MAX = 1024
+INTERACTION_QUESTIONS_MAX = 16
+INTERACTION_OPTIONS_MAX = 32
+INTERACTION_QUESTION_CHARS = 8192
+INTERACTION_OPTION_VALUE_CHARS = 4096
+INTERACTION_ANSWER_TEXT_CHARS = 16384
+INTERACTION_JOINED_CHARS = 65536
+INTERACTION_ANSWER_BYTES = 64 * 1024
+INTERACTION_DETAIL_BYTES = 32 * 1024
+INTERACTION_DETAILS_MAX = 4
+INTERACTION_CHECK_IDS_MAX = 16
+
 
 class RequestError(Exception):
     pass
@@ -107,6 +123,208 @@ def project_rows(rows):
             item['text'] = str(row.get('displayName') or row.get('description') or row.get('text') or kind)[:2000]
         result.append(item)
     return result
+
+
+def display_text(value, maximum):
+    # Display-only text: clipped, never used to rebuild protocol identity.
+    return value[:maximum] if isinstance(value, str) else ''
+
+
+def project_auto_resolution(source):
+    if not isinstance(source, dict) or source.get('state') not in ('hiddenGrace', 'visibleCountdown', 'snoozed'):
+        return None
+    result = {'state': source['state']}
+    for key in ('startedAt', 'visibleAt', 'deadlineAt', 'snoozedAt'):
+        value = source.get(key)
+        if type(value) in (int, float) and math.isfinite(value):
+            result[key] = value
+    return result
+
+
+def project_questions(questions):
+    require(isinstance(questions, list) and 0 < len(questions) <= INTERACTION_QUESTIONS_MAX, '交互问题超出限制')
+    result = []
+    for question in questions:
+        require(isinstance(question, dict), '交互问题格式无效')
+        options = question.get('options')
+        require(isinstance(options, list) and 0 < len(options) <= INTERACTION_OPTIONS_MAX, '交互选项超出限制')
+        mapped = []
+        values = set()
+        for option in options:
+            require(isinstance(option, dict), '交互选项格式无效')
+            value = string(option.get('value'), INTERACTION_OPTION_VALUE_CHARS)
+            require(value not in values, '交互选项重复')
+            values.add(value)
+            item = {'value': value, 'label': display_text(option.get('label'), 512)}
+            if isinstance(option.get('description'), str):
+                item['description'] = display_text(option['description'], 1024)
+            mapped.append(item)
+        entry = {'question': string(question.get('question'), INTERACTION_QUESTION_CHARS),
+            'header': display_text(question.get('header'), 512), 'options': mapped}
+        if question.get('multiSelect') is True:
+            entry['multiSelect'] = True
+        result.append(entry)
+    return result
+
+
+def project_answer_drafts(drafts):
+    require(isinstance(drafts, dict), '交互草稿无效')
+    result = {}
+    for question, answers in drafts.items():
+        require(isinstance(question, str) and 0 < len(question) <= INTERACTION_QUESTION_CHARS
+            and '\x00' not in question, '交互草稿无效')
+        require(isinstance(answers, list) and len(answers) <= INTERACTION_OPTIONS_MAX, '交互草稿无效')
+        result[question] = [string(answer, INTERACTION_ANSWER_TEXT_CHARS) for answer in answers]
+    require(len(result) <= INTERACTION_QUESTIONS_MAX, '交互草稿无效')
+    return result
+
+
+def project_interaction(interaction):
+    """Project one pendingInteraction into a bounded answerable detail.
+
+    Returns (detail, id_preserved). Identity violations downgrade the whole item to a
+    fixed unsupported placeholder rather than trimming questions/options and continuing.
+    """
+    require(isinstance(interaction, dict), '交互格式无效')
+    kind = interaction.get('kind')
+    require(kind in ('permission', 'userInput', 'workspaceHookReview'), '未知交互类型')
+    raw_id = interaction.get('interactionId')
+    id_preserved = isinstance(raw_id, str) and 0 < len(raw_id) <= INTERACTION_ID_MAX and '\x00' not in raw_id
+    resolution = project_auto_resolution(interaction.get('autoResolution'))
+    payload = interaction.get('payload')
+
+    def placeholder(reason):
+        detail = {'kind': kind, 'supported': False, 'unsupportedReason': reason}
+        if id_preserved:
+            detail['interactionId'] = raw_id
+        if resolution:
+            detail['autoResolution'] = resolution
+        return detail
+
+    if kind == 'workspaceHookReview':
+        return placeholder('unsupported_kind'), id_preserved
+    if not isinstance(payload, dict) or payload.get('kind') != kind:
+        return placeholder('invalid_payload'), id_preserved
+    if not id_preserved:
+        return placeholder('invalid_id'), id_preserved
+    try:
+        detail = {'kind': kind, 'interactionId': raw_id}
+        if resolution:
+            detail['autoResolution'] = resolution
+        if kind == 'permission':
+            detail['toolName'] = display_text(payload.get('toolName'), 200)
+            detail['summary'] = display_text(payload.get('summary'), 4000)
+            detail['freeText'] = payload.get('freeText') is True
+            options = payload.get('options')
+            require(isinstance(options, list) and 0 < len(options) <= INTERACTION_OPTIONS_MAX, '权限选项无效')
+            mapped = []
+            for option in options:
+                require(isinstance(option, dict) and option.get('kind') in
+                    ('allowOnce', 'allowAlways', 'deny', 'custom'), '权限选项无效')
+                mapped.append({'optionId': string(option.get('optionId'), INTERACTION_ID_MAX),
+                    'label': display_text(option.get('label'), 512), 'kind': option['kind']})
+            detail['options'] = mapped
+        else:
+            detail['prompt'] = display_text(payload.get('prompt'), 4000)
+            detail['freeText'] = payload.get('freeText') is True
+            detail['sensitive'] = payload.get('sensitive') is True
+            detail['toolName'] = display_text(payload.get('toolName'), 200)
+            if payload.get('questions') is not None:
+                detail['questions'] = project_questions(payload['questions'])
+                index = payload.get('currentQuestionIndex')
+                if type(index) is int and 0 <= index < len(detail['questions']):
+                    detail['currentQuestionIndex'] = index
+            elif payload.get('options') is not None:
+                options = payload['options']
+                require(isinstance(options, list) and 0 < len(options) <= INTERACTION_OPTIONS_MAX, '交互选项无效')
+                detail['options'] = [{'optionId': string(option.get('optionId'), INTERACTION_ID_MAX),
+                    'label': display_text(option.get('label'), 512)}
+                    for option in options if isinstance(option, dict)]
+                require(len(detail['options']) == len(options), '交互选项无效')
+            if payload.get('answerDrafts') is not None:
+                detail['answerDrafts'] = project_answer_drafts(payload['answerDrafts'])
+    except RequestError:
+        return placeholder('oversized'), id_preserved
+    if len(json.dumps(detail, ensure_ascii=False).encode()) > INTERACTION_DETAIL_BYTES:
+        return placeholder('oversized'), id_preserved
+    detail['supported'] = True
+    return detail, id_preserved
+
+
+def project_interactions(pending):
+    """Return (details, complete): the first INTERACTION_DETAILS_MAX items plus the
+    completeness flag. complete is true only when every pending interaction is
+    represented with its original ID — a truncated window or an unpreservable ID
+    keeps it false so absence in the details list never proves "not pending"."""
+    require(isinstance(pending, list), '交互列表无效')
+    details = []
+    complete = len(pending) <= INTERACTION_DETAILS_MAX
+    for interaction in pending[:INTERACTION_DETAILS_MAX]:
+        try:
+            detail, id_preserved = project_interaction(interaction)
+        except RequestError:
+            # Unrecognizable item: still occupies a slot as a placeholder without ID.
+            detail = {'kind': 'unknown', 'supported': False, 'unsupportedReason': 'invalid_payload'}
+            id_preserved = False
+        complete = complete and id_preserved
+        details.append(detail)
+    return details, complete
+
+
+def pending_interaction_ids(pending):
+    # Exact original IDs, no length cap on the lookup side: presence comparison must
+    # never miss an interaction whose ID is too long to be projected.
+    return {item['interactionId'] for item in pending
+        if isinstance(item, dict) and isinstance(item.get('interactionId'), str)}
+
+
+def answer_value(value):
+    if isinstance(value, str):
+        return string(value, INTERACTION_ANSWER_TEXT_CHARS)
+    require(isinstance(value, list) and 0 < len(value) <= INTERACTION_OPTIONS_MAX, '答案选项无效')
+    return [string(item, INTERACTION_ANSWER_TEXT_CHARS) for item in value]
+
+
+def interaction_content(content):
+    require(isinstance(content, dict), '交互答案无效')
+    result = {}
+    for key, value in content.items():
+        if key == 'answers':
+            require(isinstance(value, dict), '答案表无效')
+            mapped = {}
+            for question, joined in value.items():
+                require(isinstance(question, str) and 0 < len(question) <= INTERACTION_QUESTION_CHARS
+                    and '\x00' not in question, '答案键无效')
+                mapped[question] = string(joined, INTERACTION_JOINED_CHARS)
+            require(mapped, '答案表不能为空')
+            result['answers'] = mapped
+        elif key == 'answer':
+            result['answer'] = answer_value(value)
+        elif re.fullmatch(r'answer_[0-9]{1,2}', key):
+            require(int(key[7:]) < INTERACTION_QUESTIONS_MAX, '答案题号无效')
+            result[key] = answer_value(value)
+        else:
+            raise RequestError('答案字段不受支持')
+    require(result, '答案不能为空')
+    return result
+
+
+def interaction_answer(answer):
+    require(isinstance(answer, dict), '交互应答无效')
+    keys = set(answer)
+    if keys == {'optionId'}:
+        return {'optionId': string(answer['optionId'], INTERACTION_ID_MAX)}
+    if keys == {'freeText'}:
+        return {'freeText': string(answer['freeText'], INTERACTION_ANSWER_TEXT_CHARS)}
+    if keys == {'action'}:
+        require(answer['action'] in ('decline', 'cancel'), '该应答类型必须携带内容')
+        return {'action': answer['action']}
+    if keys == {'action', 'content'}:
+        require(answer['action'] == 'accept', '该应答类型不应携带内容')
+        validated = {'action': 'accept', 'content': interaction_content(answer['content'])}
+        require(len(json.dumps(validated, ensure_ascii=False).encode()) <= INTERACTION_ANSWER_BYTES, '答案超出大小限制')
+        return validated
+    raise RequestError('交互应答无效')
 
 
 class Assembler:
@@ -301,6 +519,11 @@ class Bridge:
                     'mode': 'yolo', 'planEnabled': False, 'requestedDelivery': params['delivery'], 'inputOrigin': 'mobile'}
         elif kind == 'stop':
             payload = {'expectedForegroundExecutionId': string(params.get('executionId'))}
+        elif kind == 'resolveInteraction':
+            payload = {'interactionId': string(params.get('interactionId'), INTERACTION_ID_MAX),
+                'answer': interaction_answer(params.get('answer'))}
+        elif kind == 'snoozeInteractionAutoResolution':
+            payload = {'interactionId': string(params.get('interactionId'), INTERACTION_ID_MAX)}
         envelope = {'commandId': command_id, 'clientId': self.client_id, 'sessionId': session_id,
             'type': kind, 'payload': payload, 'issuedAt': int(time.time() * 1000)}
         ack = self.agent('sendConversationCommandV4', dict(target, envelope=envelope))
@@ -318,7 +541,10 @@ class Bridge:
             self.call('zcode-agent', 'initializeConversationV4', {'kind': 'clientHello', 'protocolVersion': 3,
                 'clientId': client_id, 'clientKind': 'mobileApp', 'appVersion': 'pockethelm-zcode-experimental'})
             self.client_id = client_id
-            return {'engine': 'zcode', 'bridgeVersion': 1, 'permission': 'Full access', 'protocolVersion': 3, 'sessionsIndex': True}
+            # bridgeVersion stays 1: released 0.4.12 clients require exactly this value.
+            # New capabilities are negotiated additively; old clients ignore them.
+            return {'engine': 'zcode', 'bridgeVersion': 1, 'permission': 'Full access', 'protocolVersion': 3,
+                'sessionsIndex': True, 'capabilities': {'interactions': True}}
         require(self.client_id is not None, '请先初始化连接')
         if method == 'sessions/status':
             return self.indexes.read()
@@ -338,17 +564,33 @@ class Bridge:
         if method == 'directory/read':
             return self.read_directory(params)
         if method == 'session/read':
+            check = params.get('checkInteractionIds')
+            if check is not None:
+                # Validate before subscribing: malformed checks must not touch upstream.
+                require(isinstance(check, list) and len(check) <= INTERACTION_CHECK_IDS_MAX
+                    and len(set(check)) == len(check)
+                    and all(isinstance(item, str) and 0 < len(item) <= INTERACTION_ID_MAX for item in check),
+                    '交互核对参数无效')
             snap = self.snapshot(params)
             config = snap['config']
             control = snap['control']
-            return {'id': snap['sessionId'], 'title': snap['meta']['title'], 'revision': snap['revision'], 'logEpoch': snap['logEpoch'],
+            interactions, complete = project_interactions(snap['pendingInteractions'])
+            result = {'id': snap['sessionId'], 'title': snap['meta']['title'], 'revision': snap['revision'], 'logEpoch': snap['logEpoch'],
                 'selection': config.get('modelSelection'), 'mode': config['mode'], 'phase': control['phase'],
                 'canStop': control['canStop'], 'executionId': next((w['foregroundExecutionId'] for w in control['activeWorks'] if w.get('foregroundExecutionId')), ''),
                 'items': project_rows(snap['rows']['window']), 'totalRows': snap['rows']['totalCount'],
                 'firstRowId': snap['rows'].get('firstRowId'), 'hasMore': snap['rows']['totalCount'] > len(snap['rows']['window']),
                 'queue': [pick(q, ['queueItemId', 'text', 'sourceCommandId']) for q in snap['queue']['items']],
                 'interactionCount': len(snap['pendingInteractions']),
+                'interactions': interactions, 'interactionsComplete': complete,
                 'lastError': str((control.get('lastError') or {}).get('message', ''))[:2000]}
+            # Presence is computed from this same raw snapshot, before the detail window
+            # is applied: an ID outside the first four details still reports pending=true.
+            if check is not None:
+                pending_ids = pending_interaction_ids(snap['pendingInteractions'])
+                result['interactionPresence'] = [{'interactionId': item, 'pending': item in pending_ids}
+                    for item in check]
+            return result
         if method == 'session/history':
             target = self.session_target(params)
             before = params.get('beforeRowId')
@@ -359,6 +601,10 @@ class Bridge:
                 'revision': data['atRevision'], 'logEpoch': data['atLogEpoch']}
         if method in ('session/create', 'session/send', 'session/stop'):
             return self.command({'session/create': 'createSession', 'session/send': 'sendText', 'session/stop': 'stop'}[method], params)
+        if method == 'session/interact':
+            return self.command('resolveInteraction', params)
+        if method == 'session/interact/snooze':
+            return self.command('snoozeInteractionAutoResolution', params)
         if method == 'command/query':
             target = self.workspace(params)
             data = self.agent('queryConversationCommandsV4', dict(target, commands=[{

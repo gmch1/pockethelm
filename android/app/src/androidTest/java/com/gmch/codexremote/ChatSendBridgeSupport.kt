@@ -35,13 +35,19 @@ class TestPrefsApp(val namespace: String) : Application() {
     }
 }
 
-class FakeRpcBridge(private val vm: Any, private val rpcFieldName: String = "rpc") {
+class FakeRpcBridge(
+    private val vm: Any, private val rpcFieldName: String = "rpc",
+    private val onEvent: (JSONObject) -> Unit = {}
+) {
     class FakeRpcError(val code: Int, message: String) : Exception(message)
 
     /** Method -> response for each request of that method; a thrown FakeRpcError becomes an error reply. */
     val scripted = ConcurrentHashMap<String, (JSONObject) -> JSONObject>()
     val unexpected = CopyOnWriteArrayList<String>()
     val errors = ConcurrentLinkedQueue<Throwable>()
+
+    /** Responses the CLIENT wrote for server-initiated requests (no method field). */
+    val clientWrites = ConcurrentLinkedQueue<JSONObject>()
 
     private val serverThread = AtomicReference<Thread?>()
     private val toVm = AtomicReference<PipedInputStream?>()
@@ -56,7 +62,7 @@ class FakeRpcBridge(private val vm: Any, private val rpcFieldName: String = "rpc
         val clientOut = PipedOutputStream(serverIn)
         toVm.set(clientIn); serverOut.set(out); fromVm.set(serverIn); vmOut.set(clientOut)
         val field = vm.javaClass.getDeclaredField(rpcFieldName).apply { isAccessible = true }
-        field.set(vm, RpcClient(clientIn, clientOut, {}, {}))
+        field.set(vm, RpcClient(clientIn, clientOut, onEvent, {}))
         val worker = thread(name = "fake-chat-bridge") {
             try {
                 val reader = BufferedReader(InputStreamReader(serverIn, Charsets.UTF_8))
@@ -64,6 +70,11 @@ class FakeRpcBridge(private val vm: Any, private val rpcFieldName: String = "rpc
                     val line = reader.readLine() ?: break
                     if (line.isBlank()) continue
                     val request = JSONObject(line)
+                    if (!request.has("method")) {
+                        // A response to a server-initiated request: record it, never reply.
+                        clientWrites.add(request)
+                        continue
+                    }
                     val id = request.string("id")
                     val method = request.string("method")
                     try {

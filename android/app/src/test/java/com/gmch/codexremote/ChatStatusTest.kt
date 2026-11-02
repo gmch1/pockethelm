@@ -32,6 +32,9 @@ class ChatStatusTest {
         assertEquals(AgentRun.WaitingInteraction, zcodeAgentRun(connected = true, phase = "running", interactionCount = 1))
         assertEquals(AgentRun.WaitingInteraction, zcodeAgentRun(connected = true, phase = "waiting", interactionCount = 2))
         assertEquals("等待交互", agentRunLabel(AgentRun.WaitingInteraction, ""))
+        // Codex approvals take the same interaction state, overriding an active runtime.
+        assertEquals(AgentRun.WaitingInteraction, codexAgentRun(connected = true, runtime = "active", pendingApprovals = 1))
+        assertEquals(AgentRun.Running, codexAgentRun(connected = true, runtime = "active"))
         // A bare waiting phase is static too; only confirmed running spins.
         assertEquals(AgentRun.Waiting, zcodeAgentRun(connected = true, phase = "waiting"))
         assertEquals("等待回复", agentRunLabel(AgentRun.Waiting, ""))
