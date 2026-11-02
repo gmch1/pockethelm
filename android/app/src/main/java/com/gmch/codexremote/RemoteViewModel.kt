@@ -635,14 +635,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     fun createThread(cwd: String, name: String) = action {
         require(cwd.startsWith('/')) { "请选择项目绝对路径" }
-        val params = yolo().put("cwd", cwd)
+        // All history reads below use the paginated contract. Legacy threads are not
+        // materialized until their first message, so resuming one before send fails.
+        val params = yolo().put("cwd", cwd).put("historyMode", "paginated")
         val result = client().call("thread/start", params)
         assertYolo(result)
         val session = SessionInfo.parse(result.getJSONObject("thread"))
         if (name.isNotBlank()) client().call("thread/name/set", obj("threadId" to session.id, "name" to name.trim().take(120)))
         selectionVersion++; timeline.clear()
         mutable.update { it.copy(selected = session.copy(title = name.ifBlank { "新会话" }), items = emptyList(), queue = emptyList(),
-            historyCursor = null, draft = "", uncertain = null, diff = "", tab = 0, modelSettings = ModelSettings.parse(result), settingsNotice = null) }
+            historyCursor = null, draft = "", uncertain = null, diff = "", tab = 0, modelSettings = ModelSettings.parse(result), settingsNotice = null,
+            historyLoading = false, historyError = null, historyCached = false, sending = false, outgoing = emptyList()) }
         loadSessions(false)
     }
     private fun assertYolo(result: JSONObject) {
