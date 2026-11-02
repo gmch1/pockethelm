@@ -1,6 +1,6 @@
 # 交互类型接入：Codex 审批应答 + ZCode 提问应答
 
-状态：待 review（R9/R10 已修复并完成定向验证；未合并或发布商店）
+状态：已发布（0.4.13 / versionCode 23；2026-11-02 用户授权更新商店，分支尚未合并 main）
 
 ## 需求与验收 由 Codex 维护
 
@@ -361,3 +361,13 @@ c5b5bfc 初次代码验收结论（保留历史，修复结果见下）：**代�
 - 最终代码与测试产物一致性：以最新「R9/R10 修复交付」的源码快照、已测/已安装 APK 哈希及定向验证为准；上一轮哈希仅保留作历史证据。
 - 发布版本、APK SHA-256 与商店验证：本次为任务分支修复交付，版本维持 0.4.12/22，未合并或发布商店。
 - 完成时间及说明：2026-11-02；R1–R10 修复记录齐全，交付 `interaction-approvals` 分支待 review。
+
+
+### 商店发布记录 · 0.4.13（2026-11-02）
+
+- 用户明确授权更新原商店条目。基于 `374a830`，仅将版本递增到 0.4.13 / 23，产品逻辑和测试源码不变；上一轮 R9/R10 修复的远程 CI（run 41423904202）已全部 success。
+- 使用原发行签名构建 release 与 release androidTest；包名仍为 `com.gmch.codexremote`，不可调试，签名 SHA-256 为 `54c2508d89048ef721e3d67d0a192397f103886a9f40e65ba31d696c2e2fbab5`。源码快照（同前述算法）为 `b10b26867c8106686c9fea3a9c706f14894987b2f3017b477accc8dc0ea1b923`。
+- 实际待发布包在 Android 13 真机覆盖安装，5 项关键 UI 用例全部通过：Codex 审批 sheet 应答、ZCode 单选自定义回答、敏感输入 IME 配置、四种纯文本投影的输入与发送、敏感草稿保留及 snooze。MIUI 在 instrumentation 返回测试 Activity 时弹启动确认，经处理后测试正常完成；没有修改产品权限策略。
+- 构建产物、设备已安装 APK、商店公开索引及完整下载 APK 的 SHA-256 均一致：`f270108ee4c06ad82e92c313f33f7ad6ce68bfae8e76ee26e911f719327e5a6e`。上传 API 返回 `published`，原条目版本为 0.4.13 / 23。公网检查绕过本机不可用代理，HTTPS 证书校验正常开启。
+- 发布证据位于仓库外 `~/.local/state/pockethelm/release-0.4.13/`：`build.log`、`instrument.txt`、`verification.json`、`upload.json`、`store-verified.json`、`store-check.log` 及已校验 APK。已卸载测试包、删除临时 APK/截图缓存，AppOps 恢复原值，保留新版本与用户数据。
+- 开发机已部署本任务新版 bridge；其他开发机如需使用 ZCode 应答，仍须按 README 更新桥接器。发布记录与版本号提交、推送 `interaction-approvals`；本次不合并 main。
