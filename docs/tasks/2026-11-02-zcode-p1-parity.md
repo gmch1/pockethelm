@@ -1,6 +1,6 @@
 # ZCode P1 能力对齐：更改徽章、队列管理与列表元数据
 
-状态：发布中（0.4.16 / 26，2026-11-03）
+状态：已发布（0.4.16 / 26，2026-11-03）
 
 ## 需求与验收
 
@@ -109,3 +109,4 @@
 ### 商店发布 0.4.16
 
 - 用户明确授权更新商店；发布原 129 已测 APK，源码指纹复核一致，保留包名与原发行签名，debuggable=false。发布证据位于 `~/.local/state/pockethelm/release-0.4.16/`。
+- 发布源码提交 `ea44d0a`。原商店返回 published，公开 HTTPS 索引版本 0.4.16 / 26、原签名及完整下载包哈希均与已测 APK 一致：`c28ae536ff2c359e9e5931480c506ed86962c073aca50fd903a24390e43783bd`。公开文件 `com.gmch.codexremote_26.apk`；保留 upload.json、store-verified.json、index-v1.jar、download.apk 和 store-check.log。仅推送 `zcode-p1-parity`，未合并 main。
