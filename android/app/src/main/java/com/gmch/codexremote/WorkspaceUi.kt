@@ -20,6 +20,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -233,30 +234,33 @@ internal fun WorkspaceListPage(engine: String, onEngine: (String) -> Unit,
             if (!connected) OfflineBanner(busy, reconnect)
             WorkspaceError(error, dismissError, detail)
             topExtra()
-            LazyColumn(Modifier.weight(1f), state = list) {
-                if (filtered.isEmpty()) item(key = "empty") {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 72.dp), horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(when {
-                            filtersActive -> "没有匹配的会话"
-                            sessions.isNotEmpty() -> "没有匹配的会话"
-                            busy -> "正在加载会话…"
-                            !connected -> "连接后加载会话"
-                            error != null -> "会话加载失败"
-                            else -> "暂无会话"
-                        }, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (filtersActive) TextButton({ search = ""; projectPath = ""; onlyRunning = false }) { Text("清除筛选") }
-                        if (error != null && !busy) TextButton(refresh, enabled = connected) { Text("重试") }
+            PullToRefreshBox(isRefreshing = busy, onRefresh = { if (connected && !busy) refresh() },
+                modifier = Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(Modifier.fillMaxSize(), state = list) {
+                    if (filtered.isEmpty()) item(key = "empty") {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 72.dp), horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(when {
+                                filtersActive -> "没有匹配的会话"
+                                sessions.isNotEmpty() -> "没有匹配的会话"
+                                busy -> "正在加载会话…"
+                                !connected -> "连接后加载会话"
+                                error != null -> "会话加载失败"
+                                else -> "暂无会话"
+                            }, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (filtersActive) TextButton({ search = ""; projectPath = ""; onlyRunning = false }) { Text("清除筛选") }
+                            if (error != null && !busy) TextButton(refresh, enabled = connected) { Text("重试") }
+                        }
                     }
+                    items(filtered, key = { it.id }) { row ->
+                        SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
+                            preview = row.preview, pending = row.pendingInteractions,
+                            unread = row.unread, background = row.backgroundWork) { open(row.id) }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
+                    }
+                    if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
+                    item { Spacer(Modifier.height(8.dp)) }
                 }
-                items(filtered, key = { it.id }) { row ->
-                    SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
-                        preview = row.preview, pending = row.pendingInteractions,
-                        unread = row.unread, background = row.backgroundWork) { open(row.id) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
-                }
-                if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
-                item { Spacer(Modifier.height(8.dp)) }
             }
         }
     }
