@@ -1,6 +1,6 @@
 # Codex 新会话首条消息发送失败
 
-状态：review 通过，发布 0.4.15 / 25 中（2026-11-02）
+状态：已发布 0.4.15 / 25（2026-11-02）
 
 ## 需求与验收 由 Codex 维护
 
@@ -110,3 +110,5 @@
 - 待发布/已测试 APK SHA-256：`1043a198ff5547ab20fdbdab652e167f5121813ca5e581892c01975d2bd3a5ae`；包名 `com.gmch.codexremote`，debuggable=false，原发行签名 SHA-256 `54c2508d89048ef721e3d67d0a192397f103886a9f40e65ba31d696c2e2fbab5`。
 - 构建基线 `67bd2a3` 加本轮源码修改；72 文件源码指纹（同上述算法）`0f4454b70dd0081e7cd2b1cf5fba1b885bd2106c389fd7c15a1c7fb4e4dc9586`。构建和验收后产品/测试源码未变；优先发布同一已测产物，不为提交元数据重构建。
 - 私有证据：`~/.local/state/pockethelm/release-0.4.15/`，含 build.log、instrument.txt、live-result.json、live-events.json、verification.json、source-snapshot.json、unnamed-success.png、source.tar.gz 和原签名 APK。
+- 发布源码提交 `51e750f`，提交后的上述源码指纹与已测试构建一致。原商店上传返回 published，公开 HTTPS 索引已是 0.4.15 / 25；原签名与完整下载 APK 哈希均匹配已测试产物 `1043a198ff5547ab20fdbdab652e167f5121813ca5e581892c01975d2bd3a5ae`。
+- 发布文件 `com.gmch.codexremote_25.apk`，使用正常 TLS 校验；保留 upload.json、index-v1.jar、download.apk、store-verified.json、store-check.log 和 source-commit.json。不改商店服务、签名或 DNS，不合并 main；仅推送本任务分支，未触碰 `.zcode/`。
