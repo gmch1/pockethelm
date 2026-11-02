@@ -3,8 +3,10 @@ package com.gmch.codexremote
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.PanToolAlt
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -50,20 +52,29 @@ internal fun relativeActivityTime(millis: Long, now: Long = System.currentTimeMi
 private val Amber = Color(0xff936b28)
 private val RunningTint = Color(0xffe8f1e9)
 
-/** One flat list row: title over project · status · time; running rows keep a soft wash and edge bar. */
+/** One flat list row: title over preview (ZCode P1, when present) over project · status ·
+ *  time; running rows keep a soft wash and edge bar, unread rows carry a dot before the
+ *  title, pending-interaction counts and background work ride the status line. */
 @Composable
 internal fun SessionRow(title: String, project: String, status: String, updatedAt: Long,
-                        enabled: Boolean = true, onClick: () -> Unit) {
+                        enabled: Boolean = true, preview: String = "", pending: Int = 0,
+                        unread: Boolean = false, background: Boolean = false, onClick: () -> Unit) {
     val running = status == "执行中"
     Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)
         .background(if (running) RunningTint else Color.Transparent)
         .clickable(enabled = enabled, onClickLabel = "打开会话", onClick = onClick)) {
         Box(Modifier.width(4.dp).fillMaxHeight().background(if (running) MaterialTheme.colorScheme.primary else Color.Transparent))
-        Row(Modifier.weight(1f).heightIn(min = 76.dp).padding(start = 14.dp, end = 18.dp, top = 13.dp, bottom = 12.dp),
+        Row(Modifier.weight(1f).heightIn(min = if (preview.isBlank()) 76.dp else 88.dp)
+            .padding(start = 14.dp, end = 18.dp, top = 13.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text(title, fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium,
-                    maxLines = if (LocalDensity.current.fontScale > 1.15f) 2 else 1, overflow = TextOverflow.Ellipsis)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (unread) Box(Modifier.size(7.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+                    Text(title, Modifier.weight(1f, fill = false), fontSize = 15.sp, lineHeight = 23.sp, fontWeight = FontWeight.Medium,
+                        maxLines = if (LocalDensity.current.fontScale > 1.15f) 2 else 1, overflow = TextOverflow.Ellipsis)
+                }
+                if (preview.isNotBlank()) Text(preview, fontSize = 11.sp, lineHeight = 17.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                     Text(project.ifBlank { "未归类项目" }, fontSize = 11.sp, lineHeight = 18.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -85,6 +96,11 @@ internal fun SessionRow(title: String, project: String, status: String, updatedA
                         status.isNotEmpty() -> Text(status, fontSize = 11.sp, lineHeight = 18.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                    if (pending > 0) {
+                        Icon(Icons.Outlined.PanToolAlt, null, Modifier.size(12.dp), tint = Amber)
+                        Text("待交互 $pending", fontSize = 11.sp, lineHeight = 18.sp, color = Amber)
+                    }
+                    if (background) Text("后台", fontSize = 11.sp, lineHeight = 18.sp, color = MaterialTheme.colorScheme.primary)
                 }
             }
             Text(relativeActivityTime(updatedAt), fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)

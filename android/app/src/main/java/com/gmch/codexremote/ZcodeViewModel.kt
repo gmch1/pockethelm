@@ -43,7 +43,16 @@ data class ZcodeState(
     val interactReleasable: Set<String> = emptySet(),
     val interactionPresence: Map<String, Boolean> = emptyMap(),
     val interactionNotice: String = "",
-    val snoozeUnconfirmed: Set<String> = emptySet()
+    val snoozeUnconfirmed: Set<String> = emptySet(),
+    // P1 (2026-11-02 zcode-p1-parity): authoritative turn badge, file-change detail and
+    // queue operations only when the bridge advertises them; list metadata from the
+    // sessions-index stream; diffText carries a loaded detail sheet body.
+    val turn: ZTurn? = null,
+    val queueOpsEnabled: Boolean = false,
+    val diffEnabled: Boolean = false,
+    val indexMetaEnabled: Boolean = false,
+    val listMeta: Map<String, ZListMeta> = emptyMap(),
+    val diffText: String? = null
 )
 
 class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
@@ -77,6 +86,23 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private var historySyncedAt = 0L
     private var resumeJob: Job? = null
     private var navigationVersion = 0
+    // P1 unread tracking: in-memory seen timestamps (wall clock at read), persisted to the
+    // vault only on navigation/connection boundaries — never on the 2.5s poll.
+    private val seenActivity = LinkedHashMap<String, Long>()
+    private fun seenKey() = key("seen")
+    private fun persistSeen() {
+        val bounded = seenActivity.entries.toList().takeLast(500)
+        seenActivity.clear(); bounded.forEach { seenActivity[it.key] = it.value }
+        runCatching {
+            vault.put(seenKey(), org.json.JSONObject().apply { bounded.forEach { (id, at) -> put(id, at) } }.toString())
+        }
+    }
+    private fun restoreSeen() {
+        seenActivity.clear()
+        val raw = runCatching { vault.get(seenKey()) }.getOrNull() ?: return
+        val stored = runCatching { JSONObject(raw) }.getOrNull() ?: return
+        stored.keys().forEach { id -> seenActivity[id] = stored.optLong(id) }
+    }
 
     init {
         val raw = runCatching { vault.get("profile") }.getOrNull()
@@ -193,6 +219,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             // vault blob is per-environment and will not reload); drop them wholesale.
             resetInteractionEnvironment()
             snoozeStates.clear()
+            seenActivity.clear()
             mutable.value = ZcodeState()
         }
         if (!mutable.value.connected) { connect(); return }
@@ -243,6 +270,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         // backoff budget die with it. Answer records survive in the vault for recovery.
         snoozeStates.clear()
         interactionFlights.clear()
+        persistSeen()
         mutable.update {
             it.copy(connected = false, busy = false, sending = false, historyLoading = false, sessionsFresh = false, liveStatuses = emptyList(),
                 // A session opened but never loaded must not fall back to a blank timeline.
@@ -250,7 +278,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                     "连接已断开，未能加载会话内容，重连后重试" else it.historyError,
                 commandInFlight = false,
                 interactionsEnabled = false, interactions = emptyList(), interactionsComplete = false,
-                interactSubmitting = emptySet(), interactReleasable = emptySet(), interactionPresence = emptyMap(), interactionNotice = "", snoozeUnconfirmed = emptySet())
+                interactSubmitting = emptySet(), interactReleasable = emptySet(), interactionPresence = emptyMap(), interactionNotice = "", snoozeUnconfirmed = emptySet(),
+                turn = null, queueOpsEnabled = false, diffEnabled = false, indexMetaEnabled = false,
+                listMeta = emptyMap(), diffText = null)
         }
     }
     fun connect() {
@@ -267,6 +297,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 // A different environment owns no local records from the previous one.
                 outgoingBySession.clear()
                 resetInteractionEnvironment()
+                seenActivity.clear()
             }
             profile = next
             pending = vault.get(key("pending"))?.let(::JSONObject)
@@ -289,8 +320,15 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 check(hello.string("engine") == "zcode" && hello.optInt("bridgeVersion") == 1) { "请在开发机安装 ZCode 桥接器" }
                 supportsSessionIndex = hello.optBoolean("sessionsIndex")
                 // Optional capability: an older bridge without it keeps the count-only placeholder.
-                interactSupport = hello.optJSONObject("capabilities")?.optBoolean("interactions") == true
-                mutable.update { it.copy(connected = true, interactionsEnabled = interactSupport) }
+                val capabilities = hello.optJSONObject("capabilities")
+                interactSupport = capabilities?.optBoolean("interactions") == true
+                val queueOps = capabilities?.optBoolean("queueOps") == true
+                val turnSummary = capabilities?.optBoolean("turnSummary") == true
+                val fileChanges = capabilities?.optBoolean("fileChanges") == true
+                val indexMeta = capabilities?.optBoolean("indexMeta") == true
+                restoreSeen()
+                mutable.update { it.copy(connected = true, interactionsEnabled = interactSupport,
+                    queueOpsEnabled = queueOps, diffEnabled = turnSummary && fileChanges, indexMetaEnabled = indexMeta) }
                 recoverPending()
                 try { recoverInteractions() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
                 mutable.value.selected?.let { session ->
@@ -335,6 +373,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }, sessions = data.optJSONArray("sessions").objects().map(ZSession::parse)
             // Most recently active first; stable sort keeps peers without timestamps in place.
             .sortedByDescending { it.updatedAt }) }
+        publishListMeta()
         // readTree is a complete list. Removed sessions must not survive a cold-start snapshot.
         val selected = mutable.value.selected
         if (selected != null && mutable.value.historyCached && mutable.value.sessions.none { it.id == selected.id }) {
@@ -342,7 +381,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             older = emptyList()
             mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), outgoing = emptyList(),
                 draft = "", phase = "", executionId = "", historyLoading = false, historyCached = false,
-                historyError = null, notice = "该会话已移除") }
+                historyError = null, notice = "该会话已移除", turn = null, diffText = null) }
         }
     }
     // Directory picker: all transitions go through the ZcodeBrowser reducer; this wiring owns
@@ -471,6 +510,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     private fun select(session: ZSession) {
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
+        // The outgoing session has been read to its latest state; stamp and persist now so
+        // its unread dot dies with navigation, not with the next connect cycle.
+        mutable.value.selected?.let { seenActivity[it.id] = System.currentTimeMillis() }
+        persistSeen()
         older = emptyList()
         val outKey = outgoingKey(session.id)
         mutable.update { it.copy(selected = session, historyCached = false, items = emptyList(), queue = emptyList(), phase = "", executionId = "",
@@ -480,7 +523,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             draft = vault.get(key("draft", session.id)).orEmpty(), beforeRow = null, notice = "", currentSelection = null, permission = "",
             interactions = emptyList(), interactionsComplete = false, interactionPresence = emptyMap(),
             interactSubmitting = emptySet(), interactReleasable = emptySet(), interactionNotice = "",
-            logEpoch = "", revision = 0) }
+            logEpoch = "", revision = 0, turn = null, diffText = null) }
         // A persisted pending send restores its 待确认 bubble for exactly this session —
         // but never over an existing record: an in-flight SENDING, or a settled
         // ACCEPTED/FAILED receipt, must not be downgraded by replaying the old receipt.
@@ -498,10 +541,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         navigationVersion++
         if (mutable.value.selected == null) return
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
+        mutable.value.selected?.let { seenActivity[it.id] = System.currentTimeMillis() }
+        persistSeen()
         mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false,
             historyError = null, outgoing = emptyList(), sessionsFresh = it.connected && it.sessionsFresh,
             interactions = emptyList(), interactionsComplete = false, interactSubmitting = emptySet(),
-            interactionNotice = "", snoozeUnconfirmed = emptySet()) }
+            interactionNotice = "", snoozeUnconfirmed = emptySet(), turn = null, diffText = null) }
         older = emptyList()
         val epoch = generation
         viewModelScope.launch {
@@ -575,6 +620,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val queue = queueEntries(data)
         val first = if (data.isNull("firstRowId")) null else data.optDouble("firstRowId")
         val interactions = if (interactSupport) zcodeInteractions(data) else emptyList()
+        // Reading the authoritative snapshot IS the seen event for the open session. In
+        // memory only; persisted at the next navigation/connection boundary.
+        seenActivity[session.id] = System.currentTimeMillis()
         mutable.update { it.copy(selected = session.copy(title = data.string("title").ifBlank { session.title }),
             items = (older + items).distinctBy { row -> row.id }, phase = data.string("phase"), queue = queue,
             executionId = if (data.optBoolean("canStop")) data.string("executionId") else "",
@@ -587,6 +635,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             historyLoading = false, historyError = null, historyCached = false,
             beforeRow = if (older.isNotEmpty()) it.beforeRow else first?.takeIf { _ -> data.optBoolean("hasMore") },
             logEpoch = epoch, revision = revision,
+            turn = ZTurn.parse(data.optJSONObject("turn")),
             notice = noticeForPhase(data.string("phase"), data.string("lastError").ifBlank { it.notice })) }
         reconcileOutgoing(session.id)
         // Snooze intent may predate this snapshot (question arrived first), and a failed
@@ -694,6 +743,43 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         write("session/stop", session.target().put("executionId", state.executionId))
         read(session)
     }
+
+    // ---- Queue operations & turn diff (task 2026-11-02 zcode-p1-parity) ----
+    // CAS discipline: baseRevision is the revision of the snapshot the user is acting on
+    // (state.revision, updated only by authoritative reads). The bridge refuses to invent
+    // one; a server stale surfaces as an error — we never auto-retry the command.
+
+    private fun queueWrite(method: String, queued: QueuedMessage, extra: JSONObject.() -> Unit = {}) = action {
+        val state = mutable.value
+        val session = state.selected ?: return@action
+        check(state.queueOpsEnabled) { "开发机桥接器暂不支持队列操作，请更新桥接器" }
+        check(state.logEpoch.isNotBlank()) { "会话尚未加载完成，请稍候重试" }
+        write(method, session.target().put("queueItemId", queued.id)
+            .put("baseRevision", state.revision).apply(extra))
+        read(session)
+    }
+    fun removeQueued(queued: QueuedMessage) = queueWrite("session/queue/remove", queued)
+    fun promoteQueued(queued: QueuedMessage) = queueWrite("session/queue/promote", queued)
+    fun editQueued(queued: QueuedMessage, text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) { mutable.update { it.copy(error = "排队内容不能为空") }; return }
+        queueWrite("session/queue/edit", queued) { put("text", trimmed) }
+    }
+
+    /** Loads the per-file detail for the current turn via session/diff; result opens the
+     *  shared detail sheet. Row identity and version come from the same rendered snapshot. */
+    fun loadTurnDiff() = action {
+        val state = mutable.value
+        val session = state.selected ?: return@action
+        val turn = state.turn ?: return@action
+        check(state.diffEnabled) { "开发机桥接器暂不支持更改明细，请更新桥接器" }
+        check(turn.entityId.isNotBlank()) { "该轮次缺少行标识，请刷新会话后重试" }
+        val data = call("session/diff", session.target()
+            .put("rowId", turn.rowId).put("entityId", turn.entityId)
+            .put("baseRevision", state.revision).put("baseLogEpoch", state.logEpoch))
+        mutable.update { it.copy(diffText = formatFileChanges(data)) }
+    }
+    fun clearTurnDiff() { mutable.update { it.copy(diffText = null) } }
     private suspend fun write(method: String, params: JSONObject, commandId: String? = null,
                              onDispatch: () -> Unit = {}): JSONObject? {
         check(pending == null) { "上一条命令结果尚未确认，请先刷新查询" }
@@ -1166,12 +1252,23 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val epoch = generation
         try {
             val data = call("sessions/status")
-            if (epoch == generation && active && visible)
-                mutable.update { it.copy(liveStatuses = zcodeLiveStatuses(data)) }
+            if (epoch == generation && active && visible) {
+                val statuses = zcodeLiveStatuses(data)
+                mutable.update { it.copy(liveStatuses = statuses) }
+                publishListMeta()
+            }
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) {
-            if (epoch == generation) mutable.update { it.copy(liveStatuses = emptyList()) }
+            if (epoch == generation) mutable.update { it.copy(liveStatuses = emptyList(), listMeta = emptyMap()) }
         }
+    }
+
+    /** List metadata joins live statuses with local seen timestamps; rebuilt on every
+     *  status read and project refresh so removed sessions drop out immediately. */
+    private fun publishListMeta() {
+        if (!mutable.value.indexMetaEnabled) return
+        mutable.update { it.copy(listMeta = buildListMeta(it.sessions, it.liveStatuses,
+            seenActivity.toMap(), it.selected?.id)) }
     }
     private fun pauseStatuses() {
         mutable.update { it.copy(liveStatuses = emptyList()) }

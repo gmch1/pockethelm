@@ -101,6 +101,14 @@ def guard_for(provider, settings):
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def bounded_int(value, maximum=2**53):
+    # Authoritative counters (diff stats, durations, revisions): pass through finite
+    # non-negative numbers only; anything else is dropped rather than guessed.
+    if type(value) is int and 0 <= value <= maximum:
+        return value
+    return None
+
+
 def project_rows(rows):
     result = []
     for row in rows:
@@ -108,6 +116,11 @@ def project_rows(rows):
         if kind == 'turnHeader':
             continue
         item = {'id': str(row['rowId']), 'kind': kind, 'status': row.get('state', row.get('status', ''))}
+        # Row identity for detail queries and (P2) row-targeted commands; display rows
+        # never re-key on it, and an absent or malformed value simply omits the field.
+        entity = row.get('entityId')
+        if isinstance(entity, str) and 0 < len(entity) <= 1024 and '\x00' not in entity:
+            item['entityId'] = entity
         if kind in ('userInput', 'assistantText', 'reasoning'):
             item['text'] = row.get('text', '')[:120000]
             item['commandId'] = row.get('sourceCommandId', '')
@@ -122,6 +135,101 @@ def project_rows(rows):
         else:
             item['text'] = str(row.get('displayName') or row.get('description') or row.get('text') or kind)[:2000]
         result.append(item)
+    return result
+
+
+def project_turn(rows):
+    """Project the latest turnHeader of the window: the authoritative per-turn work time
+    and CLI-aggregated file change totals (repeat writes and reverts are already netted
+    out upstream — clients must not sum tool diffs themselves). The rowId/entityId pair
+    is the target for the conversationFileChanges detail query."""
+    header = None
+    for row in rows:
+        if isinstance(row, dict) and row.get('kind') == 'turnHeader':
+            header = row
+    if not header or type(header.get('rowId')) is not int or header['rowId'] < 0:
+        return None
+    entity = header.get('entityId')
+    result = {'rowId': header['rowId'],
+        'entityId': entity if isinstance(entity, str) and 0 < len(entity) <= 1024 and '\x00' not in entity else '',
+        'state': header.get('state') if header.get('state') in
+            ('running', 'completedSuccess', 'completedInterrupted', 'failed') else ''}
+    active = bounded_int(header.get('activeMs'))
+    if active is not None:
+        result['activeMs'] = active
+    changes = header.get('fileChanges')
+    if isinstance(changes, dict):
+        summary = {}
+        for key in ('additions', 'deletions', 'files'):
+            value = bounded_int(changes.get(key))
+            if value is not None:
+                summary[key] = value
+        if changes.get('state') in ('active', 'reverted'):
+            summary['state'] = changes['state']
+        if summary:
+            result['fileChanges'] = summary
+    return result
+
+
+FILE_CHANGES_FILES_MAX = 200
+FILE_CHANGES_HUNKS_MAX = 64
+FILE_CHANGES_HUNK_LINES_MAX = 400
+FILE_CHANGES_LINE_CHARS = 1000
+
+
+def project_file_changes(data):
+    """Bounded projection of conversationFileChangesV4: per-file identity, CLI counters,
+    tool attribution and patch hunks. Malformed entries are skipped, never fatal."""
+    require(isinstance(data, dict), '更改明细无效')
+    result = {}
+    for key in ('files', 'additions', 'deletions'):
+        value = bounded_int(data.get(key))
+        if value is not None:
+            result[key] = value
+    if data.get('state') in ('active', 'reverted'):
+        result['state'] = data['state']
+    items = []
+    for entry in (data.get('items') or [])[:FILE_CHANGES_FILES_MAX]:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get('path')
+        if not isinstance(path, str) or not 0 < len(path) <= 4096 or '\x00' in path:
+            continue
+        item = {'path': path}
+        for key in ('additions', 'deletions', 'writeCount'):
+            value = bounded_int(entry.get(key))
+            if value is not None:
+                item[key] = value
+        names = entry.get('toolNames')
+        if isinstance(names, list):
+            mapped = [name for name in names[:8] if isinstance(name, str) and name][:8]
+            if mapped:
+                item['toolNames'] = [name[:200] for name in mapped]
+        hunks = []
+        total_lines = 0
+        for hunk in (entry.get('patches') or [])[:FILE_CHANGES_HUNKS_MAX]:
+            if not isinstance(hunk, dict) or not isinstance(hunk.get('lines'), list):
+                continue
+            lines = []
+            for line in hunk['lines']:
+                if not isinstance(line, str):
+                    continue
+                if total_lines >= FILE_CHANGES_HUNK_LINES_MAX:
+                    break
+                lines.append(line[:FILE_CHANGES_LINE_CHARS])
+                total_lines += 1
+            if not lines:
+                continue
+            mapped = {'lines': lines}
+            for key in ('oldStart', 'oldLines', 'newStart', 'newLines'):
+                value = hunk.get(key)
+                if type(value) is int:
+                    mapped[key] = value
+            hunks.append(mapped)
+        if hunks:
+            item['patches'] = hunks
+        items.append(item)
+    result['items'] = items
     return result
 
 
@@ -508,6 +616,7 @@ class Bridge:
         target = self.workspace(params) if kind == 'createSession' else self.session_target(params)
         session_id = target.pop('sessionId', None)
         payload = {}
+        base_revision = None
         if kind in ('createSession', 'sendText'):
             chosen = self.check_selection(params)
             if kind == 'createSession':
@@ -528,8 +637,21 @@ class Bridge:
                 'answer': interaction_answer(params.get('answer'))}
         elif kind == 'snoozeInteractionAutoResolution':
             payload = {'interactionId': string(params.get('interactionId'), INTERACTION_ID_MAX)}
+        elif kind in ('deleteQueueItem', 'sendQueuedNow'):
+            payload = {'queueItemId': string(params.get('queueItemId'), 256)}
+        elif kind == 'editQueueItem':
+            payload = {'queueItemId': string(params.get('queueItemId'), 256),
+                'newText': string(params.get('text'), 64000)}
+        # CAS commands carry the revision the user acted on. The bridge never refreshes
+        # it on its own: a server-side stale must surface instead of being bypassed.
+        if kind in ('deleteQueueItem', 'editQueueItem', 'sendQueuedNow'):
+            revision = params.get('baseRevision')
+            require(type(revision) is int and revision >= 0, '缺少会话版本，请刷新后重试')
+            base_revision = revision
         envelope = {'commandId': command_id, 'clientId': self.client_id, 'sessionId': session_id,
             'type': kind, 'payload': payload, 'issuedAt': int(time.time() * 1000)}
+        if base_revision is not None:
+            envelope['baseRevision'] = base_revision
         ack = self.agent('sendConversationCommandV4', dict(target, envelope=envelope))
         # Project only stable status/code, not raw upstream diagnostic messages.
         return pick(ack, ['commandId', 'status', 'reasonCode', 'revisionAtDecision', 'result'])
@@ -548,7 +670,8 @@ class Bridge:
             # bridgeVersion stays 1: released 0.4.12 clients require exactly this value.
             # New capabilities are negotiated additively; old clients ignore them.
             return {'engine': 'zcode', 'bridgeVersion': 1, 'permission': 'Full access', 'protocolVersion': 3,
-                'sessionsIndex': True, 'capabilities': {'interactions': True}}
+                'sessionsIndex': True, 'capabilities': {'interactions': True, 'queueOps': True,
+                    'turnSummary': True, 'fileChanges': True, 'indexMeta': True}}
         require(self.client_id is not None, '请先初始化连接')
         if method == 'sessions/status':
             return self.indexes.read()
@@ -588,6 +711,9 @@ class Bridge:
                 'interactionCount': len(snap['pendingInteractions']),
                 'interactions': interactions, 'interactionsComplete': complete,
                 'lastError': str((control.get('lastError') or {}).get('message', ''))[:2000]}
+            turn = project_turn(snap['rows']['window'])
+            if turn:
+                result['turn'] = turn
             # Presence is computed from this same raw snapshot, before the detail window
             # is applied: an ID outside the first four details still reports pending=true.
             if check is not None:
@@ -605,6 +731,26 @@ class Bridge:
                 'revision': data['atRevision'], 'logEpoch': data['atLogEpoch']}
         if method in ('session/create', 'session/send', 'session/stop'):
             return self.command({'session/create': 'createSession', 'session/send': 'sendText', 'session/stop': 'stop'}[method], params)
+        if method in ('session/queue/remove', 'session/queue/edit', 'session/queue/promote'):
+            return self.command({'session/queue/remove': 'deleteQueueItem', 'session/queue/edit': 'editQueueItem',
+                'session/queue/promote': 'sendQueuedNow'}[method], params)
+        if method == 'session/diff':
+            target = self.session_target(params)
+            row_id = params.get('rowId')
+            require(type(row_id) is int and row_id >= 0, '轮次行号无效')
+            revision = params.get('baseRevision')
+            require(type(revision) is int and revision >= 0, '缺少会话版本，请刷新后重试')
+            entity = params.get('entityId')
+            require(isinstance(entity, str) and 0 < len(entity) <= 1024 and '\x00' not in entity,
+                '该轮次缺少行标识，无法读取更改明细，请刷新会话')
+            request = dict(target, sessionId=params['sessionId'], target={'rowId': row_id,
+                'entityId': entity}, baseRevision=revision,
+                baseLogEpoch=string(params.get('baseLogEpoch'), 256))
+            try:
+                data = self.agent('conversationFileChangesV4', request)
+            except WireError:
+                raise RequestError('更改明细读取失败，可能因会话已更新，请刷新后重试')
+            return project_file_changes(data)
         if method == 'session/interact':
             return self.command('resolveInteraction', params)
         if method == 'session/interact/snooze':

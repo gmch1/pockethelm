@@ -50,7 +50,8 @@ data class SessionInfo(
     }
 }
 
-data class TimelineItem(val id: String, val kind: String, val text: String, val status: String = "", val clientId: String = "") {
+data class TimelineItem(val id: String, val kind: String, val text: String, val status: String = "", val clientId: String = "",
+                        val entityId: String = "") {
     companion object {
         fun parse(j: JSONObject): TimelineItem {
             val type = j.string("type")

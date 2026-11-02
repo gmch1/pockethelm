@@ -194,4 +194,23 @@ class ChatStatusTest {
         assertEquals("", zcodeSessionStatusLabel(""))
         assertEquals("", zcodeSessionStatusLabel("some-future-enum"))
     }
+    // ---- P1 (2026-11-02 zcode-p1-parity): turn badge labels ----
+
+    @Test fun turnDiffBadgePairsCountersAndMarksReverted() {
+        fun label(add: Int, del: Int, files: Int, reverted: Boolean = false, running: Boolean = false, activeMs: Long = 0) =
+            turnDiffBadgeLabel(TurnDiffSummary(add, del, files, reverted, running, activeMs, true))
+        assertEquals("更改 +318 −0 · 2 文件", label(318, 0, 2))
+        assertEquals("更改 +1 −9", label(1, 9, 0))
+        assertEquals("更改 +1 −1 · 已撤销", label(1, 1, 0, reverted = true))
+        assertEquals("更改 +2 −0 · 1 文件", label(2, 0, 1))
+        assertEquals("本轮修改", label(0, 0, 0))
+    }
+
+    @Test fun turnDurationUsesAuthoritativeActiveMsOnly() {
+        assertEquals("", turnDurationLabel(0))
+        assertEquals("", turnDurationLabel(-5))
+        assertEquals("12 秒", turnDurationLabel(12_000))
+        assertEquals("1 分 52 秒", turnDurationLabel(112_000))
+        assertEquals("61 分 0 秒", turnDurationLabel(3_660_000))
+    }
 }

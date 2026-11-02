@@ -30,4 +30,53 @@ class ZcodeSessionStatusTest {
         assertEquals(live("running"), zcodeLiveStatuses(data))
         assertTrue(zcodeLiveStatuses(JSONObject("""{"workspaces":[]}""")).isEmpty())
     }
+    // ---- P1 (2026-11-02 zcode-p1-parity): live metadata & unread join ----
+
+    @Test fun liveStatusesCarryP1MetadataTolerantly() {
+        val data = JSONObject("""{"workspaces":[{"workspacePath":"/work","workspaceIdentity":"host-a","fresh":true,
+            "sessions":[{"sessionId":"s","phase":"waiting","lastActivityAt":1730000000000,
+            "lastAssistantPreview":"最近的回复","pendingInteractionSummary":{"permissionCount":1,"userInputCount":2},
+            "hasBackgroundWork":true,"lastOutcome":"error"},
+            {"sessionId":"t","phase":"running"}]}]}""")
+        val statuses = zcodeLiveStatuses(data)
+        val rich = statuses.first { it.id == "s" }
+        assertEquals(1730000000000L, rich.lastActivityAt)
+        assertEquals("最近的回复", rich.preview)
+        assertEquals(1, rich.pendingPermissions)
+        assertEquals(2, rich.pendingInputs)
+        assertTrue(rich.hasBackgroundWork)
+        assertEquals("error", rich.lastOutcome)
+        val plain = statuses.first { it.id == "t" }
+        assertEquals(0, plain.lastActivityAt); assertEquals("", plain.preview)
+        assertEquals(0, plain.pendingPermissions); assertFalse(plain.hasBackgroundWork)
+    }
+
+    @Test fun listMetaUnreadOnlyForKnownSessionsWithNewerActivity() {
+        val sessions = listOf(session, session.copy(id = "t"), session.copy(id = "u"))
+        val live = listOf(ZLiveSessionStatus("s", "/work", "host-a", "running", lastActivityAt = 200),
+            ZLiveSessionStatus("t", "/work", "host-a", "running", lastActivityAt = 300),
+            ZLiveSessionStatus("u", "/work", "host-a", "running", lastActivityAt = 300))
+        val seen = mapOf("s" to 100L, "t" to 400L)
+        val meta = buildListMeta(sessions, live, seen, openSessionId = "u")
+        assertTrue(meta.getValue("s").unread)      // known + newer activity
+        assertFalse(meta.getValue("t").unread)     // known but activity already seen
+        assertFalse(meta.getValue("u").unread)     // never opened on this device: calm first view
+        assertEquals(200L, meta.getValue("s").lastActivityAt)
+        // The open session is never unread even when its seen record is stale.
+        val openNewer = buildListMeta(sessions, live, seen, openSessionId = "t")
+        assertFalse(openNewer.getValue("t").unread)
+    }
+
+    @Test fun listMetaPendingSumsCountsAndSkipsForeignWorkspaces() {
+        val live = listOf(ZLiveSessionStatus("s", "/other", "host-a", "waiting",
+            pendingPermissions = 1, pendingInputs = 2, hasBackgroundWork = true))
+        val meta = buildListMeta(listOf(session), live, emptyMap(), null)
+        assertEquals(0, meta.getValue("s").pending)
+        assertFalse(meta.getValue("s").backgroundWork)
+        val own = listOf(ZLiveSessionStatus("s", "/work", "host-a", "waiting",
+            pendingPermissions = 1, pendingInputs = 2, hasBackgroundWork = true))
+        val rich = buildListMeta(listOf(session), own, emptyMap(), null)
+        assertEquals(3, rich.getValue("s").pending)
+        assertTrue(rich.getValue("s").backgroundWork)
+    }
 }

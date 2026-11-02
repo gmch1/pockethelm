@@ -68,6 +68,34 @@ fun timelineStatusLabel(status: String) = when (status) {
     else -> ""
 }
 
+/**
+ * Authoritative per-turn change summary for the shared timeline badge (ZCode P1). Numbers
+ * come from the CLI's turnHeader aggregation — the client never sums tool diffs itself.
+ */
+data class TurnDiffSummary(
+    val additions: Int, val deletions: Int, val files: Int,
+    val reverted: Boolean, val running: Boolean, val activeMs: Long,
+    val detailAvailable: Boolean
+)
+
+/** "更改 +318 −0 · 2 文件 · 已撤销" — counters pair up whenever the turn reported any change. */
+fun turnDiffBadgeLabel(summary: TurnDiffSummary): String {
+    val parts = mutableListOf<String>()
+    if (summary.additions > 0 || summary.deletions > 0 || summary.files > 0) {
+        parts += "+${summary.additions} −${summary.deletions}"
+        if (summary.files > 0) parts += "${summary.files} 文件"
+    }
+    if (summary.reverted) parts += "已撤销"
+    return if (parts.isEmpty()) "本轮修改" else "更改 " + parts.joinToString(" · ")
+}
+
+/** Authoritative active work time; formatted as 秒/分秒/分 only when the turn reports it. */
+fun turnDurationLabel(activeMs: Long): String = when {
+    activeMs <= 0 -> ""
+    activeMs < 60_000 -> "${activeMs / 1000} 秒"
+    else -> "${activeMs / 60_000} 分 ${activeMs % 60_000 / 1000} 秒"
+}
+
 private val transientReceiptNotices = setOf(
     "已开始执行", "ZCode 已排队，等待当前任务完成", "已插入当前任务", "命令已接收")
 

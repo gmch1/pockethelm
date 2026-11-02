@@ -7,7 +7,7 @@ from wire import Client
 
 def summary(phase='running', workspace='host-a', identity='s'):
     return dict(sessionId=identity, workspaceId=workspace, phase=phase, lastActivityAt=1,
-                lastAssistantPreview='PRIVATE', metadata={'token': 'SECRET'})
+                lastAssistantPreview='最近回复', metadata={'token': 'SECRET'})
 
 
 def frame(payload, start=0, end=1, sub='sub', key='host-a'):
@@ -30,7 +30,11 @@ class IndexTests(unittest.TestCase):
         entry = self.entry(); entry.accept(snapshot())
         self.assertTrue(entry.fresh)
         self.assertEqual(entry.sessions['s']['phase'], 'running')
-        self.assertNotIn('PRIVATE', str(entry.sessions)); self.assertNotIn('SECRET', str(entry.sessions))
+        # P1 display metadata flows; arbitrary host metadata still never does.
+        self.assertEqual(entry.sessions['s']['lastAssistantPreview'], '最近回复')
+        self.assertEqual(entry.sessions['s']['lastActivityAt'], 1)
+        self.assertNotIn('SECRET', str(entry.sessions))
+        self.assertNotIn('metadata', str(entry.sessions))
         delta = frame(dict(kind='deltas', deltas=[dict(op='session.upserted', session=summary('completedInterrupted'))]), 1, 2)
         entry.accept(delta); entry.accept(delta)
         self.assertEqual(entry.sessions['s']['phase'], 'completedInterrupted')
@@ -108,6 +112,39 @@ class IndexTests(unittest.TestCase):
         client.events = [(1, 'a'), (2, 'b')]; client.frame = Mock()
         client.unlisten(1)
         self.assertEqual(client.events, [(2, 'b')])
+
+    def test_p1_metadata_fields_flow_bounded(self):
+        entry = self.entry()
+        rich = dict(summary(), pendingInteractionSummary={'permissionCount': 1, 'userInputCount': 2},
+            hasBackgroundWork=True, lastOutcome='error')
+        entry.accept(frame(dict(kind='snapshot', snapshot=dict(protocolVersion=1, workspaceId='host-a',
+            logEpoch='epoch', sessions=[rich]))))
+        self.assertTrue(entry.fresh)
+        projected = entry.sessions['s']
+        self.assertEqual(projected['pendingInteractionSummary'], {'permissionCount': 1, 'userInputCount': 2})
+        self.assertTrue(projected['hasBackgroundWork'])
+        self.assertEqual(projected['lastOutcome'], 'error')
+
+    def test_malformed_optional_metadata_is_skipped_not_fatal(self):
+        cases = [('pendingInteractionSummary', {'permissionCount': -1, 'userInputCount': 2}),
+                 ('pendingInteractionSummary', {'permissionCount': True, 'userInputCount': 2}),
+                 ('lastActivityAt', 'soon'), ('lastAssistantPreview', 123),
+                 ('hasBackgroundWork', 'yes'), ('lastOutcome', 'vibes'), ('lastAssistantPreview', '')]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                entry = self.entry()
+                entry.accept(frame(dict(kind='snapshot', snapshot=dict(protocolVersion=1,
+                    workspaceId='host-a', logEpoch='epoch', sessions=[dict(summary(), **{key: value})]))))
+                self.assertTrue(entry.fresh, 'display-only garbage must not invalidate the stream')
+                self.assertEqual(entry.sessions['s']['phase'], 'running')
+                self.assertNotIn(key, entry.sessions['s'])
+                self.assertNotIn('SECRET', str(entry.sessions))
+
+    def test_preview_is_clipped_to_bound(self):
+        entry = self.entry()
+        entry.accept(frame(dict(kind='snapshot', snapshot=dict(protocolVersion=1, workspaceId='host-a',
+            logEpoch='epoch', sessions=[dict(summary(), lastAssistantPreview='x' * 900)]))))
+        self.assertEqual(len(entry.sessions['s']['lastAssistantPreview']), 512)
 
 
 if __name__ == '__main__':

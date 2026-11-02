@@ -61,7 +61,70 @@ fun zcodeItems(j: JSONObject) = j.optJSONArray("items").objects().map {
         "success", "complete" -> "completed"; "streaming", "inputStreaming" -> "running"
         "error" -> "failed"; "cancelled" -> "interrupted"; else -> it.string("status")
     }
-    TimelineItem(it.getString("id"), kind, it.string("text"), status, it.string("commandId"))
+    TimelineItem(it.getString("id"), kind, it.string("text"), status, it.string("commandId"), it.string("entityId"))
+}
+
+/**
+ * Latest turnHeader projection from session/read: authoritative work time and CLI-aggregated
+ * change totals. fileChanges/addiveMs are optional upstream — the rowId/entityId pair is the
+ * target for the session/diff detail query and is always present when the turn exists.
+ */
+data class ZTurn(val rowId: Long, val entityId: String, val state: String, val activeMs: Long = 0,
+                 val additions: Int = -1, val deletions: Int = -1, val files: Int = -1,
+                 val reverted: Boolean = false) {
+    val hasChanges get() = additions >= 0 || deletions >= 0
+    companion object {
+        fun parse(j: JSONObject?): ZTurn? {
+            if (j == null || j.optLong("rowId", -1) < 0) return null
+            val changes = j.optJSONObject("fileChanges")
+            // org.json may surface counters as Integer or Long; accept any JSON number.
+            fun counter(key: String) = (changes?.opt(key) as? Number)?.toInt() ?: -1
+            return ZTurn(j.optLong("rowId"), j.string("entityId"), j.string("state"), j.optLong("activeMs"),
+                counter("additions"), counter("deletions"), counter("files"), changes?.string("state") == "reverted")
+        }
+    }
+}
+
+/** Badge-facing summary for the shared ChatTimeline; engine-agnostic by design. */
+fun ZTurn?.summary(): TurnDiffSummary? = this?.let { turn ->
+    if (!turn.hasChanges && turn.entityId.isBlank()) null
+    else TurnDiffSummary(turn.additions.coerceAtLeast(0), turn.deletions.coerceAtLeast(0),
+        turn.files.coerceAtLeast(0), turn.reverted, turn.state == "running", turn.activeMs,
+        turn.entityId.isNotBlank())
+}
+
+/** session/diff detail sheet text: totals, per-file counters and bounded patch hunks. */
+fun formatFileChanges(j: JSONObject): String {
+    val lines = mutableListOf<String>()
+    val files = j.optJSONArray("items").objects()
+    val additions = (j.opt("additions") as? Number)?.toInt() ?: -1
+    val deletions = (j.opt("deletions") as? Number)?.toInt() ?: -1
+    val total = (j.opt("files") as? Number)?.toInt() ?: files.size
+    val head = buildString {
+        append("$total 个文件")
+        if (additions >= 0) append(" · +$additions")
+        if (deletions >= 0) append(" · −$deletions")
+        if (j.string("state") == "reverted") append(" · 已撤销")
+    }
+    lines.add(head)
+    files.forEach { file ->
+        lines.add("")
+        var counters = listOfNotNull(
+            (file.opt("additions") as? Number)?.let { "+${it.toInt()}" },
+            (file.opt("deletions") as? Number)?.let { "−${it.toInt()}" },
+            (file.opt("writeCount") as? Number)?.takeIf { it.toInt() > 0 }?.let { "改写 ${it.toInt()} 次" })
+            .joinToString(" · ")
+        val tools = file.optJSONArray("toolNames")?.strings()?.filter { it.isNotBlank() }.orEmpty()
+        if (tools.isNotEmpty()) counters = listOf(counters, tools.joinToString("/")).filter { it.isNotBlank() }.joinToString(" · ")
+        lines.add("${file.string("path")}${if (counters.isBlank()) "" else "\n$counters"}")
+        file.optJSONArray("patches").objects().forEach { hunk ->
+            val oldStart = (hunk.opt("oldStart") as? Number)?.toLong()
+            val newStart = (hunk.opt("newStart") as? Number)?.toLong()
+            lines.add("@@ -${oldStart ?: "?"} +${newStart ?: "?"} @@")
+            hunk.optJSONArray("lines").strings().forEach { lines.add(it) }
+        }
+    }
+    return lines.joinToString("\n").take(200_000)
 }
 // Start Plan uses raw token balances; Coding Plan uses rolling windows and percent used.
 private fun JSONObject.quotaNumber(key: String): Double? = (opt(key) as? Number)?.toDouble()

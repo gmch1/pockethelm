@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from bridge import (Assembler, Bridge, RequestError, guard_for, project_rows, project_quota,
-    project_interactions, interaction_answer)
+    project_interactions, interaction_answer, project_turn, project_file_changes)
 from wire import Client, WireError, decode, encode
 from install import dispatcher
 
@@ -422,6 +422,146 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(RequestError):
                 bridge.dispatch('session/read', {'checkInteractionIds': check})
         bridge.snapshot.assert_not_called()
+
+    # ---- P1: row identity, turn summary, file-change detail, queue commands ----
+
+    def test_row_projection_carries_entity_id_and_skips_malformed(self):
+        rows = [
+            {'rowId': 1, 'kind': 'userInput', 'text': 'hi', 'entityId': 'turn-1'},
+            {'rowId': 2, 'kind': 'assistantText', 'text': 'ok', 'entityId': ''},
+            {'rowId': 3, 'kind': 'reasoning', 'text': 'hmm', 'entityId': 7},
+            {'rowId': 4, 'kind': 'toolCall', 'entityId': 'x' * 1025},
+        ]
+        items = project_rows(rows)
+        self.assertEqual(items[0]['entityId'], 'turn-1')
+        self.assertNotIn('entityId', items[1])
+        self.assertNotIn('entityId', items[2])
+        self.assertNotIn('entityId', items[3])
+
+    def test_turn_summary_uses_latest_turn_header_and_drops_garbage(self):
+        none = project_turn([{'rowId': 5, 'kind': 'userInput', 'text': 'x'}])
+        self.assertIsNone(none)
+        self.assertIsNone(project_turn([]))
+        rows = [
+            {'rowId': 3, 'kind': 'turnHeader', 'state': 'completedSuccess',
+                'entityId': 'turn-old', 'fileChanges': {'additions': 1, 'deletions': 1, 'files': 1}},
+            {'rowId': 7, 'kind': 'turnHeader', 'state': 'running', 'entityId': 'turn-new',
+                'activeMs': 112000, 'fileChanges': {'additions': 318, 'deletions': 0, 'files': 2,
+                    'state': 'active'}},
+        ]
+        turn = project_turn(rows)
+        self.assertEqual(turn, {'rowId': 7, 'entityId': 'turn-new', 'state': 'running',
+            'activeMs': 112000, 'fileChanges': {'additions': 318, 'deletions': 0, 'files': 2, 'state': 'active'}})
+        # Non-numeric counters and unknown enum states degrade to absence, never guesses.
+        degraded = project_turn([{'rowId': 7, 'kind': 'turnHeader', 'state': 'weird',
+            'entityId': 'turn-new', 'activeMs': -5, 'fileChanges': {'additions': 'many'}}])
+        self.assertEqual(degraded, {'rowId': 7, 'entityId': 'turn-new', 'state': ''})
+
+    def test_session_read_includes_latest_turn_summary(self):
+        snapshot = make_snapshot([])
+        snapshot['rows'] = {'window': [
+            {'rowId': 3, 'kind': 'turnHeader', 'state': 'failed', 'entityId': 'turn-9',
+                'activeMs': 4000, 'fileChanges': {'additions': 12, 'deletions': 4, 'files': 1}}],
+            'totalCount': 1, 'firstRowId': 3}
+        bridge = Bridge(Mock()); bridge.client_id = 'pockethelm-test'
+        bridge.snapshot = Mock(return_value=snapshot)
+        result = bridge.dispatch('session/read', {})
+        self.assertEqual(result['turn'], {'rowId': 3, 'entityId': 'turn-9', 'state': 'failed',
+            'activeMs': 4000, 'fileChanges': {'additions': 12, 'deletions': 4, 'files': 1}})
+        bridge.snapshot = Mock(return_value=make_snapshot([]))  # window without turn headers
+        self.assertNotIn('turn', bridge.dispatch('session/read', {}))
+
+    def test_queue_commands_build_cas_envelope_from_user_snapshot_revision(self):
+        client = Mock(); client.call.return_value = {'commandId': 'c', 'status': 'accepted', 'revisionAtDecision': 9}
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: {'workspacePath': '/w', 'sessionId': 's'})
+        cases = [('session/queue/remove', 'deleteQueueItem', {'queueItemId': 'q1'}, {'queueItemId': 'q1'}),
+                 ('session/queue/promote', 'sendQueuedNow', {'queueItemId': 'q1'}, {'queueItemId': 'q1'}),
+                 ('session/queue/edit', 'editQueueItem', {'queueItemId': 'q1', 'text': '改写'},
+                  {'queueItemId': 'q1', 'newText': '改写'})]
+        for method, kind, params, payload in cases:
+            with self.subTest(method=method):
+                client.call.reset_mock()
+                result = bridge.dispatch(method, dict(params, workspacePath='/w', sessionId='s',
+                    commandId='cmd-0123456789abcdef', baseRevision=7))
+                self.assertEqual(result['status'], 'accepted')
+                envelope = client.call.call_args.args[2][0]['envelope']
+                self.assertEqual(envelope['type'], kind)
+                self.assertEqual(envelope['payload'], payload)
+                self.assertEqual(envelope['baseRevision'], 7)
+                self.assertEqual(envelope['sessionId'], 's')
+        for bad_revision in (None, -1, '7', 1.5, True):
+            with self.subTest(bad_revision=bad_revision):
+                client.call.reset_mock()
+                with self.assertRaises(RequestError):
+                    bridge.dispatch('session/queue/remove', {'workspacePath': '/w', 'sessionId': 's',
+                        'queueItemId': 'q1', 'commandId': 'cmd-0123456789abcdef', 'baseRevision': bad_revision})
+                client.call.assert_not_called()
+
+    def test_session_diff_sends_row_target_and_version(self):
+        client = Mock()
+        client.call.return_value = {'files': 2, 'additions': 5, 'deletions': 2, 'state': 'active',
+            'items': [{'path': '/w/a.kt', 'additions': 5, 'deletions': 2, 'writeCount': 3,
+                'toolNames': ['Edit', 'Bash'], 'patches': [{'oldStart': 1, 'oldLines': 1,
+                    'newStart': 1, 'newLines': 2, 'lines': ['- old', '+ new', '+ extra']}]}]}
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: {'workspacePath': '/w', 'workspaceIdentity': 'host-a', 'sessionId': 's'})
+        result = bridge.dispatch('session/diff', {'workspacePath': '/w', 'workspaceIdentity': 'host-a',
+            'sessionId': 's', 'rowId': 7, 'entityId': 'turn-7', 'baseRevision': 9, 'baseLogEpoch': 'e1'})
+        args = client.call.call_args.args
+        self.assertEqual(args[:2], ('zcode-agent', 'conversationFileChangesV4'))
+        request = args[2][0]
+        self.assertEqual(request['sessionId'], 's')
+        self.assertEqual(request['target'], {'rowId': 7, 'entityId': 'turn-7'})
+        self.assertEqual(request['baseRevision'], 9)
+        self.assertEqual(request['baseLogEpoch'], 'e1')
+        self.assertEqual(request['workspacePath'], '/w')
+        self.assertEqual(result['items'][0]['toolNames'], ['Edit', 'Bash'])
+        self.assertEqual(result['items'][0]['patches'][0]['newLines'], 2)
+        self.assertEqual(result['items'][0]['writeCount'], 3)
+
+    def test_session_diff_rejects_bad_input_and_maps_wire_errors(self):
+        client = Mock()
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: {'workspacePath': '/w', 'sessionId': 's'})
+        base = {'workspacePath': '/w', 'sessionId': 's', 'rowId': 7, 'entityId': 'turn-7',
+            'baseRevision': 9, 'baseLogEpoch': 'e1'}
+        for key, value in (('rowId', 'x'), ('rowId', -1), ('entityId', ''), ('baseRevision', None), ('baseLogEpoch', '')):
+            with self.subTest(key=key, value=value):
+                client.call.reset_mock()
+                with self.assertRaises(RequestError):
+                    bridge.dispatch('session/diff', dict(base, **{key: value}))
+                client.call.assert_not_called()
+        from wire import WireError
+        client.call.side_effect = WireError('rejected')
+        with self.assertRaisesRegex(RequestError, '刷新'):
+            bridge.dispatch('session/diff', base)
+
+    def test_file_changes_projection_bounds_and_skips_malformed(self):
+        data = {'files': 1, 'additions': 3, 'deletions': 0, 'state': 'reverted', 'items': [
+            {'path': 'src/a.kt', 'additions': 3, 'toolNames': ['T%s' % i for i in range(12)],
+             'patches': [{'lines': ['x' * 2000] + ['+ ok']} | {'oldStart': 1}, {'lines': []},
+                         {'lines': [42]}, 'junk']},
+            {'path': 5}, 'junk']}
+        result = project_file_changes(data)
+        item = result['items'][0]
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(item['toolNames'], ['T%s' % i for i in range(8)])
+        self.assertEqual(len(item['patches']), 1)
+        self.assertEqual(item['patches'][0]['lines'], ['x' * 1000, '+ ok'])
+        self.assertEqual(result['state'], 'reverted')
+        self.assertEqual(result['deletions'], 0)
+        self.assertNotIn('deletions', item)
+        self.assertNotIn('writeCount', item)
+
+    def test_initialize_advertises_p1_capabilities_at_version_one(self):
+        client = Mock()
+        client.call = Mock(side_effect=[{'protocolVersion': 3, 'clientMode': 'web-remote-replayable'}, {}])
+        bridge = Bridge(client)
+        result = bridge.dispatch('initialize', {'clientId': 'pockethelm-zcode-abcdefgh1234'})
+        self.assertEqual(result['bridgeVersion'], 1)
+        for capability in ('interactions', 'queueOps', 'turnSummary', 'fileChanges', 'indexMeta'):
+            self.assertTrue(result['capabilities'][capability])
 
 
 if __name__ == '__main__':

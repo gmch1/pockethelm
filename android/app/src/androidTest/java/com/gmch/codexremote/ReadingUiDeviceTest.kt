@@ -184,7 +184,7 @@ class ReadingUiDeviceTest {
                 (1..30).map { TimelineItem("t$it", "mcpToolCall", "hidden command $it", "completed") } +
                 TimelineItem("a", "agentMessage", (1..40).joinToString("\n") { "这是第 $it 行回答内容" })
             scenario.onActivity { activity -> activity.setContent {
-                PocketHelmTheme { ZcodeTimeline(ZcodeState(items = history), Modifier.fillMaxSize().safeDrawingPadding(), {}, {}) { _, _ -> } }
+                PocketHelmTheme { ZcodeTimeline(ZcodeState(items = history), androidx.lifecycle.ViewModelProvider(activity)[ZcodeViewModel::class.java], Modifier.fillMaxSize().safeDrawingPadding(), {}, {}) { _, _ -> } }
             } }
             await { matching("定位用户问题").size == 1 && matching("工作过程").isEmpty() }
             click("定位用户问题")

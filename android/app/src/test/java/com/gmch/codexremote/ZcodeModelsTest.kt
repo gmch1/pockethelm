@@ -180,4 +180,58 @@ class ZcodeModelsTest {
         assertEquals(interactionCountdown(now + 120_000, now), interactionCountdown((now + 120_000) / 1000, now))
         assertEquals("自动结束时间已到，等待服务器确认", interactionCountdown(now - 1, now))
     }
+    // ---- P1 (2026-11-02 zcode-p1-parity): row identity, turn summary, diff detail ----
+
+    @Test fun zcodeItemsCarryEntityIdWhenPresent() {
+        val items = zcodeItems(JSONObject("""{"items":[
+            {"id":"1","kind":"userInput","text":"hi","commandId":"c1","entityId":"turn-1"},
+            {"id":"2","kind":"assistantText","text":"ok","status":"complete"}]}"""))
+        assertEquals("turn-1", items[0].entityId)
+        assertEquals("", items[1].entityId)
+    }
+
+    @Test fun turnParseKeepsAuthoritativeFieldsAndDegradesTolerantly() {
+        val full = ZTurn.parse(JSONObject("""{"rowId":7,"entityId":"turn-7","state":"running",
+            "activeMs":112000,"fileChanges":{"additions":318,"deletions":0,"files":2,"state":"active"}}"""))
+        assertEquals(ZTurn(7, "turn-7", "running", 112000, 318, 0, 2, false), full)
+        assertNull(ZTurn.parse(null))
+        assertNull(ZTurn.parse(JSONObject("""{"entityId":"x"}""")))
+        // Missing fileChanges keeps identity + state with absent counters.
+        val bare = ZTurn.parse(JSONObject("""{"rowId":7,"entityId":"turn-7","state":"failed"}"""))
+        assertEquals(ZTurn(7, "turn-7", "failed", 0, -1, -1, -1, false), bare)
+        assertFalse(bare!!.hasChanges)
+        val reverted = ZTurn.parse(JSONObject("""{"rowId":7,"entityId":"e","state":"completedSuccess",
+            "fileChanges":{"additions":5,"deletions":5,"files":1,"state":"reverted"}}"""))
+        assertTrue(reverted!!.reverted)
+    }
+
+    @Test fun turnSummaryFeedsTheSharedBadgeOnlyWithContentOrDetailTarget() {
+        assertNull((null as ZTurn?).summary())
+        // No counters and no detail target: nothing to render.
+        assertNull(ZTurn(7, "", "running").summary())
+        // Counters alone justify the badge; entityId alone justifies a detail-only badge.
+        val withChanges = ZTurn(7, "turn-7", "completedSuccess", 4000, 318, 0, 2, reverted = true)
+        val summary = withChanges.summary()!!
+        assertEquals(318, summary.additions); assertEquals(0, summary.deletions)
+        assertEquals(2, summary.files); assertTrue(summary.reverted); assertFalse(summary.running)
+        assertTrue(summary.detailAvailable)
+        val detailOnly = ZTurn(8, "turn-8", "running", 9000).summary()!!
+        assertTrue(detailOnly.detailAvailable)
+        assertTrue(detailOnly.running)
+    }
+
+    @Test fun formatFileChangesRendersTotalsCountersAndHunks() {
+        val text = formatFileChanges(JSONObject("""{"files":2,"additions":7,"deletions":3,"state":"active","items":[
+            {"path":"src/a.kt","additions":7,"deletions":3,"writeCount":2,"toolNames":["Edit","Bash"],
+             "patches":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":2,"lines":["- old","+ new"]}]}]}"""))
+        assertTrue(text.contains("2 个文件"))
+        assertTrue(text.contains("+7"))
+        assertTrue(text.contains("−3"))
+        assertTrue(text.contains("src/a.kt"))
+        assertTrue(text.contains("改写 2 次"))
+        assertTrue(text.contains("Edit/Bash"))
+        assertTrue(text.contains("@@ -1 +1 @@"))
+        assertTrue(text.contains("+ new"))
+        assertFalse(text.contains("已撤销"))
+    }
 }

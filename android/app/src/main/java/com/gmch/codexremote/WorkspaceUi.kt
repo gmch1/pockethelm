@@ -51,12 +51,17 @@ import kotlinx.coroutines.flow.first
 
 /** Both engines adapt data and actions into these components; layout never depends on engine. */
 internal data class WorkspaceSession(val id: String, val title: String, val path: String, val project: String,
-    val status: String, val updatedAt: Long, val group: String = path)
+    val status: String, val updatedAt: Long, val group: String = path,
+    val preview: String = "", val pendingInteractions: Int = 0,
+    val unread: Boolean = false, val backgroundWork: Boolean = false)
 internal fun SessionInfo.workspace(cached: Boolean = false) = WorkspaceSession(id, title, cwd, project,
     if (cached) "" else status, updatedAt * 1000)
-internal fun ZSession.workspace(projects: List<ZProject>, fresh: Boolean = true, live: List<ZLiveSessionStatus> = emptyList()) = WorkspaceSession(id, title, path,
+internal fun ZSession.workspace(projects: List<ZProject>, fresh: Boolean = true, live: List<ZLiveSessionStatus> = emptyList(),
+    meta: Map<String, ZListMeta> = emptyMap()) = WorkspaceSession(id, title, path,
     projects.find { it.id == project }?.name ?: path.trimEnd('/').substringAfterLast('/'),
-    zcodeListStatus(this, fresh, live), updatedAt, "$project:$identity:$path")
+    zcodeListStatus(this, fresh, live), updatedAt, "$project:$identity:$path",
+    meta[id]?.preview.orEmpty(), meta[id]?.pending ?: 0,
+    meta[id]?.unread ?: false, meta[id]?.backgroundWork ?: false)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -245,7 +250,9 @@ internal fun WorkspaceListPage(engine: String, onEngine: (String) -> Unit,
                     }
                 }
                 items(filtered, key = { it.id }) { row ->
-                    SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen) { open(row.id) }
+                    SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
+                        preview = row.preview, pending = row.pendingInteractions,
+                        unread = row.unread, background = row.backgroundWork) { open(row.id) }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
                 }
                 if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
@@ -436,10 +443,13 @@ internal fun ChatSettingsBar(summary: String, quota: String, settings: () -> Uni
 internal fun ChatTimeline(sessionId: String, agent: String, items: List<TimelineItem>, outgoing: List<OutgoingMessage>, queue: List<QueuedMessage>,
     hasMore: Boolean, loading: Boolean, error: String?, connected: Boolean, busy: Boolean,
     modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit,
-    diff: String = "", removeQueued: ((QueuedMessage) -> Unit)? = null) {
+    diff: String = "", removeQueued: ((QueuedMessage) -> Unit)? = null,
+    turnSummary: TurnDiffSummary? = null, onTurnDiff: (() -> Unit)? = null,
+    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null) {
     val list = rememberLazyListState()
     var follow by rememberSaveable { mutableStateOf(true) }
     var jump by remember { mutableStateOf<String?>(null) }
+    var editingQueue by remember { mutableStateOf<QueuedMessage?>(null) }
     val rows = remember(items, outgoing, queue) { readingRows(buildChatRows(items, outgoing, queue)) }
     val questions = remember(rows) { rows.filter { it.isUserRow } }
     val ime = WindowInsets.ime.getBottom(LocalDensity.current)
@@ -452,7 +462,8 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
             }
         }
     } }
-    val tail = (if (hasMore) 1 else 0) + maxOf(1, rows.size) + (if (diff.isNotBlank()) 1 else 0)
+    val tail = (if (hasMore) 1 else 0) + maxOf(1, rows.size) +
+        (if (diff.isNotBlank() || turnSummary != null) 1 else 0)
     LaunchedEffect(follow, tail, rows.lastOrNull(), ime) { if (follow && rows.isNotEmpty()) list.scrollToItem(tail) }
     LaunchedEffect(jump, rows, hasMore) {
         val index = rows.indexOfFirst { it.id == jump }
@@ -482,12 +493,62 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
                 row.outgoing != null -> OutgoingCard(row.outgoing, detail)
                 row.queued != null -> Column {
                     OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队"), detail)
-                    if (removeQueued != null) TextButton({ removeQueued(row.queued) }, enabled = connected && !busy) { Text("移出队列") }
+                    QueuedItemActions(row.queued, connected && !busy, removeQueued, promoteQueued,
+                        onEdit = if (editQueued != null) { { editingQueue = it } } else null)
                 }
             } }
-            if (diff.isNotBlank()) item { OutlinedButton({ detail("当前执行差异", diff) }, Modifier.fillMaxWidth()) { Text("查看本轮修改") } }
+            if (turnSummary != null) item(key = "turn-diff") {
+                TurnDiffBadge(turnSummary, enabled = connected && !busy, onClick = onTurnDiff)
+            } else if (diff.isNotBlank()) item { OutlinedButton({ detail("当前执行差异", diff) }, Modifier.fillMaxWidth()) { Text("查看本轮修改") } }
             item(key = "tail") { Spacer(Modifier.height(1.dp)) }
         }
         if (!follow) TextButton({ jump = null; follow = true }, Modifier.align(Alignment.CenterHorizontally)) { Text("回到最新") }
+    }
+    editingQueue?.let { queued ->
+        var value by remember(queued.id) { mutableStateOf(queued.text) }
+        AlertDialog(onDismissRequest = { editingQueue = null }, title = { Text("编辑排队消息") },
+            text = { OutlinedTextField(value, { value = it }, Modifier.fillMaxWidth(), maxLines = 5, label = { Text("排队内容") }) },
+            confirmButton = { TextButton({ editQueued?.invoke(queued, value); editingQueue = null },
+                enabled = value.isNotBlank() && editQueued != null) { Text("保存") } },
+            dismissButton = { TextButton({ editingQueue = null }) { Text("取消") } })
+    }
+}
+
+/** Compact inline actions under a queued row; absent actions (older bridges) hide entirely. */
+@Composable
+private fun QueuedItemActions(queued: QueuedMessage, enabled: Boolean,
+    remove: ((QueuedMessage) -> Unit)?, promote: ((QueuedMessage) -> Unit)?,
+    onEdit: ((QueuedMessage) -> Unit)?) {
+    if (remove == null && promote == null && onEdit == null) return
+    Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        if (remove != null) TextButton({ remove(queued) }, enabled = enabled,
+            contentPadding = PaddingValues(horizontal = 8.dp)) { Text("移出队列", fontSize = 11.sp) }
+        if (promote != null) TextButton({ promote(queued) }, enabled = enabled,
+            contentPadding = PaddingValues(horizontal = 8.dp)) { Text("立即发送", fontSize = 11.sp) }
+        if (onEdit != null) TextButton({ onEdit(queued) }, enabled = enabled,
+            contentPadding = PaddingValues(horizontal = 8.dp)) { Text("编辑", fontSize = 11.sp) }
+    }
+}
+
+/**
+ * Authoritative turn-change badge: CLI-aggregated counters with the official client's
+ * shape (+N −M · files · reverted), plus the turn's active work time while running.
+ * Tap loads the per-file detail; disabled only means "not clickable right now".
+ */
+@Composable
+private fun TurnDiffBadge(summary: TurnDiffSummary, enabled: Boolean, onClick: (() -> Unit)?) {
+    val duration = turnDurationLabel(summary.activeMs)
+    Surface(onClick = { onClick?.invoke() }, enabled = enabled && onClick != null,
+        shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.padding(top = 2.dp)) {
+        Row(Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(turnDiffBadgeLabel(summary), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface,
+                style = androidx.compose.ui.text.TextStyle(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium))
+            if (summary.running && duration.isNotBlank())
+                Text(duration, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+            if (onClick != null) Icon(Icons.Outlined.ChevronRight, "查看更改明细", Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }

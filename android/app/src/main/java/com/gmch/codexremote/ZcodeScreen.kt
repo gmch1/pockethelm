@@ -67,6 +67,11 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
         })
         if (state.interactionsComplete && live.isEmpty()) interactionSheet = false
     }
+    // The turn-diff badge fires an RPC; its formatted result lands here and opens the
+    // shared detail sheet once, then clears so reopening re-queries.
+    LaunchedEffect(state.diffText) {
+        state.diffText?.let { detail = "本轮更改明细" to it; vm.clearTurnDiff() }
+    }
     val chat = state.selected != null && tab == 0
     BackHandler(chat) { vm.back() }
     when {
@@ -101,7 +106,7 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
                         color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp))
                     if (state.interactionNotice.isNotBlank()) Text(state.interactionNotice, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 16.dp))
                     if (state.notice.isNotBlank()) Text(state.notice, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 16.dp))
-                    ZcodeTimeline(state, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
+                    ZcodeTimeline(state, vm, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
                     ChatSettingsBar(zcodeSettingsSummary(state), state.quotaSummary,
                         { showSettings = true }, { showSettings = true; vm.quota() })
                     ChatComposer(state.draft, vm::draft, state.sending,
@@ -121,7 +126,7 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
             }
         }
         else -> pages.SaveableStateProvider("tab:0") { WorkspaceListPage(engine = "zcode", onEngine = { codex.engine(it) },
-            sessions = state.sessions.map { it.workspace(state.projects, state.connected && state.sessionsFresh, state.liveStatuses) },
+            sessions = state.sessions.map { it.workspace(state.projects, state.connected && state.sessionsFresh, state.liveStatuses, state.listMeta) },
             connected = state.connected, busy = state.busy,
             canCreate = state.connected && !state.busy && !state.pending, canOpen = state.connected && !state.busy,
             open = { id -> tab = 0; state.sessions.find { it.id == id }?.let(vm::open) }, create = { newSession = true },
@@ -400,8 +405,14 @@ private fun ZChoice(label: String, enabled: Boolean, options: List<Pair<String, 
 }
 
 @Composable
-internal fun ZcodeTimeline(state: ZcodeState, modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit) {
+internal fun ZcodeTimeline(state: ZcodeState, vm: ZcodeViewModel, modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit) {
     ChatTimeline(state.selected?.id.orEmpty(), "ZCode", state.items, state.outgoing, state.queue,
         state.beforeRow != null, state.historyLoading, state.historyError, state.connected, state.busy,
-        modifier, history, retry, detail)
+        modifier, history, retry, detail,
+        turnSummary = state.turn.summary(),
+        onTurnDiff = if (state.diffEnabled && !state.turn?.entityId.orEmpty().isNullOrBlank() && state.logEpoch.isNotBlank())
+            ({ vm.loadTurnDiff() }) else null,
+        removeQueued = if (state.queueOpsEnabled) ({ vm.removeQueued(it) }) else null,
+        promoteQueued = if (state.queueOpsEnabled) ({ vm.promoteQueued(it) }) else null,
+        editQueued = if (state.queueOpsEnabled) ({ queued, text -> vm.editQueued(queued, text) }) else null)
 }

@@ -34,7 +34,25 @@ class IndexProjection:
         if not isinstance(identity, str) or not 0 < len(identity) <= 1024:
             raise ValueError('Invalid session identity')
         # Preview/tool inputs/account metadata deliberately stay on the host.
-        return {'sessionId': identity, 'phase': value['phase']}
+        result = {'sessionId': identity, 'phase': value['phase']}
+        # Display-only metadata (P1): additive and tolerant — a malformed optional field is
+        # skipped, never fatal for the index stream. Identity fields above stay strict.
+        summary = value.get('pendingInteractionSummary')
+        if isinstance(summary, dict):
+            permissions, inputs = summary.get('permissionCount'), summary.get('userInputCount')
+            if type(permissions) is int and 0 <= permissions <= 64 and type(inputs) is int and 0 <= inputs <= 64:
+                result['pendingInteractionSummary'] = {'permissionCount': permissions, 'userInputCount': inputs}
+        activity = value.get('lastActivityAt')
+        if type(activity) is int and 0 < activity <= 4102444800000:
+            result['lastActivityAt'] = activity
+        preview = value.get('lastAssistantPreview')
+        if isinstance(preview, str) and preview:
+            result['lastAssistantPreview'] = preview[:512]
+        if value.get('hasBackgroundWork') is True:
+            result['hasBackgroundWork'] = True
+        if value.get('lastOutcome') in ('completed', 'error', 'interrupted'):
+            result['lastOutcome'] = value['lastOutcome']
+        return result
 
     def accept(self, wire):
         if self.invalid:
