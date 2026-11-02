@@ -1,6 +1,6 @@
 # 会话列表下拉刷新
 
-状态：review 通过，准备发布 0.4.17 / 27
+状态：已发布 0.4.17 / 27（2026-11-03）
 
 ## 需求与验收
 
@@ -31,3 +31,4 @@
 - 版本递增 0.4.17 / 27，保留包名及发行签名；对实际新 APK 重跑手势与相关真机回归，完成后发布同一产物。
 - 实际发布包构建、lint 通过；JVM 102 项中 101 通过、1 项可选 SSH 跳过、0 失败。129 真机 14 项全部通过（下拉手势、列表刷新、P1 队列与未读回归），权限弹窗 0，模型请求 0。测试包已清理，权限基线保留，已安装包 hash 匹配。
 - APK SHA-256 `108019f76a85b7433367927ce9c76968995edfe861402e5c6968b598e79002b0`；源码指纹 `a4a40c68886ed6557947e7165de4b7b649d9e467592a683ff4671d02e8122260`（上述同一算法），基线 5b80417 加本轮改动。发行签名不变，debuggable=false。证据位于 `~/.local/state/pockethelm/release-0.4.17/`。
+- 发布源码 `0fc107b`，提交后源码指纹与已测包对应源码一致。原商店返回 published；公开 HTTPS 索引 0.4.17 / 27、原发行签名与完整下载 APK 哈希均匹配已测包。公开文件 `com.gmch.codexremote_27.apk`，证据含 upload.json、store-verified.json、store-check.log、index-v1.jar、download.apk。已推送 feat-list-pull-refresh，未合并 main。
