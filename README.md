@@ -1,6 +1,6 @@
 # PocketHelm · 掌舵
 
-原生 Android 客户端，通过 SSH 管理开发机上的 Codex 会话和任务。Kotlin / Jetpack Compose，Android 8.0+。当前版本 0.4.15，协议按 Codex CLI 0.165.0 验证。
+原生 Android 客户端，通过 SSH 管理开发机上的 Codex 会话和任务。Kotlin / Jetpack Compose，Android 8.0+。当前版本 0.4.16，协议按 Codex CLI 0.165.0 验证。
 
 源码仓库：[gmch1/pockethelm](https://github.com/gmch1/pockethelm) · [CI](https://github.com/gmch1/pockethelm/actions/workflows/ci.yml)
 

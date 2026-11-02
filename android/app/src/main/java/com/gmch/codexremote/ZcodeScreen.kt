@@ -406,6 +406,7 @@ private fun ZChoice(label: String, enabled: Boolean, options: List<Pair<String, 
 
 @Composable
 internal fun ZcodeTimeline(state: ZcodeState, vm: ZcodeViewModel, modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit) {
+    val queueContext = vm.queueContext(state)
     ChatTimeline(state.selected?.id.orEmpty(), "ZCode", state.items, state.outgoing, state.queue,
         state.beforeRow != null, state.historyLoading, state.historyError, state.connected, state.busy,
         modifier, history, retry, detail,
@@ -414,5 +415,5 @@ internal fun ZcodeTimeline(state: ZcodeState, vm: ZcodeViewModel, modifier: Modi
             ({ vm.loadTurnDiff() }) else null,
         removeQueued = if (state.queueOpsEnabled) ({ vm.removeQueued(it) }) else null,
         promoteQueued = if (state.queueOpsEnabled) ({ vm.promoteQueued(it) }) else null,
-        editQueued = if (state.queueOpsEnabled) ({ queued, text -> vm.editQueued(queued, text) }) else null)
+        editQueued = if (state.queueOpsEnabled) ({ queued, text -> vm.editQueued(queued, text, queueContext) }) else null)
 }

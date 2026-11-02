@@ -86,10 +86,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private var historySyncedAt = 0L
     private var resumeJob: Job? = null
     private var navigationVersion = 0
-    // P1 unread tracking: in-memory seen timestamps (wall clock at read), persisted to the
+    // Server activity watermarks acknowledged only by successful reads, persisted to the
     // vault only on navigation/connection boundaries — never on the 2.5s poll.
     private val seenActivity = LinkedHashMap<String, Long>()
-    private fun seenKey() = key("seen")
+    private fun seenKey() = key("seen-server-v1")
     private fun persistSeen() {
         val bounded = seenActivity.entries.toList().takeLast(500)
         seenActivity.clear(); bounded.forEach { seenActivity[it.key] = it.value }
@@ -510,9 +510,6 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     private fun select(session: ZSession) {
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
-        // The outgoing session has been read to its latest state; stamp and persist now so
-        // its unread dot dies with navigation, not with the next connect cycle.
-        mutable.value.selected?.let { seenActivity[it.id] = System.currentTimeMillis() }
         persistSeen()
         older = emptyList()
         val outKey = outgoingKey(session.id)
@@ -541,7 +538,6 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         navigationVersion++
         if (mutable.value.selected == null) return
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
-        mutable.value.selected?.let { seenActivity[it.id] = System.currentTimeMillis() }
         persistSeen()
         mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false,
             historyError = null, outgoing = emptyList(), sessionsFresh = it.connected && it.sessionsFresh,
@@ -577,6 +573,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val sequence = ++snapshotSequence
         snapshotRequests[target] = sequence
         val connection = client()
+        // Capture before requesting content: a later index event must not mark unseen
+        // content as read. Missing index data conservatively leaves the watermark alone.
+        val activityBeforeRead = mutable.value.liveStatuses.firstOrNull {
+            it.id == session.id && it.path == session.path && it.identity == session.identity
+        }?.lastActivityAt?.takeIf { it > 0 }
         val eligibleReceipts = interactRecords.values.filter { belongs(it, session) &&
             it.commandId !in interactionFlights && it.phase != "submitting" }.map { it.commandId }.toSet()
         val request = session.target()
@@ -620,9 +621,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val queue = queueEntries(data)
         val first = if (data.isNull("firstRowId")) null else data.optDouble("firstRowId")
         val interactions = if (interactSupport) zcodeInteractions(data) else emptyList()
-        // Reading the authoritative snapshot IS the seen event for the open session. In
-        // memory only; persisted at the next navigation/connection boundary.
-        seenActivity[session.id] = System.currentTimeMillis()
+        activityBeforeRead?.let { seenActivity[session.id] = maxOf(seenActivity[session.id] ?: 0, it) }
         mutable.update { it.copy(selected = session.copy(title = data.string("title").ifBlank { session.title }),
             items = (older + items).distinctBy { row -> row.id }, phase = data.string("phase"), queue = queue,
             executionId = if (data.optBoolean("canStop")) data.string("executionId") else "",
@@ -749,21 +748,29 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     // (state.revision, updated only by authoritative reads). The bridge refuses to invent
     // one; a server stale surfaces as an error — we never auto-retry the command.
 
-    private fun queueWrite(method: String, queued: QueuedMessage, extra: JSONObject.() -> Unit = {}) = action {
+    data class QueueContext(val session: ZSession, val revision: Long, val logEpoch: String, val generation: Int)
+    fun queueContext(state: ZcodeState): QueueContext? = state.selected?.let {
+        QueueContext(it, state.revision, state.logEpoch, generation)
+    }
+    private fun queueWrite(method: String, queued: QueuedMessage,
+        context: QueueContext? = queueContext(mutable.value), extra: JSONObject.() -> Unit = {}) = action {
         val state = mutable.value
-        val session = state.selected ?: return@action
+        val captured = context ?: return@action
+        check(captured.generation == generation && sameTarget(state.selected, captured.session) &&
+            captured.logEpoch == state.logEpoch) { "会话已变化，请重新打开队列操作" }
+        val session = captured.session
         check(state.queueOpsEnabled) { "开发机桥接器暂不支持队列操作，请更新桥接器" }
         check(state.logEpoch.isNotBlank()) { "会话尚未加载完成，请稍候重试" }
         write(method, session.target().put("queueItemId", queued.id)
-            .put("baseRevision", state.revision).apply(extra))
+            .put("baseRevision", captured.revision).apply(extra))
         read(session)
     }
     fun removeQueued(queued: QueuedMessage) = queueWrite("session/queue/remove", queued)
     fun promoteQueued(queued: QueuedMessage) = queueWrite("session/queue/promote", queued)
-    fun editQueued(queued: QueuedMessage, text: String) {
+    fun editQueued(queued: QueuedMessage, text: String, context: QueueContext? = queueContext(mutable.value)) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) { mutable.update { it.copy(error = "排队内容不能为空") }; return }
-        queueWrite("session/queue/edit", queued) { put("text", trimmed) }
+        queueWrite("session/queue/edit", queued, context) { put("text", trimmed) }
     }
 
     /** Loads the per-file detail for the current turn via session/diff; result opens the

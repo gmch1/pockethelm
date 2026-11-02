@@ -178,6 +178,50 @@ class ZcodeP1ParityTest {
         assertEquals(6L, wireCalls.toList()[1].optLong("baseRevision"))
     }
 
+    @Test fun queueEditKeepsOpeningRevisionAfterRemoteUpdate() = runBlocking {
+        freshViewModel()
+        scriptRead(revision = 5)
+        selectReflection(session)
+        instrumentation.runOnMainSync { vm.retryLoad() }
+        assertTrue(await { it.revision == 5L })
+        val opening = vm.queueContext(state.value)
+        scriptRead(revision = 6)
+        instrumentation.runOnMainSync { vm.retryLoad() }
+        assertTrue(await { it.revision == 6L })
+        val calls = CopyOnWriteArrayList<JSONObject>()
+        bridge.scripted["session/queue/edit"] = { req ->
+            calls.add(req.getJSONObject("params"))
+            obj("status" to "stale", "reasonCode" to "revisionMismatch")
+        }
+        instrumentation.runOnMainSync { vm.editQueued(QueuedMessage("q1", "c1", "old"), "my edit", opening) }
+        assertTrue(await { it.error != null && !it.busy })
+        assertEquals(5L, calls.single().getLong("baseRevision"))
+        // A dialog from the previous session cannot dispatch against the new selection.
+        selectReflection(session.copy(id = "s2"))
+        instrumentation.runOnMainSync { vm.editQueued(QueuedMessage("q1", "c1", "old"), "my edit", opening) }
+        assertTrue(await { it.error?.contains("会话已变化") == true && !it.busy })
+        assertEquals(1, calls.size)
+    }
+
+    @Test fun unreadWatermarkUsesServerTimeAndFailedReadCannotAdvanceIt() = runBlocking {
+        freshViewModel()
+        selectReflection(session)
+        state.value = state.value.copy(liveStatuses = listOf(ZLiveSessionStatus(
+            "s1", session.path, "", "running", lastActivityAt = 1000L)))
+        scriptRead()
+        instrumentation.runOnMainSync { vm.retryLoad() }
+        assertTrue(await { !it.historyLoading && !it.busy })
+        assertEquals(1000L, seenMap()["s1"])
+        state.value = state.value.copy(liveStatuses = listOf(ZLiveSessionStatus(
+            "s1", session.path, "", "running", lastActivityAt = 2000L)))
+        bridge.scripted["session/read"] = { throw FakeRpcBridge.FakeRpcError(-32602, "read failed") }
+        instrumentation.runOnMainSync { vm.retryLoad() }
+        assertTrue(await { it.error != null && !it.busy })
+        instrumentation.runOnMainSync { vm.back() }
+        assertEquals(1000L, seenMap()["s1"])
+        assertTrue(buildListMeta(listOf(session), state.value.liveStatuses, seenMap(), null)["s1"]!!.unread)
+    }
+
     @Test fun oldBridgeCapabilitiesKeepQueueOpsOffAndExplainThemselves() = runBlocking {
         freshViewModel()
         state.value = state.value.copy(queueOpsEnabled = false)
@@ -190,6 +234,47 @@ class ZcodeP1ParityTest {
         assertTrue(await { it.error?.contains("桥接器") == true })
         // The capability gate rejects before anything reaches the wire.
         assertTrue(bridge.clientWrites.isEmpty())
+    }
+
+    @Test fun queueEditorRetainsOpeningCallbackAcrossUiRefresh() {
+        val revision = androidx.compose.runtime.mutableStateOf(5L)
+        var submitted: Long? = null
+        androidx.test.core.app.ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity -> activity.setContent {
+                val renderedRevision = revision.value
+                PocketHelmTheme {
+                    ChatTimeline("s1", "ZCode", emptyList(), emptyList(),
+                        listOf(QueuedMessage("q1", "c1", "original")), false, false, null, true, false,
+                        androidx.compose.ui.Modifier.fillMaxSize(), {}, {}, { _, _ -> },
+                        editQueued = { _, _ -> submitted = renderedRevision })
+                }
+            } }
+            fun click(text: String) {
+                fun find(n: android.view.accessibility.AccessibilityNodeInfo?): android.view.accessibility.AccessibilityNodeInfo? {
+                    if (n == null) return null
+                    if (n.text?.toString() == text && n.isVisibleToUser) return n
+                    for (i in 0 until n.childCount) find(n.getChild(i))?.let { return it }
+                    return null
+                }
+                val deadline = System.currentTimeMillis() + 10000
+                while (System.currentTimeMillis() < deadline) {
+                    var node = find(instrumentation.uiAutomation.rootInActiveWindow)
+                    if (node != null) {
+                        while (!node!!.isClickable && node.parent != null) node = node.parent
+                        if (node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)) return
+                    }
+                    Thread.sleep(50)
+                }
+                fail("Missing button: $text")
+            }
+            click("编辑")
+            instrumentation.waitForIdleSync()
+            instrumentation.runOnMainSync { revision.value = 6L }
+            instrumentation.waitForIdleSync()
+            click("保存")
+            instrumentation.waitForIdleSync()
+            assertEquals(5L, submitted)
+        }
     }
 
     @Test fun badgeAndQueueActionsRenderOnDevice() {

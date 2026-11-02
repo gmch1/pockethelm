@@ -449,7 +449,8 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
     val list = rememberLazyListState()
     var follow by rememberSaveable { mutableStateOf(true) }
     var jump by remember { mutableStateOf<String?>(null) }
-    var editingQueue by remember { mutableStateOf<QueuedMessage?>(null) }
+    var editingQueue by remember(sessionId) { mutableStateOf<QueuedMessage?>(null) }
+    var saveQueueEdit by remember(sessionId) { mutableStateOf<((QueuedMessage, String) -> Unit)?>(null) }
     val rows = remember(items, outgoing, queue) { readingRows(buildChatRows(items, outgoing, queue)) }
     val questions = remember(rows) { rows.filter { it.isUserRow } }
     val ime = WindowInsets.ime.getBottom(LocalDensity.current)
@@ -494,7 +495,7 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
                 row.queued != null -> Column {
                     OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队"), detail)
                     QueuedItemActions(row.queued, connected && !busy, removeQueued, promoteQueued,
-                        onEdit = if (editQueued != null) { { editingQueue = it } } else null)
+                        onEdit = if (editQueued != null) { { saveQueueEdit = editQueued; editingQueue = it } } else null)
                 }
             } }
             if (turnSummary != null) item(key = "turn-diff") {
@@ -508,7 +509,7 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
         var value by remember(queued.id) { mutableStateOf(queued.text) }
         AlertDialog(onDismissRequest = { editingQueue = null }, title = { Text("编辑排队消息") },
             text = { OutlinedTextField(value, { value = it }, Modifier.fillMaxWidth(), maxLines = 5, label = { Text("排队内容") }) },
-            confirmButton = { TextButton({ editQueued?.invoke(queued, value); editingQueue = null },
+            confirmButton = { TextButton({ saveQueueEdit?.invoke(queued, value); editingQueue = null },
                 enabled = value.isNotBlank() && editQueued != null) { Text("保存") } },
             dismissButton = { TextButton({ editingQueue = null }) { Text("取消") } })
     }
