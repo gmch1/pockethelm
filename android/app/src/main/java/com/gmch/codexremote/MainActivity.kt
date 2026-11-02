@@ -179,9 +179,9 @@ private fun approvalTitle(kind: String) = when (kind) {
     "writeStdin" -> "向运行中进程输入"; "fileChange" -> "文件改动审批"; else -> "命令审批"
 }
 
-private val decisionLabels = linkedMapOf("accept" to "允许", "acceptForSession" to "本会话允许", "decline" to "拒绝")
+private val decisionLabels = linkedMapOf("accept" to "允许", "acceptForSession" to "本会话允许", "decline" to "拒绝", "cancel" to "取消本次执行")
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun CodexApprovalSheet(
     approvals: List<PendingApproval>, items: List<TimelineItem>, enabled: Boolean,
@@ -205,7 +205,7 @@ private fun CodexApprovalSheet(
                             if (approval.hasObjectDecisions) "该审批包含当前客户端不支持的决策类型（如策略修改），请在原终端处理。"
                             else "该审批没有当前客户端可用的决策选项，请在原终端处理。",
                             fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
-                        else -> Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        else -> FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             approval.decisions.forEach { decision ->
                                 TextButton({ decide(approval, decision) }, enabled = enabled) {
                                     Text(decisionLabels[decision] ?: decision, color = if (decision == "decline") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)

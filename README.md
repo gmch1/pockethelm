@@ -4,7 +4,7 @@
 
 源码仓库：[gmch1/pockethelm](https://github.com/gmch1/pockethelm) · [CI](https://github.com/gmch1/pockethelm/actions/workflows/ci.yml)
 
-任务默认 YOLO，不提供任务审批、推送或手机后台服务。进入前台连接并刷新，退出前台断开手机连接；任务继续在开发机的共享 App Server 上执行。
+任务默认 YOLO，支持应答其他客户端触发的审批和 ZCode 提问；不提供推送或手机后台服务。进入前台连接并刷新，退出前台断开手机连接；任务继续在开发机的共享 App Server 上执行。
 
 ## 功能
 
@@ -167,7 +167,7 @@ ZCode 通过原 App 更新提供，保留包名 `com.gmch.codexremote`、签名�
 - 排队、请求插入、停止；显示服务端实际返回的 delivery。插入请求可能由 ZCode 暂时排队。停止携带所观察的 foreground execution ID，避免迟到请求停止后一轮。
 - 命令 ID 在发送前加密落盘；断连后查询原命令，结果未知时阻止自动重发。聊天草稿与 Codex 隔离保存。
 - **交互应答（AskUserQuestion / 提问类 userInput）**：紧凑待交互入口展开为答题表单（多题、多选、自定义回答，跳过/取消）；答案结构与官方客户端一致（`action + content`）。应答走独立于消息发送的确认通道：发送前先落盘 commandId 元数据（答案文本与敏感内容不落盘），`accepted/noop` 后仍等待权威快照确认才恢复按钮；断线结果未知只提示核对、绝不自动重发；`answerDrafts` 播种表单，自动结束倒计时在首次操作时请求 snooze（仅以服务端确认的 snoozed 为准）。旧桥接器（无 `capabilities.interactions`）自动回退为仅提示。
-- Codex 侧同样支持**命令执行/文件改动审批的查看与应答**：审批按线程展示（writeStdin 与命令执行区分、文件审批显示授权目录），决策按钮与服务端 `availableDecisions` 取交集，不支持的决策类型明确提示且不消费；应答原样回显请求 ID（区分数字与字符串），发送后进入「已发送，等待确认」，由 `serverRequest/resolved` 或回合结束撤卡；断线只清本地卡片，不向新连接重发。真实验证确认晚接入的客户端可以接手其他客户端留下的待审批请求。
+- Codex 侧同样支持**命令执行/文件改动审批的查看与应答**：审批按线程展示（writeStdin 与命令执行区分、文件审批显示授权目录），决策按钮与服务端 `availableDecisions` 取交集；服务端声明 `cancel` 时提供独立的「取消本次执行」，不转换成拒绝；不支持的决策类型明确提示且不消费；应答原样回显请求 ID（区分数字与字符串），发送后进入「已发送，等待确认」，由 `serverRequest/resolved` 或回合结束撤卡；断线只清本地卡片，不向新连接重发。真实验证确认晚接入的客户端可以接手其他客户端留下的待审批请求。
 - 文字全文、工具一行折叠、顶部最近问题跳转、进入会话自动到底部。
 
 边界：

@@ -568,8 +568,8 @@ class Bridge:
             if check is not None:
                 # Validate before subscribing: malformed checks must not touch upstream.
                 require(isinstance(check, list) and len(check) <= INTERACTION_CHECK_IDS_MAX
-                    and len(set(check)) == len(check)
-                    and all(isinstance(item, str) and 0 < len(item) <= INTERACTION_ID_MAX for item in check),
+                    and all(isinstance(item, str) and 0 < len(item) <= INTERACTION_ID_MAX for item in check)
+                    and len(set(check)) == len(check),
                     '交互核对参数无效')
             snap = self.snapshot(params)
             config = snap['config']

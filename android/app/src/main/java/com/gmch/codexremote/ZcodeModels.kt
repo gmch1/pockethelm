@@ -182,7 +182,9 @@ data class ZFormDraft(val selectedValues: List<String> = emptyList(), val custom
 
 private fun formAnswers(question: ZQuestion, draft: ZFormDraft?): List<String> {
     val custom = draft?.customAnswer?.trim().orEmpty()
-    return (draft?.selectedValues ?: emptyList()) + (if (custom.isNotEmpty()) listOf(custom) else emptyList())
+    val selected = draft?.selectedValues.orEmpty()
+    if (!question.multiSelect) return if (custom.isNotEmpty()) listOf(custom) else selected.take(1)
+    return selected + (if (custom.isNotEmpty()) listOf(custom) else emptyList())
 }
 
 /**
@@ -217,3 +219,20 @@ fun buildInteractionContent(questions: List<ZQuestion>, drafts: Map<String, ZFor
 fun interactionFormAnswered(questions: List<ZQuestion>, drafts: Map<String, ZFormDraft>): Boolean =
     questions.any { formAnswers(it, drafts[it.question]).isNotEmpty() }
 
+
+/** Upstream drafts use answer_N (or numeric index), not the displayed question text. */
+fun initialInteractionDrafts(interaction: ZInteraction): Map<String, ZFormDraft> =
+    interaction.questions.mapIndexed { index, question ->
+        val values = interaction.answerDrafts["answer_$index"] ?: interaction.answerDrafts[index.toString()].orEmpty()
+        val options = question.options.map { it.value }.toSet()
+        val custom = values.filter { it !in options }.joinToString(", ")
+        question.question to ZFormDraft(
+            if (!question.multiSelect && custom.isNotEmpty()) emptyList() else values.filter { it in options }, custom)
+    }.toMap()
+
+fun interactionCountdown(deadlineAt: Long, now: Long): String {
+    val millis = if (deadlineAt < 1_000_000_000_000L) deadlineAt * 1000L else deadlineAt
+    val remaining = millis - now
+    return if (remaining <= 0) "自动结束时间已到，等待服务器确认"
+    else "即将自动结束 · 剩余约 ${(remaining + 59_999) / 60_000} 分钟"
+}

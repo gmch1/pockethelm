@@ -94,7 +94,7 @@ data class PendingApproval(
      *  list when it advertised one. An advertised list with no renderable entries means
      *  this client cannot answer at all — not a license to show every button. */
     val decisions: List<String> get() =
-        if (!advertised) DECISIONS else DECISIONS.filter { it in stringDecisions }
+        if (!advertised) DECISIONS else (DECISIONS + "cancel").filter { it in stringDecisions }
 
     companion object {
         val DECISIONS = listOf("accept", "acceptForSession", "decline")

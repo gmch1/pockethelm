@@ -150,4 +150,10 @@ class ProtocolTest {
         assertTrue(unsupported.advertised)
         assertTrue(unsupported.decisions.isEmpty())
     }
+    @Test fun serverAdvertisedCancelIsNeverConvertedToDecline() {
+        val approval = PendingApproval.parse(obj("id" to 4, "method" to "item/commandExecution/requestApproval",
+            "params" to obj("threadId" to "t", "turnId" to "u", "itemId" to "i",
+                "availableDecisions" to org.json.JSONArray(listOf("accept", "cancel")))), 1)!!
+        assertEquals(listOf("accept", "cancel"), approval.decisions)
+    }
 }

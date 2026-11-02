@@ -23,13 +23,26 @@ import kotlin.concurrent.thread
  * the ViewModel's private rpc field by reflection. No network, no real sessions.
  */
 class TestPrefsApp(val namespace: String) : Application() {
+    var failCommits = false
     lateinit var prefsContext: Context
         private set
     fun attach(base: Context) {
         prefsContext = object : ContextWrapper(base) {
             override fun getNoBackupFilesDir() = java.io.File(base.cacheDir, "resume_test_$namespace")
-            override fun getSharedPreferences(name: String, mode: Int) =
-                super.getSharedPreferences("zcode_load_test_$namespace-$name", mode)
+            override fun getSharedPreferences(name: String, mode: Int): android.content.SharedPreferences {
+                val prefs = super.getSharedPreferences("zcode_load_test_$namespace-$name", mode)
+                return object : android.content.SharedPreferences by prefs {
+                    override fun edit(): android.content.SharedPreferences.Editor {
+                        val editor = prefs.edit()
+                        return object : android.content.SharedPreferences.Editor by editor {
+                            override fun commit() = if (failCommits) false else editor.commit()
+                            override fun putString(key: String?, value: String?): android.content.SharedPreferences.Editor {
+                                editor.putString(key, value); return this
+                            }
+                        }
+                    }
+                }
+            }
         }
         attachBaseContext(prefsContext)
     }

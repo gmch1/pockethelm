@@ -1,6 +1,6 @@
 # 交互类型接入：Codex 审批应答 + ZCode 提问应答
 
-状态：实现与验证完成，待 review
+状态：待 review（Codex 直接修复完成；自动化、真机与真实 ZCode 交互链路验证通过）
 
 ## 需求与验收 由 Codex 维护
 
@@ -39,7 +39,7 @@
 - `handle()` 的 `has("id")` 分支：
   - 已知审批方法（commandExecution / fileChange）解析入 state；`kind: "writeStdin"` 与 `"command"` 按标题区分（「命令审批」/「向运行中进程输入」）。
   - 未知 server request（permissions / requestUserInput / elicitation 等）保持现状：不消费、明确报错提示到原终端处理。
-- 决策按钮 = 支持集 `{accept, acceptForSession, decline}` ∩ `availableDecisions`（字段缺省时用支持集）。交集为空或仅含对象形式（策略修改类决策）→ 卡片显示「该审批含当前客户端不支持的决策类型，请在原终端处理」，不渲染按钮、不应答、不猜测转换。
+- 决策按钮 = 支持集 `{accept, acceptForSession, decline, cancel}` ∩ `availableDecisions`（字段缺省时仍仅用前三项；`cancel` 以独立的「取消本次执行」按钮原样提交）。交集为空或仅含对象形式（策略修改类决策）→ 卡片显示「该审批含当前客户端不支持的决策类型，请在原终端处理」，不渲染按钮、不应答、不猜测转换。
 - `decide(approval, decision)`：在 `actions` 互斥锁内重检——`generation == epoch`、该审批（按 key）仍在 state、threadId 未切换、未被重复点击；捕获原连接对象后 `respond()`，不在异步续体中重新取当前连接。写入成功仅代表应答发出：仅当原连接代次及原请求仍有效时，将卡片转入「已发送，等待确认」态并禁用按钮，不立即移除；若期间已 resolved/完成/断开，不重新插回卡片。
 - 撤卡时机（任一触发即撤）：`serverRequest/resolved`（按 threadId + 类型敏感 requestId 匹配）、`turn/completed`（threadId + turnId 匹配）、`disconnect()`（`epoch++` 处同步清空全部本地审批；旧应答绝不写往新连接；server 端请求保留给其他客户端）。
 
@@ -175,31 +175,42 @@ bridge.py + Python 测试 → Protocol/RemoteViewModel（Codex 链路含代次�
 
 ### R1 ZCode 提问必须支持 action + content，不能统一提交 optionId
 
-- 状态：方案复查通过，待实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：原计划将 userInput 应答统一为 optionId 提交；官方 AskUserQuestion 走结构化答案，普通选项值塞进 optionId 可能被解释成 decline。
 - 修复验收要求：区分简单交互（optionId/freeText）与 AskUserQuestion（多题草稿、多选、`action:"accept"` + content）；多题切换只更新本地草稿；保留 answerDrafts；content 白名单校验而非任意透传。
 - ZCode 修复与验证：计划 v2 已按官方 `buildElicitationResponseContent`（ElicitationDialog.tsx:272-303）逐行复刻 buildContent（answers / answer_N / 单题兼容 answer、未答题不含键），提供 decline/cancel；bridge 对 content 做白名单结构校验；JVM 测试对照官方 JSON 形态。待实现后复查。
 - Codex 复查结论：方案层面通过：已覆盖结构化 content、多题/多选和未答题语义。实现与测试尚未发生，不视为代码验收关闭；身份字段截断边界见 R8。
 
+- Codex 代码验收（c5b5bfc）：**待修复，P1**。`ZcodeScreen.kt:305` 单选题输入 customAnswer 时保留原 selectedValues；`ZcodeModels.kt:199` 最终同时产生矛盾答案。真机操作“选 PostgreSQL → 自定义输入 SQLite → 提交”实际得到 `answers[题目]="postgres, SQLite"`，`answer_0="postgres"`，单题兼容 answer 也是 postgres。必须对齐官方：单选自定义输入清掉预设选择，多选才保留组合；增加真实 Compose 点击/输入/请求断言。
+- R1 补充（P2，静态核对）：`ZcodeScreen.kt:276` 将 answerDrafts 的原始键直接当 question 文本使用，但官方 `createInitialElicitationDrafts` 读取 `answer_N`/数字索引并分离选项与自定义值；当前上游草稿无法正确回显。按官方索引映射并测试恢复。
+
+- Codex 修复与验证（2026-11-02）：单选自定义输入会清掉原选项；构建 content 时也强制单值一致。answer_N/数字索引草稿按上游规则拆成预设选择和自定义输入。JVM 覆盖索引映射、多选组合、单题兼容字段；真机点 PostgreSQL 后输入 SQLite，实际回写 answer_0/answer/answers 均为 SQLite。
+
 ### R2 Codex 审批按钮不能无条件展示
 
-- 状态：方案复查通过，待实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：命令审批有 `availableDecisions` 且可能含对象形式策略修改决策；同一方法可能表示 writeStdin，并非执行新命令。
 - 修复验收要求：基础决策与服务端允许选项取交集；不支持类型明确提示、不猜测转换；文件审批展示 grantRoot；正文默认紧凑、可展开查看完整内容。
 - ZCode 修复与验证：计划 v2 已含交集逻辑、writeStdin 标题区分、grantRoot 必显、maxLines + 展开切换。待实现后复查。
 - Codex 复查结论：方案层面通过：支持集交集、writeStdin 区分及完整正文入口已明确。grantRoot 为可选字段，仅在服务端提供时展示，缺失不猜测授权根目录。
 
+- Codex 修复与验证（2026-11-02）：继续按 availableDecisions 取交集，额外原样支持服务端声明的 cancel，不转换为 decline；按钮 FlowRow 可换行。基础默认集合保持不变。交集、对象类型、writeStdin/fileChange/grantRoot 解析测试通过；Codex 实际 sheet 点击允许后保持已发送直到 resolved。
+
 ### R3 审批应答绑定连接与会话，区分「已发送」与「已处理」
 
-- 状态：方案复查通过，待实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：requestId 类型混用（数字 7 与字符串 "7"）、跨线程取正文、重复点击、断线后旧应答发往新连接等风险；仅覆盖「连接后收到新请求」不能证明能接手已有审批。
 - 修复验收要求：连接代次 + 原始 ID（类型敏感）区分；卡片只展示当前线程、正文只从该线程 timeline 取；点击时重检请求存在与连接未变；respond 成功仅「已发送待确认」，resolved/回合结束再撤卡；断线清本地不重发；验证审批已存在时 App 才接入的接手场景。
 - ZCode 修复与验证：计划 v2 已含 generation 绑定、类型敏感 key、actions 锁内重检、已发送态、三种撤卡时机、probe 真实接手验证（两分支结论如实记录）。待实现后复查。
 - Codex 复查结论：方案层面通过：已覆盖连接代次、线程归属、已发送待确认和真实接手能力边界。撤卡与异步写入后的状态更新均须限定原连接和原请求，不能让已 resolved 的卡片复活。
 
+- Codex 代码验收（c5b5bfc）：**待修复，P1**。`RemoteViewModel.kt:850–857` 只拿旧对象的 key 查“当前 epoch 的请求”，未校验入参 approval.generation 和完整目标身份。定向真机复现：保存 epoch N/id=7 的旧对象，模拟新连接 epoch N+1 收到 id=7 的不同命令，再调用 decide(old,"accept")，客户端确实回写 accept 给新请求。必须先拒绝旧代次对象，并比对 thread/turn/item 和当前请求；修复后的测试应断言回写次数为 0。
+
+- Codex 修复与验证（2026-11-02）：进入 actions 锁后先比较原审批 generation，再匹配完整 PendingApproval；写后也只更新原请求。旧 generation/id=7 对象遇到新连接复用 id=7 时回写次数为 0；撤卡、类型敏感 ID、重复点击回归通过。
+
 ### R4 ZCode 交互恢复独立于消息恢复，敏感答案不落盘
 
-- 状态：方案 v3 已补充，待实现方复核及实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：复用 `write()`/`finishAck()` 会误清消息发送保护（ZcodeViewModel.kt:642）。
 - 修复验收要求：独立管理提交/确认/恢复；按环境/workspace/session/interaction 定位；持久化 commandId 与查询元数据，敏感答案不落盘；重连先 command/query 再读快照，未知≠失败、不盲目重发；accepted/duplicate/noop 后刷新快照；提交期间禁用对应按钮，普通消息输入保持独立。
 - ZCode 修复与验证：计划 v2 已改为独立通道（不改 write/finishAck）、独立 vault key、恢复顺序与对账规则、freeText 不落盘、submitting 集合。待实现后复查。
@@ -208,17 +219,28 @@ bridge.py + Python 测试 → Protocol/RemoteViewModel（Codex 链路含代次�
 - Codex v3 文档修订：独立状态机改为写前持久化、按完整目标保存有界记录集合；明确 awaitingSnapshot/uncertain 禁用期限、权威快照对账、旧代次隔离、元数据白名单及显式重新填写入口；验收清单同步覆盖。
 - ZCode 实现方复核（v3）：无阻塞。落实要点：`pending-interact` 为按环境 key 的单 JSON 集合（≤128 条，短互斥段整体读改写、不跨网络调用持锁）；提交路径顺序为「校验 → 生成 commandId → 持久化（失败即中止，RPC 次数为 0）→ 置 submitting → 发 RPC」；回包/finally 一律用捕获的 generation/目标/commandId，不用当前 profile 重算 key；快照按 revision/logEpoch 及会话归属校验后再生效。交互 RPC 不进 `action`/`busy` 包装，与消息通道互不阻塞。
 
+- Codex 代码验收（c5b5bfc）：**待修复，P1**。
+  - R4-a（真机复现）：`ZcodeViewModel.kt:869–873` 把所有 RpcException 都视为明确拒绝。桥接器 -32000/-32001 是上游/适配器结果不确定，可能已经执行；注入 -32000 后恢复记录立即消失、按钮重新可用。仅确定的校验拒绝或明确 rejected/stale/failed ACK 可清记录；其他异常及未知 ACK 必须保留 uncertain，不盲目允许重发。
+  - R4-b（真机复现）：`read():524–535` 在任何 revision/logEpoch 新旧校验之前调用 reconcileInteractions；后者也不校验版本。当前 revision=100 的待交互被 revision=1 的同 epoch 空快照清除，UI revision 倒退到 1。对账与 UI 必须共用原目标的版本门禁，过期快照不得清恢复记录；不同 logEpoch 先重新建立权威状态。
+  - R4-c（静态确认）：`foreground():187–192` 先将 profile 改为新环境，再通过 `updateInteractRecords(emptyList)` 写 vault，实际清空新环境已有恢复记录；`updateInteractRecords():801` 动态取当前 profile 的 key，没有捕获原环境。环境切换应只清内存并加载目标环境记录，保留两边磁盘状态；所有写回用捕获的 key/目标/commandId。补测 A→B→A 及 B 已有恢复记录。
+  - R4-d（静态确认）：`recoverInteractions():990–996` query 返回未知后直接 continue，不执行原计划要求的权威存在性读取；超窗或后台会话即使已经处理也可能一直保留保护。未知仍须读取同目标 presence，读取失败才保留 uncertain。
+  - 实现尚未满足元数据白名单：`interact():838` 将原始 optionId 放入 summary 并持久化，和 v3“不保存答案/敏感选项值”不一致；只存操作类型等固定摘要。未知 ACK 也不应进入明确拒绝分支。
+
+- Codex 修复与验证（2026-11-02）：保存、回写、清理均捕获原环境 key、generation、完整目标和 commandId；环境切换只清内存，按 resumeIdentity 分库存储。重复提交在同一短互斥段内检查；原始 optionId 改为固定操作摘要。只有 -32602 或明确拒绝 ACK 解锁，未知 ACK/适配器异常保留 uncertain；query 未知仍核对同目标 presence。统一读取门禁拒绝同 epoch 旧 revision/旧请求回包，epoch 改变二次读取确认，已退役 epoch 不回退。请求开始后新建或仍在途的回执不由该快照结算。写前/ACK 后落盘失败均保留安全状态，RPC 在途禁止手动解锁。真机覆盖 A→B→A、旧回包、双交互、重复点击、未知查询、两类磁盘失败、revision/epoch 倒退。
+
 ### R5 bridgeVersion 不得升为 2
 
-- 状态：方案复查通过，待实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：0.4.12 在初始化校验 `bridgeVersion == 1`（ZcodeViewModel.kt:265），升版会使商店 App 无法连接；也不应放宽为任意 `>= 2`。
 - 修复验收要求：保持兼容版本，新增明确交互能力标志，由新 App 检查。
 - ZCode 修复与验证：计划 v2 保持 `bridgeVersion: 1`，新增 `capabilities.interactions` 标志；新 App 检查标志而非放宽版本；兼容性场景纳入验收清单（旧 App↔新桥、旧桥↔新 App）。待实现后复查。
 - Codex 复查结论：方案层面通过：bridgeVersion 保持 1，能力标志增量协商，两向兼容验收已明确。无能力标志应降级展示，而非让整个连接初始化失败。
 
+- Codex 修复与验证（2026-11-02）：bridgeVersion 保持 1，capabilities.interactions 增量协商；新桥安装后真实 initialize/session/read/应答全链路正常，旧客户端的版本门禁不受影响。无能力标志仍只显示提示。
+
 ### R6 ZCode 提问自动结束（autoResolution）处理
 
-- 状态：方案 v3 已补充，待实现方复核及实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：3.17.1 有 autoResolution，官方客户端在用户开始操作时调用 snooze；不处理会出现用户输入中问题被自动结束。
 - 修复验收要求：本期覆盖该路径；被其他客户端回答或自动结束时及时撤销提交入口并说明状态。
 - ZCode 修复与验证：计划 v2 投影 autoResolution、首次操作触发一次 snooze（best-effort）、倒计时展示、交互消失撤入口并提示。待实现后复查。
@@ -227,9 +249,13 @@ bridge.py + Python 测试 → Protocol/RemoteViewModel（Codex 链路含代次�
 - Codex v3 文档修订：已加入用户操作意图、状态晚到补发、失败释放在途标记、有界退避重试及服务端 snoozed 确认；已定义终态停止和旧代次隔离。
 - ZCode 实现方复核（v3）：无阻塞。snooze 状态机按文档实现：`userInteracted` 意图先行、autoResolution 晚到时待快照出现可暂停状态再补发（不消耗尝试次数）；`inFlight`/`ackAccepted` 分离，同目标不并发；每代次每交互最多 3 次、退避 ≥1s/≥3s；超时未知沿用原 commandId（借 command/query 对账），明确拒绝后新尝试换新 commandId；「已暂停」仅凭快照 snoozed，失败时保留真实倒计时并提示暂停未确认；权威确认结束后停重试、清意图与草稿。
 
+- Codex 代码验收（c5b5bfc）：**待修复，P2**。`ZcodeScreen.kt:228–230` 时间单位反了：毫秒 deadline 除以 1，再减当前秒；秒 deadline 却除以 1000。正常倒计时因结果越界只显示“即将自动结束”。统一为毫秒差再换秒，并覆盖秒/毫秒协议口径与到期边界。`ZcodeSimpleInteraction`/`ZcodeQuestionForm` 仅在文本改变时 noteInteractionTouch，聚焦输入没有触发；用户聚焦后停顿仍可能自动结束，需接入 focus 回调。没有提交应答记录的 snooze 意图也应在权威结束时清除，目前 reconcileInteractions 的 targets 为空会直接 return。
+
+- Codex 修复与验证（2026-11-02）：统一秒/毫秒 deadline 计算并每秒更新；单选和简单输入的聚焦也记录触碰意图。晚到 autoResolution、失败后有界重试、未知结果复用 commandId、服务端 snoozed 才显示已暂停。无答案回执的交互也按权威 presence 清理 snooze 状态。JVM 倒计时测试、真机迟到/失败重试/聚焦用例通过；真实 ZCode Server 测试等待快照 snoozed 后才继续答题，截图可核对。
+
 ### R7 有界交互列表不能作为“已处理”的完整证据（P1）
 
-- 状态：方案 v3 已补充，待实现方复核及实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：§二.1 的 max 4 投影与 §二.2 的“交互从快照消失即清记录”冲突。第五条或因排序移动到可见窗口之外的交互仍可能 pending；不支持类型被过滤、快照读取失败也不等于交互已处理。误清会丢失恢复记录或重新允许重复应答。
 - 修复验收要求：明确完整性契约。可增加针对已知 interactionId 的存在性查询，或返回有界的完整 ID 集及完整性标志；超限时明确不完整，禁止据此推断消失。只有成功读取同一原目标的权威完整状态或明确终态才能清记录；UI 可继续仅显示前四条，并说明还有更多待处理。ACK 后刷新同样遵守该规则。
 - 验收：超过四条、重排序、未支持类型、读失败/断线时，不误清待确认记录；真正完成后正确清理。
@@ -239,9 +265,13 @@ bridge.py + Python 测试 → Protocol/RemoteViewModel（Codex 链路含代次�
 - Codex v3 文档修订：选定 session/read 的 interactionsComplete + checkInteractionIds/interactionPresence 契约，不再让实现方二选一；存在性从截断前同一原始快照计算。超窗、未知类型、读失败和 ACK 错序场景已纳入验收。
 - ZCode 实现方复核（v3）：契约可实现。落实方式：`snapshot()` 取到的原始 `pendingInteractions` 先做存在性计算再投影前四条；`interactionsComplete` 语义照文档（全部表达且原始 ID 保留才 true）。边界确认：ID 本身超 1024 字符的占位项无法进入 checkInteractionIds（16 个上限内也无法携带），按 R8 处理——占位省略 ID、不可应答，且该快照 `interactionsComplete=false`，与文档自洽。App 端清理记录仅凭「interactionsComplete=true 的同目标权威快照中缺席」或「显式 pending=false」两条路径。
 
+- Codex 代码验收（c5b5bfc）：**待修复，P2**。桥接器已实现前四条与完整性/显式 presence 区分，但 `ZcodeScreen.kt:59–61` 仍按当前四条详情中的缺席清理 forms，未看完整性或 presence；重排序/超窗会丢用户草稿。仅权威结束清草稿，并按完整环境/workspace/session/interaction 隔离，而非仅 selected.id。此项不能因桥接器投影测试通过而整体关闭。
+
+- Codex 修复与验证（2026-11-02）：表单按环境/workspace path/identity/session 隔离，只凭完整快照缺席或显式 pending=false 清草稿。简单 freeText 草稿移到 sheet 外的内存表，关闭重开和四条详情窗口重排序均保留。聚焦过的交互加入存在性核对；提交保护与 UI 共用已验版本的快照。真机敏感输入遮蔽、窗口移出/移回、关闭重开及保留文本用例通过。
+
 ### R8 显示截断与协议身份校验必须分开（P2）
 
-- 状态：方案 v3 已补充，待实现方复核及实现验收。
+- 状态：本轮修复与定向验收完成（见下方补充；原 review 记录保留）。
 - 位置、触发条件及影响：§二.1 写“string() 截断”，但本项目 helper 实际是超限拒绝，并不截断。interactionId / optionId / option.value 被截断会改变应答目标；AskUserQuestion 的完整 question 文本还是 content.answers 的键，不能用截断后的显示文本组装答案。
 - 修复验收要求：ID、选项值、答案映射所需的 question 保持原值；显示文案可单独截断。超出协议接收上限时对该交互明确标注不支持并禁用应答，不静默裁掉题目或候选项后继续提交，也不使整个 session/read 失败。规定嵌套数组、字符串和总响应大小的限额。表单 UI 的 maxLines 折叠不应改变模型中的原始值。
 - 验收：长 question 的 answers 键仍为原文；超长身份/超限题目不产生变形应答；普通会话内容仍能读取。
@@ -254,12 +284,44 @@ bridge.py + Python 测试 → Protocol/RemoteViewModel（Codex 链路含代次�
 范围与交付澄清（v3 已合入）：
 
 - ZCode permission 已统一为：本期支持上游明确 options 的简单应答；复杂类型只提示，不推断权限选项，yolo 策略不变。
-- 当前只有计划文档；真实 app-server、真机 fixture 和实现测试均未执行。本轮没有创建分支、修改产品代码、部署桥接器或推送。
+- 以上 v3 方案修订阶段仅修改文档；当前实现与验证情况以本轮交付和下面代码 review 记录为准。
 
-整体结论：第二轮意见已直接合入 v3 实现方案与验收清单，可交实现方复核。R1–R8 的实现与测试证据均留待代码交付时验收；本次不创建任务分支、不启动其他 AI、不部署或推送。
+c5b5bfc 初次代码验收结论（保留历史，修复结果见下）：**代码 review 不通过，待修复后复查，不合并或发布本任务。** 紧凑入口与底部表单方向符合预期，Codex UI 允许应答主路径可用；R1/R3/R4 存在已在真机复现的问题，R6/R7 仍有实现遗漏。
+
+- Codex 修复与验证（2026-11-02）：复核保真/限额和单条 unsupported 降级路径，沿用现有 Python 边界测试。补正 checkInteractionIds 校验顺序：先验证字符串再去重，嵌套对象/数组不会触发未捕获 TypeError，也不会访问上游。37 项桥接器测试通过。
+
+### Codex 本轮复查证据与界面结论
+
+- 审查提交 `c5b5bfc`；创建隔离检出构建同一产品源码，仅增加私有诊断测试，不修改任务分支产品代码。诊断类/日志/截图位于仓库外 `~/.local/state/pockethelm/interaction-review-20261102/`。
+- Android 13 真机定向探针 `probes.txt`：5 项执行完毕。其中 4 项**以断言缺陷存在为目的**，分别复现旧审批跨代次误答、-32000 误清记录、旧快照误清记录、单选自定义答案冲突；第五项实际打开 Codex 审批 sheet、点击允许并确认 accept 回写。日志中的 OK (5 tests) 不代表功能验收通过。
+- 原交付 `ApprovalInteractionTest` 的 12 项主要调用 ViewModel，没有 setContent 或真实表单点击；不能作为新交互 UI 已全面验证的证据。本轮补了两端实际 Compose 点击/输入。
+- 视觉：单行 amber 入口、等待交互状态、底部 sheet 的布局方向符合紧凑阅读要求；ZCode 选项选中态与自定义输入框可见。仍需完成多题多选、敏感输入、长文本/大字体/键盘及关闭重开草稿的 UI 验收。
+- 已知产品体验边界：真实 Codex availableDecisions 可能是 accept/策略对象/cancel，本期不支持 cancel 会只剩“允许”。应评估按原值支持独立的“取消本次执行”按钮，不把 cancel 偷换成 decline；否则 README 必须明确手机不能完成拒绝闭环，sheet 也须提示，当前仅对象列表为空时有提示。
+- 交付文档明确 ZCode 真 agent AskUserQuestion→手机回答→任务继续（含 snooze）的完整链路仍未执行；只读 session/read 冒烟与假 RPC 不能替代。修复后必须补验并记录证据，不能标“全部通过”后留给日常使用。
+- UI 等待 sheet 动画稳定后复跑两项，`ui-settled.txt` 完成（仍包含一项缺陷复现）；已查看两端稳定态截图。测试结束卸载诊断测试包、删除临时 APK/截图缓存，恢复测试前应用并拉包核对哈希一致，AppOps 10021/10032 恢复 ignore；未清用户配对或数据。隔离检出已移除，诊断源码保存在私有证据目录。
+- 诊断构建 release APK SHA-256：`17fb2aad0ac6dee88758ec3700de0802b719a7975ad10dd880a8d211463705ff`。没有上传商店、合并或推送；这是 review 产物，不是发布产物。
+
+
+## Codex 修复交付（2026-11-02）
+
+- 按用户「修复吧」直接修改产品代码和测试，未再委派其他实现会话。原 review 的四个缺陷复现已转成正向回归断言。
+- 基线为 `c5b5bfc`，修复集中在审批应答、ZCode 恢复与表单；保留 YOLO 策略及紧凑交互入口。R1–R8 的本轮回复在各原编号下。
+- 构建：签名 release APK + release androidTest；`:app:testReleaseUnitTest`、`:app:lintRelease`、`:app:assembleRelease`、`:app:assembleReleaseAndroidTest` 成功。
+- JVM：93 项中 92 通过、1 项可选的 `productionTransportThroughTencent` 因未注入 SSH fixture 跳过；没有失败。Python bridge：37 项通过；pairing：13 项通过；源码导出检查成功。
+- 真机 Android 13：`ApprovalInteractionTest` 最终 **27 项全部通过**，含真实 Compose 点击/输入、存储失败注入、连接代次/环境隔离与真实上游交互闭环。相关会话恢复、发送、列表、阅读 UI 回归 **49 项全部通过**，合计 76 个真机用例。最终真实链路用例收紧为“本次提交后出现新的 agentMessage”，单独重跑通过，排除复用会话旧回复的误判。
+- 真实 ZCode 验收：使用专用原生测试会话（GLM-5.3/max，同一轮等待与应答复用原会话）；AskUserQuestion → App 展开表单 → 聚焦并等待服务端 `autoResolution.state=snoozed` → 输入 SQLite → 提交 → 待交互归零、agent 返回 `INTERACTION_E2E_OK SQLite`，最终 phase 为 completedSuccess。测试完仅清理本次专用会话，原生 deleteSession ACK accepted。
+- 本次真链路采用 **ADB reverse 到开发机 loopback 的受限测试桥**，再连接实际安装的 bridge/ZCode Server；服务端夹具仅放行专用 session 的初始化、读取、应答、snooze、query。测试机没有可复用的已配对配置，本轮未复测 SSH 登录/扫码本身，也未修改真实配对数据。隔离通道只存在于 androidTest 与仓库外脚本，不进入 App 发行逻辑。
+- 初次附加 UI 用例因 sheet 尚未展开选中底层输入框、未配置轮询响应而失败；修正夹具的等待与轮询控制后纳入最终 27 项全通过。初次 SSH 夹具缺少 profile，明确改为上述测试隧道；不将该次失败写成 SSH 通过。
+- 证据存放于仓库外 `~/.local/state/pockethelm/interaction-fix-20261102/`：最终交互/回归日志、live-bridge-strict-final.log、live-strict-result.json、device-live-strict-final.txt、界面截图与清理记录。不公开真实会话标识、连接配置或日志正文。
+- 已测产品 APK SHA-256：`e2f8adea3628766a9bb7dc526d7482f08329bd236c5b1367729bf7628796a98a`。构建后产品源码未再变化；源码快照（按路径排序，逐项串接路径 + NUL + 文件内容 + NUL，范围 git 跟踪的 android/ 与 scripts/zcode/）SHA-256：`5e7ecdb371b1b6047bb5de4bee7a2e7f221ed700bbaf603a88261ffb91b9a373`。
+- 补充真机夹具修正：真实 autoResolution 有 60 秒 hidden grace，初次严格复测的 30 秒等待超时；改为 90 秒后，服务端暂停确认及新回复断言全部通过。未更改产品超时或服务端设置。
+- 测试收尾：两个本轮专用原生 fixture 均已清理（deleteSession accepted）；卸载 androidTest、移除 ADB reverse/临时目标文件/APK/截图缓存，AppOps 10021/10032 恢复 ignore。保留已验证修复版 App，拉取已安装 APK 核对 SHA-256 一致；没有清用户数据。
+- 本轮未穷举所有字号、横屏和复杂权限策略的组合；SSH 配对链路未重测。核心修复的自动化和实际交互闭环均有证据，范围外交互仍按 README 降级。
+- 本轮不升级商店版本，不合并 main；按任务流程提交、推送 `interaction-approvals` 并交付待 review。商店仍为原版。
+
 
 ## 发布或完成 由 Codex 维护
 
-- 最终代码与测试产物一致性：（待定）
-- 发布版本、APK SHA-256 与商店验证：（待定）
-- 完成时间及说明：（待定）
+- 最终代码与测试产物一致性：基线、源码快照及已安装 APK 哈希见上；最终仅文档和测试断言变化，产品 APK 未重建。
+- 发布版本、APK SHA-256 与商店验证：本次为任务分支修复交付，版本维持 0.4.12/22，未合并或发布商店。
+- 完成时间及说明：2026-11-02；R1–R8 修复记录齐全，交付 `interaction-approvals` 分支待 review。

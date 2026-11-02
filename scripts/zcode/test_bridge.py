@@ -381,6 +381,15 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['bridgeVersion'], 1)
         self.assertTrue(result['capabilities']['interactions'])
 
+    def test_presence_check_rejects_non_string_before_deduplication(self):
+        client = Mock()
+        bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
+        bridge.snapshot = Mock()
+        for check in ([{}], [[]], ['ok', 'ok'], [True]):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/read', {'checkInteractionIds': check})
+        bridge.snapshot.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -162,4 +162,22 @@ class ZcodeModelsTest {
         assertFalse(empty.has("answer_0")); assertFalse(empty.has("answer"))
         assertFalse(interactionFormAnswered(listOf(q), emptyMap()))
     }
+    @Test fun customSingleAnswerWinsAndIndexedDraftsRestore() {
+        val q = ZQuestion("数据库", "DB", listOf(ZQuestionOption("pg", "Postgres")), false)
+        val result = buildInteractionContent(listOf(q), mapOf(q.question to ZFormDraft(listOf("pg"), "SQLite")))
+        assertEquals("SQLite", result.getString("answer_0"))
+        assertEquals("SQLite", result.getJSONObject("answers").getString(q.question))
+        val interaction = ZInteraction("i", "userInput", true, questions = listOf(q, q.copy(question = "模块", multiSelect = true)),
+            answerDrafts = mapOf("answer_0" to listOf("SQLite"), "1" to listOf("pg", "custom")))
+        val restored = initialInteractionDrafts(interaction)
+        assertEquals(ZFormDraft(customAnswer = "SQLite"), restored[q.question])
+        assertEquals(ZFormDraft(listOf("pg"), "custom"), restored["模块"])
+    }
+
+    @Test fun countdownAcceptsSecondsAndMillisAndShowsExpiry() {
+        val now = 1_800_000_000_000L
+        assertEquals("即将自动结束 · 剩余约 2 分钟", interactionCountdown(now + 120_000, now))
+        assertEquals(interactionCountdown(now + 120_000, now), interactionCountdown((now + 120_000) / 1000, now))
+        assertEquals("自动结束时间已到，等待服务器确认", interactionCountdown(now - 1, now))
+    }
 }

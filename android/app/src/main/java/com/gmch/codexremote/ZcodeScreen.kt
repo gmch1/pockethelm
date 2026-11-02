@@ -14,6 +14,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import kotlinx.coroutines.delay
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -55,10 +57,13 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
     var interactionSheet by remember { mutableStateOf(false) }
     // In-memory form drafts keyed by interaction id; scoped to the selected session and
     // surviving sheet open/close and polls. Never persisted, cleared when it ends.
-    val forms = remember(state.selected?.id) { mutableStateMapOf<String, InteractionFormState>() }
-    LaunchedEffect(state.interactions, state.selected?.id) {
+    val forms = remember(navigation.profile.resumeIdentity, state.selected?.path, state.selected?.identity, state.selected?.id) { mutableStateMapOf<String, InteractionFormState>() }
+    LaunchedEffect(state.interactions, state.interactionsComplete, state.interactionPresence, forms) {
         val live = state.interactions.map { it.id }.toSet()
-        forms.keys.removeAll(forms.keys.filter { it !in live })
+        forms.keys.removeAll(forms.keys.filter {
+            state.interactionPresence[it] == false || (state.interactionsComplete && it !in live)
+        })
+        if (state.interactionsComplete && live.isEmpty()) interactionSheet = false
     }
     val chat = state.selected != null && tab == 0
     BackHandler(chat) { vm.back() }
@@ -167,6 +172,7 @@ private class InteractionFormState {
     var index by mutableIntStateOf(-1) // -1: follow the snapshot's current question
     val drafts = mutableStateMapOf<String, ZFormDraft>()
     var seeded = false
+    var text by mutableStateOf("")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -197,7 +203,7 @@ private fun ZcodeInteractionCard(
     interaction: ZInteraction, state: ZcodeState, session: ZSession,
     vm: ZcodeViewModel, forms: SnapshotStateMap<String, InteractionFormState>
 ) {
-    val disabled = interaction.id.isNotBlank() && interaction.id in state.interactSubmitting
+    val disabled = !state.connected || interaction.id in state.interactSubmitting
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(interaction.title, style = MaterialTheme.typography.titleLarge)
         if (interaction.toolName.isNotBlank())
@@ -208,10 +214,10 @@ private fun ZcodeInteractionCard(
             return@Column
         }
         if (interaction.questions.isNotEmpty()) ZcodeQuestionForm(interaction, session, vm, forms, disabled)
-        else ZcodeSimpleInteraction(interaction, session, vm, disabled)
-        if (disabled) {
+        else ZcodeSimpleInteraction(interaction, session, vm, disabled, forms.getOrPut(interaction.id) { InteractionFormState() })
+        if (interaction.id in state.interactSubmitting) {
             Text("应答已发送，等待确认；结果未知时不会自动重发。", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
-            TextButton({ vm.releaseInteraction(session, interaction.id) }) { Text("已核对，重新填写") }
+            TextButton({ vm.releaseInteraction(session, interaction.id) }, enabled = interaction.id in state.interactReleasable) { Text("已核对，重新填写") }
         }
     }
 }
@@ -222,12 +228,13 @@ private fun ZcodeInteractionCard(
 private fun ZcodeAutoResolutionLine(interaction: ZInteraction, state: ZcodeState) {
     val unconfirmed = interaction.id in state.snoozeUnconfirmed
     val auto = interaction.autoResolution ?: return
+    val now by produceState(System.currentTimeMillis(), auto) {
+        while (true) { value = System.currentTimeMillis(); delay(1000) }
+    }
     val text = when {
         auto.state == "snoozed" -> "已暂停自动结束"
         auto.state == "visibleCountdown" && auto.deadlineAt > 0 -> {
-            val unit = if (auto.deadlineAt > 1_000_000_000_000L) 1L else 1000L
-            val seconds = (auto.deadlineAt / unit - System.currentTimeMillis() / 1000L)
-            if (seconds in 0..86_400) "即将自动结束 · 剩余约 ${seconds / 60 + 1} 分钟" else "即将自动结束"
+            interactionCountdown(auto.deadlineAt, now)
         }
         else -> return
     }
@@ -244,7 +251,7 @@ private fun zcodeUnsupportedReason(reason: String) = when (reason) {
 
 /** Simple interactions (permission or option-only userInput): optionId / freeText answers. */
 @Composable
-private fun ZcodeSimpleInteraction(interaction: ZInteraction, session: ZSession, vm: ZcodeViewModel, disabled: Boolean) {
+private fun ZcodeSimpleInteraction(interaction: ZInteraction, session: ZSession, vm: ZcodeViewModel, disabled: Boolean, form: InteractionFormState) {
     if (interaction.summary.isNotBlank()) Text(interaction.summary, fontSize = 13.sp)
     if (interaction.prompt.isNotBlank()) Text(interaction.prompt, fontSize = 13.sp)
     interaction.options.forEach { option ->
@@ -254,11 +261,10 @@ private fun ZcodeSimpleInteraction(interaction: ZInteraction, session: ZSession,
         }
     }
     if (interaction.freeText) {
-        var text by remember(interaction.id) { mutableStateOf("") }
-        OutlinedTextField(text, { text = it; vm.noteInteractionTouch(session, interaction) },
-            Modifier.fillMaxWidth(), label = { Text(if (interaction.sensitive) "输入（敏感内容不落盘）" else "输入回答") },
+        OutlinedTextField(form.text, { form.text = it; vm.noteInteractionTouch(session, interaction) },
+            Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) vm.noteInteractionTouch(session, interaction) }, enabled = !disabled, label = { Text(if (interaction.sensitive) "输入（敏感内容不落盘）" else "输入回答") },
             visualTransformation = if (interaction.sensitive) PasswordVisualTransformation() else VisualTransformation.None)
-        TextButton({ vm.interactFreeText(session, interaction, text) }, enabled = !disabled && text.isNotBlank()) { Text("发送") }
+        TextButton({ vm.interactFreeText(session, interaction, form.text) }, enabled = !disabled && form.text.isNotBlank()) { Text("发送") }
     }
 }
 
@@ -273,9 +279,7 @@ private fun ZcodeQuestionForm(
     if (!form.seeded && form.drafts.isEmpty() && interaction.answerDrafts.isNotEmpty()) {
         form.seeded = true
         // First display seeds from upstream drafts; later edits are never overwritten.
-        interaction.answerDrafts.forEach { (question, values) ->
-            form.drafts[question] = ZFormDraft(values)
-        }
+        form.drafts.putAll(initialInteractionDrafts(interaction))
     }
     val questions = interaction.questions
     val index = if (form.index in questions.indices) form.index
@@ -305,8 +309,10 @@ private fun ZcodeQuestionForm(
         }
         OutlinedTextField(draft.customAnswer, { value ->
             vm.noteInteractionTouch(session, interaction)
-            form.drafts[question.question] = draft.copy(customAnswer = value)
-        }, Modifier.fillMaxWidth(), label = { Text("自定义回答") }, enabled = !disabled)
+            form.drafts[question.question] = draft.copy(customAnswer = value, selectedValues = if (question.multiSelect) draft.selectedValues else emptyList())
+        }, Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) vm.noteInteractionTouch(session, interaction) },
+            label = { Text("自定义回答") }, enabled = !disabled,
+            visualTransformation = if (interaction.sensitive) PasswordVisualTransformation() else VisualTransformation.None)
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             if (index > 0) TextButton({ form.index = index - 1 }, enabled = !disabled) { Text("上一题") }
             if (index < questions.size - 1) TextButton({ form.index = index + 1 }, enabled = !disabled) { Text("下一题") }

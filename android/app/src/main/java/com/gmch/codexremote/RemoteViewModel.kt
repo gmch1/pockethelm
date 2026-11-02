@@ -848,19 +848,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // Captured under the action mutex: the connection object and the request must both
         // still be the ones the card was rendered from.
         val generation = epoch
-        val connection = client()
-        val current = mutable.value.approvals.firstOrNull { it.key == approval.key && it.generation == generation }
+        if (approval.generation != generation) return@action
+        val current = mutable.value.approvals.firstOrNull { it == approval }
             ?: return@action // Resolved elsewhere or the connection changed: card is already gone.
         check(!current.sent) { "该审批已应答，等待服务器确认" }
         check(current.threadId == mutable.value.selected?.id) { "会话已切换，请重新确认" }
         check(decision in current.decisions) { "该审批不支持此决策" }
+        val connection = client()
         connection.respond(current.rawId, obj("decision" to decision))
         // A write succeeding only means the answer left this device. Flip to sent only while
         // the same generation still owns the card — a resolved notification processed during
         // the write must not resurrect it.
         mutable.update { state ->
-            if (generation == epoch && state.approvals.any { it.key == current.key })
-                state.copy(approvals = state.approvals.map { if (it.key == current.key) it.copy(sent = true) else it })
+            if (generation == epoch && state.approvals.any { it == current })
+                state.copy(approvals = state.approvals.map { if (it == current) it.copy(sent = true) else it })
             else state
         }
     }
