@@ -159,7 +159,7 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
             dismissButton = { TextButton({ confirmUncertain = false }) { Text("返回") } })
         ChatTimeline(session.id, "Codex", state.items, state.outgoing, state.queue, state.historyCursor != null,
             state.historyLoading, state.historyError, state.connected, state.busy, Modifier.weight(1f),
-            vm::moreHistory, vm::retryHistory, detail, state.diff, vm::deleteQueued)
+            vm::moreHistory, vm::retryHistory, detail, state.diff, vm::deleteQueued, dismissFailed = vm::dismissFailed)
         ExecutionControls(state, vm)
         ChatComposer(state.draft, vm::draft, state.sending,
             state.connected && !state.busy && !state.sending && state.draft.isNotBlank() && state.uncertain == null,

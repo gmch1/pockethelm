@@ -183,12 +183,32 @@ class ZcodeSendRealtimeTest {
         assertFalse(vm.state.value.sending)
     }
 
+    @Test fun failedAttemptPrecedesSuccessfulRetryAndCanBeDismissed() = runBlocking {
+        freshViewModel(); seedSession("sessA", "same text")
+        scriptSend { obj("status" to "rejected", "reasonCode" to "stale_guard") }
+        instrumentation.runOnMainSync { vm.send() }
+        assertTrue(await { !it.busy && it.outgoing.singleOrNull()?.state == OutgoingState.FAILED })
+        val failed = vm.state.value.outgoing.single()
+        scriptSend { obj("status" to "accepted", "result" to obj("delivery" to "startNow")) }
+        scriptRead()
+        instrumentation.runOnMainSync { vm.send() }
+        assertTrue(await { !it.busy && it.items.isNotEmpty() })
+        val rows = buildChatRows(vm.state.value.items, vm.state.value.outgoing)
+        assertEquals(failed.clientId, rows.first().outgoing!!.clientId)
+        assertEquals("userMessage", rows.last().item!!.kind)
+        instrumentation.runOnMainSync { vm.dismissFailed(failed) }
+        assertTrue(vm.state.value.outgoing.isEmpty())
+        assertEquals("same text", vm.state.value.items.single().text)
+    }
+
     @Test fun bridgeErrorStaysUncertainWithPendingProtection() = runBlocking {
         freshViewModel(); seedSession("sessA", "任务D")
         scriptSend { throw FakeRpcBridge.FakeRpcError(-32000, "桥接器内部错误") }
         instrumentation.runOnMainSync { vm.send() }
         assertTrue(await { !it.busy && it.outgoing.isNotEmpty() && it.outgoing[0].state == OutgoingState.UNCERTAIN })
         assertEquals("结果待确认", outgoingStatusLabel(vm.state.value.outgoing[0]))
+        instrumentation.runOnMainSync { vm.dismissFailed(vm.state.value.outgoing.single()) }
+        assertEquals(OutgoingState.UNCERTAIN, vm.state.value.outgoing.single().state)
         assertTrue(vm.state.value.pending)
         assertEquals("任务D", vm.state.value.draft)
     }

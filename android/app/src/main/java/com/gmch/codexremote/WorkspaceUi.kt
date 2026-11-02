@@ -449,7 +449,8 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
     modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit,
     diff: String = "", removeQueued: ((QueuedMessage) -> Unit)? = null,
     turnSummary: TurnDiffSummary? = null, onTurnDiff: (() -> Unit)? = null,
-    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null) {
+    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null,
+    dismissFailed: ((OutgoingMessage) -> Unit)? = null) {
     val list = rememberLazyListState()
     var follow by rememberSaveable { mutableStateOf(true) }
     var jump by remember { mutableStateOf<String?>(null) }
@@ -495,7 +496,11 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
             items(rows, key = { it.key }) { row -> when {
                 row.activity.isNotEmpty() -> ActivitySummary(row.activity, detail)
                 row.item != null -> TimelineCard(row.item, agentName = agent, detail = detail)
-                row.outgoing != null -> OutgoingCard(row.outgoing, detail)
+                row.outgoing != null -> Column {
+                    OutgoingCard(row.outgoing, detail)
+                    if (row.outgoing.state == OutgoingState.FAILED && dismissFailed != null)
+                        TextButton({ dismissFailed(row.outgoing) }) { Text("移除失败记录") }
+                }
                 row.queued != null -> Column {
                     OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队"), detail)
                     QueuedItemActions(row.queued, connected && !busy, removeQueued, promoteQueued,

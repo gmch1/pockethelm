@@ -415,5 +415,6 @@ internal fun ZcodeTimeline(state: ZcodeState, vm: ZcodeViewModel, modifier: Modi
             ({ vm.loadTurnDiff() }) else null,
         removeQueued = if (state.queueOpsEnabled) ({ vm.removeQueued(it) }) else null,
         promoteQueued = if (state.queueOpsEnabled) ({ vm.promoteQueued(it) }) else null,
+        dismissFailed = vm::dismissFailed,
         editQueued = if (state.queueOpsEnabled) ({ queued, text -> vm.editQueued(queued, text, queueContext) }) else null)
 }
