@@ -371,3 +371,11 @@ c5b5bfc 初次代码验收结论（保留历史，修复结果见下）：**代�
 - 构建产物、设备已安装 APK、商店公开索引及完整下载 APK 的 SHA-256 均一致：`f270108ee4c06ad82e92c313f33f7ad6ce68bfae8e76ee26e911f719327e5a6e`。上传 API 返回 `published`，原条目版本为 0.4.13 / 23。公网检查绕过本机不可用代理，HTTPS 证书校验正常开启。
 - 发布证据位于仓库外 `~/.local/state/pockethelm/release-0.4.13/`：`build.log`、`instrument.txt`、`verification.json`、`upload.json`、`store-verified.json`、`store-check.log` 及已校验 APK。已卸载测试包、删除临时 APK/截图缓存，AppOps 恢复原值，保留新版本与用户数据。
 - 开发机已部署本任务新版 bridge；其他开发机如需使用 ZCode 应答，仍须按 README 更新桥接器。发布记录与版本号提交、推送 `interaction-approvals`；本次不合并 main。
+
+
+### 发布后测试残留清理（2026-11-02）
+
+- 用户怀疑审批测试遗留 Codex 任务。本机 app-server 确认有 3 个今日 15:01–15:02 创建的临时审批测试会话仍为 active / waitingOnApproval，工作目录均为临时审批探针目录，提示词只要求执行合成 echo 标记。不是持续生成的正式用户任务。
+- 逐一调用 turn/interrupt，查询确认 interrupted 后再 thread/archive。清理后当前服务列出的 active 会话只有本工作会话；其他已加载用户会话 idle。保留正常 daemon、updater 与终端客户端，不通过杀整个服务清理任务。
+- 脚本存在清理漏洞：`run_approval_smoke` 的 finally 仅在 client_b 已创建时归档，A 阶段失败会遗漏；归档前也不保证回合已停止。改为使用独立连接清理，只针对本次创建的 thread，先中断并确认终态再归档。清理失败抛错并保留诊断目录/标识，不静默报成功。
+- 新增 3 项离线回归：pending 回合先中断后归档、B 创建前失败仍清理、清理失败保留目录且显式失败。全部通过，并接入 Python CI；没有为验证清理再次创建付费模型任务。此项仅修改开发测试脚本，不修改或重新发布 0.4.13 App。

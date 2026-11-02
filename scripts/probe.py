@@ -155,6 +155,30 @@ class Client:
         self.process.wait(timeout=10)
 
 
+def cleanup_approval_thread(thread, via_jump, config):
+    """Use an independent connection even when A/B failed or already disconnected."""
+    client = Client(via_jump, config)
+    try:
+        deadline = time.monotonic() + 15
+        interrupted = set()
+        while True:
+            turns = client.call("thread/turns/list", {"threadId": thread, "limit": 10,
+                "sortDirection": "desc", "itemsView": "notLoaded"})["data"]
+            active = [turn for turn in turns if turn["status"] == "inProgress"]
+            if not active:
+                break
+            for turn in active:
+                if turn["id"] not in interrupted:
+                    client.call("turn/interrupt", {"threadId": thread, "turnId": turn["id"]})
+                    interrupted.add(turn["id"])
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Approval smoke cleanup did not observe a terminal turn")
+            time.sleep(.2)
+        client.call("thread/archive", {"threadId": thread})
+    finally:
+        client.close()
+
+
 def run_approval_smoke(via_jump, config):
     """Real approval flow against the local app-server, incl. the takeover question.
 
@@ -238,19 +262,24 @@ def run_approval_smoke(via_jump, config):
         assert declined, "declined decision did not reach the turn"
         print("PASS: takeover decline landed; command item status is declined", flush=True)
     finally:
-        if thread and client_b:
-            try:
-                client_b.call("thread/archive", {"threadId": thread})
+        cleaned = thread is None
+        try:
+            if thread:
+                cleanup_approval_thread(thread, via_jump, config)
+                cleaned = True
                 print("Archived only the approval smoke thread", flush=True)
-            except Exception as e:
-                print(f"Approval smoke cleanup needs attention: {type(e).__name__}", flush=True)
-        for client in (client_a, client_b):
-            if client:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-        shutil.rmtree(folder, ignore_errors=True)
+        except Exception as e:
+            print(f"Approval smoke cleanup failed ({type(e).__name__}); retained thread {thread} and {folder}", flush=True)
+            raise
+        finally:
+            for client in (client_a, client_b):
+                if client:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            if cleaned:
+                shutil.rmtree(folder, ignore_errors=True)
 
 
 def main():
