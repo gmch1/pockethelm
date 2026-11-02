@@ -30,9 +30,6 @@ internal fun EngineApp(codex: RemoteViewModel, zcode: ZcodeViewModel) {
         else { zcode.leave(); codex.foreground() }
     }
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        ChoiceTabs(listOf("Codex", "ZCode"), if (engine == "codex") 0 else 1,
-            { codex.engine(if (it == 0) "codex" else "zcode") },
-            Modifier.padding(horizontal = 16.dp, vertical = 4.dp).width(240.dp))
         Box(Modifier.weight(1f)) {
             pages.SaveableStateProvider("${navigation.profile.resumeIdentity}:$engine") {
                 if (engine == "codex") RemoteApp(codex)
@@ -47,63 +44,76 @@ internal fun EngineApp(codex: RemoteViewModel, zcode: ZcodeViewModel) {
 private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     val navigation by codex.state.collectAsStateWithLifecycle()
-    val environment = navigation.profile.name
     var newSession by remember { mutableStateOf(false) }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     val pages = rememberSaveableStateHolder()
     var detail by remember { mutableStateOf<Pair<String, String>?>(null) }
     var unlock by remember { mutableStateOf(false) }
     val chat = state.selected != null && tab == 0
-    val connection: () -> Unit = { tab = 2 }
     BackHandler(chat) { vm.back() }
-    WorkspaceScaffold(if (chat) state.selected!!.title else listOf("会话", "任务中心", "连接")[tab],
-        if (chat) state.selected!!.workspace(state.projects).project else environment,
-        chat, tab, state.busy, vm::back, vm::refresh, { tab = it }) {
-        WorkspaceError(if (tab == 2) navigation.error ?: state.error else state.error,
-            { if (tab == 2) codex.dismissError(); vm.dismissError() }) { title, text -> detail = title to text }
+    when {
+        tab == 2 -> WorkspaceScaffold("连接", chat = false, tab = tab, busy = state.busy || navigation.busy,
+            refresh = vm::refresh, selectTab = { tab = it }, engine = "zcode" to { codex.engine(it) }) {
+            WorkspaceError(navigation.error ?: state.error, { codex.dismissError(); vm.dismissError() }) { title, text -> detail = title to text }
+            pages.SaveableStateProvider("tab:2") {
+                ConnectionScreen(navigation.copy(connected = state.connected, busy = state.busy || navigation.busy,
+                    status = "ZCode · " + if (state.connected) "已连接" else "未连接"), codex, vm::connect, vm::disconnectManually)
+            }
+        }
+        chat -> WorkspaceScaffold(state.selected!!.title, state.selected!!.workspace(state.projects).project,
+            chat = true, busy = state.busy, back = vm::back, refresh = vm::refresh) {
+            WorkspaceError(state.error, vm::dismissError) { title, text -> detail = title to text }
             if (pendingProtectionVisible(state.pending, state.commandInFlight)) {
                 Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
                     Text("有一条提交尚待确认，请刷新查询。", color = MaterialTheme.colorScheme.error, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                     if (state.pendingUnknown) TextButton({ unlock = true }, enabled = !state.busy) { Text("已核对会话，解除发送保护") }
                 }
             }
-        pages.SaveableStateProvider(if (!chat) "tab:$tab" else "chat:${state.selected!!.id}") {
-            if (tab == 2) ConnectionScreen(navigation.copy(connected = state.connected, busy = state.busy || navigation.busy,
-                status = "ZCode · " + if (state.connected) "已连接" else "未连接"), codex, vm::connect, vm::disconnectManually)
-            else if (!chat) {
-                WorkspaceSessions(state.sessions.map { it.workspace(state.projects, state.connected && state.sessionsFresh, state.liveStatuses) }, state.connected, state.busy, !state.sessionsFresh,
-                    environment, state.error, state.connected && !state.busy && !state.pending,
-                    open = { id -> tab = 0; state.sessions.find { it.id == id }?.let(vm::open) }, create = { newSession = true },
-                    connection = connection, refresh = vm::refresh, addProject = vm::openBrowser, tasks = tab == 1,
-                    canOpen = state.connected && !state.busy)
-            } else Column(Modifier.fillMaxSize()) {
-                var showSettings by remember { mutableStateOf(false) }
-                ChatRunHeader(zcodeAgentRun(state.connected, state.phase, state.interactionCount), phaseLabel(state.phase),
-                    state.historyCached, state.connected, state.executionId.isNotBlank(),
-                    state.connected && !state.busy && !state.pending && !state.commandInFlight, vm::stop)
-                if (state.providers.find { it.id == state.selection?.provider }?.let { it.guard != state.selectionGuard } == true)
-                    Text("额度来源已变化，请重新选择计划", color = MaterialTheme.colorScheme.error, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp))
-                if (state.interactionCount > 0) Text("ZCode 正在等待交互；尚未接入该交互类型。",
-                    color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp))
-                if (state.notice.isNotBlank()) Text(state.notice, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 16.dp))
-                ZcodeTimeline(state, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
-                ChatSettingsBar(zcodeSettingsSummary(state), if (state.quota.startsWith("剩余")) state.quota.take(24) else "额度 ▾",
-                    { showSettings = true }, { showSettings = true; vm.quota() })
-                ChatComposer(state.draft, vm::draft, state.sending,
-                    state.connected && !state.busy && !state.pending && !state.sending && state.draft.isNotBlank() && state.selection != null,
-                    state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send)
-                if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false },
-                    sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-                    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
-                        .padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("计划与模型", style = MaterialTheme.typography.titleLarge)
-                        ZcodeControls(state, vm)
-                        Text("切换仅影响下次发送；会话当前使用的模型不变。", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("新会话默认完全访问（Full access）。", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            pages.SaveableStateProvider("chat:${state.selected!!.id}") {
+                Column(Modifier.fillMaxSize()) {
+                    var showSettings by remember { mutableStateOf(false) }
+                    ChatRunHeader(zcodeAgentRun(state.connected, state.phase, state.interactionCount), phaseLabel(state.phase),
+                        state.historyCached, state.connected, state.executionId.isNotBlank(),
+                        state.connected && !state.busy && !state.pending && !state.commandInFlight, vm::stop)
+                    if (state.providers.find { it.id == state.selection?.provider }?.let { it.guard != state.selectionGuard } == true)
+                        Text("额度来源已变化，请重新选择计划", color = MaterialTheme.colorScheme.error, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 16.dp))
+                    if (state.interactionCount > 0) Text("ZCode 正在等待交互；尚未接入该交互类型。",
+                        color = MaterialTheme.colorScheme.error, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp))
+                    if (state.notice.isNotBlank()) Text(state.notice, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 16.dp))
+                    ZcodeTimeline(state, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
+                    ChatSettingsBar(zcodeSettingsSummary(state), state.quotaSummary,
+                        { showSettings = true }, { showSettings = true; vm.quota() })
+                    ChatComposer(state.draft, vm::draft, state.sending,
+                        state.connected && !state.busy && !state.pending && !state.sending && state.draft.isNotBlank() && state.selection != null,
+                        state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send)
+                    if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false },
+                        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+                        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text("计划与模型", style = MaterialTheme.typography.titleLarge)
+                            ZcodeControls(state, vm)
+                            Text("切换仅影响下次发送；会话当前使用的模型不变。", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("新会话默认完全访问（Full access）。", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                     }
                 }
             }
         }
+        else -> pages.SaveableStateProvider("tab:0") { WorkspaceListPage(engine = "zcode", onEngine = { codex.engine(it) },
+            sessions = state.sessions.map { it.workspace(state.projects, state.connected && state.sessionsFresh, state.liveStatuses) },
+            connected = state.connected, busy = state.busy,
+            canCreate = state.connected && !state.busy && !state.pending, canOpen = state.connected && !state.busy,
+            open = { id -> tab = 0; state.sessions.find { it.id == id }?.let(vm::open) }, create = { newSession = true },
+            reconnect = vm::connect, refresh = vm::refresh, addProject = vm::openBrowser,
+            error = state.error, dismissError = vm::dismissError, detail = { title, text -> detail = title to text },
+            selectTab = { tab = it }) {
+            if (pendingProtectionVisible(state.pending, state.commandInFlight)) {
+                Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                    Text("有一条提交尚待确认，请刷新查询。", color = MaterialTheme.colorScheme.error, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    if (state.pendingUnknown) TextButton({ unlock = true }, enabled = !state.busy) { Text("已核对会话，解除发送保护") }
+                }
+            }
+        } }
     }
     if (newSession) AlertDialog(onDismissRequest = { newSession = false }, title = { Text("选择项目") }, text = {
         Column(Modifier.verticalScroll(rememberScrollState())) {
@@ -175,7 +185,8 @@ private fun ZcodeControls(state: ZcodeState, vm: ZcodeViewModel) {
         Text("开发机已连接的计划 · 账号/团队切换后刷新", fontSize = 10.sp)
         if (provider != null && provider.guard != state.selectionGuard)
             Text("额度来源已变化，请重新选择计划", color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
-        Text(state.quota, Modifier.fillMaxWidth().clickable(enabled = enabled) { vm.quota() }.padding(vertical = 7.dp), fontSize = 11.sp)
+        Text(state.quota, Modifier.fillMaxWidth().clickable(enabled = enabled) { vm.quota() }.padding(vertical = 10.dp),
+            style = MaterialTheme.typography.bodySmall)
         if (state.currentSelection != null && state.currentSelection != selection)
             Text("会话当前：${state.currentSelection.model}；下次发送使用上方选择", fontSize = 10.sp)
     }

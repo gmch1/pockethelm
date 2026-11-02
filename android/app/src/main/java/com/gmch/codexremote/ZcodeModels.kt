@@ -62,17 +62,73 @@ fun zcodeItems(j: JSONObject) = j.optJSONArray("items").objects().map {
     }
     TimelineItem(it.getString("id"), kind, it.string("text"), status, it.string("commandId"))
 }
+// Start Plan uses raw token balances; Coding Plan uses rolling windows and percent used.
+private fun JSONObject.quotaNumber(key: String): Double? = (opt(key) as? Number)?.toDouble()
+    ?.takeIf { it.isFinite() && it >= 0 }
+private fun quotaNumberText(value: Double): String = java.text.DecimalFormat("#,##0.##",
+    java.text.DecimalFormatSymbols(java.util.Locale.US)).format(value)
+private fun quotaRemainingPercent(limit: JSONObject, start: Boolean): Double? = if (start) {
+    val total = limit.quotaNumber("number") ?: limit.quotaNumber("unit")
+    val remaining = limit.quotaNumber("remaining")
+    if (total != null && total > 0 && remaining != null) remaining / total * 100
+    else limit.quotaNumber("percentage")?.takeIf { it <= 1 }?.times(100)
+} else limit.quotaNumber("percentage")?.takeIf { it <= 100 }?.let { 100 - it }
+private fun quotaPercentText(value: Double) = java.text.DecimalFormat("0.#",
+    java.text.DecimalFormatSymbols(java.util.Locale.US)).format(value.coerceIn(0.0, 100.0)) + "%"
+
 fun zcodeQuota(j: JSONObject): String {
     val limits = j.optJSONArray("limits").objects()
-    if (limits.isEmpty()) return "服务端未返回额度窗口"
-    return limits.joinToString(" · ") { l ->
-        val window = when (l.optInt("unit")) {
-            3 -> "${l.optInt("number")} 小时"; 6 -> "${l.optInt("number")} 周"; else -> l.string("type", "额度")
-        }
-        when {
-            l.has("remaining") -> "$window 剩余 ${l.optDouble("remaining").toInt()}"
-            l.has("percentage") -> "$window 已用 ${l.optDouble("percentage").toInt()}%"
-            else -> "$window 暂无剩余值"
-        }
+    if (limits.isEmpty()) return when {
+        j.optBoolean("startPlanExpired") -> "Start Plan 已到期"
+        j.string("unavailableReason") == "no_plan" -> "当前账号暂无可用计划"
+        j.string("unavailableReason") == "not_authenticated" -> "请在开发机登录 ZCode 后重试"
+        j.string("unavailableReason") == "not_configured" -> "当前计划未连接，请在开发机检查"
+        j.string("unavailableReason") == "unavailable" -> "额度暂不可用，请重试"
+        else -> "服务端未返回额度窗口"
     }
+    val start = j.string("planKind") == "start-plan"
+    return limits.joinToString("\n\n") { l ->
+        val remaining = l.quotaNumber("remaining")
+        val used = l.quotaNumber("currentValue") ?: if (start) l.quotaNumber("usage") else null
+        // number/unit are time-window identifiers on Coding Plan, never totals.
+        val total = if (start) l.quotaNumber("number") ?: l.quotaNumber("unit") else null
+        val suffix = if (start) when (l.string("unitType")) {
+            "token" -> " Tokens"; "request" -> " 次"; else -> ""
+        } else ""
+        val percent = quotaRemainingPercent(l, start)
+        val title = if (start) {
+            val names = l.optJSONArray("usageDetails").objects().mapNotNull { detail ->
+                detail.string("displayName").ifBlank { detail.string("modelCode").removePrefix("model:") }
+                    .takeIf { it.isNotBlank() }
+            }.distinct().joinToString(" / ").ifBlank { "模型额度" }
+            names + when (l.string("period")) { "daily" -> " · 每日额度"; "one_time" -> " · 一次性额度"; else -> "" }
+        } else when (l.optInt("unit")) {
+            3 -> "${l.optInt("number")} 小时额度"; 6 -> "${l.optInt("number")} 周额度"
+            else -> "额度"
+        }
+        val balance = listOfNotNull(remaining?.let { "剩余 ${quotaNumberText(it)}$suffix" },
+            percent?.let { (if (remaining == null) "剩余 " else "") + quotaPercentText(it) }).joinToString(" · ")
+        val consumption = listOfNotNull(used?.let { "已用 ${quotaNumberText(it)}$suffix" },
+            total?.let { "总量 ${quotaNumberText(it)}$suffix" }).joinToString(" / ")
+        val reset = l.quotaNumber("nextResetTime")?.takeIf { it > 0 }?.let { value ->
+            runCatching { java.time.Instant.ofEpochMilli(value.toLong()).atZone(java.time.ZoneId.systemDefault())
+                .format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm")) }.getOrNull()
+        }?.let { time -> time + if (start) {
+            when (l.string("period")) { "daily" -> " 重置"; "one_time" -> " 到期"; else -> " 周期结束" }
+        } else " 重置" }
+        listOfNotNull(title, balance.ifBlank { "剩余量暂不可用" }, consumption.takeIf { it.isNotBlank() }, reset).joinToString("\n")
+    }
+}
+
+fun zcodeQuotaSummary(j: JSONObject, model: String): String {
+    val limits = j.optJSONArray("limits").objects()
+    val start = j.string("planKind") == "start-plan"
+    val limit = if (start) {
+        val matching = limits.filter { l -> l.optJSONArray("usageDetails").objects().any {
+            it.string("modelCode").removePrefix("model:").equals(model, ignoreCase = true)
+        } }
+        // Do not aggregate unrelated buckets, models, or expiry windows into one balance.
+        matching.singleOrNull()
+    } else limits.firstOrNull { it.optInt("unit") == 3 } ?: limits.firstOrNull()
+    return limit?.let { quotaRemainingPercent(it, start) }?.let { "剩余 ${quotaPercentText(it)}" } ?: "额度 ▾"
 }

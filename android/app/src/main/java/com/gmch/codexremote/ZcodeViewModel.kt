@@ -26,7 +26,7 @@ data class ZcodeState(
     val outgoing: List<OutgoingMessage> = emptyList(),
     val queue: List<QueuedMessage> = emptyList(), val phase: String = "", val executionId: String = "",
     val interactionCount: Int = 0, val draft: String = "", val delivery: String = "queue",
-    val quota: String = "点击读取额度", val pending: Boolean = false, val pendingUnknown: Boolean = false,
+    val quota: String = "点击读取额度", val quotaSummary: String = "额度 ▾", val pending: Boolean = false, val pendingUnknown: Boolean = false,
     val commandInFlight: Boolean = false,
     val notice: String = "", val beforeRow: Double? = null, val logEpoch: String = "", val revision: Long = 0,
     val permission: String = "", val currentSelection: ZSelection? = null,
@@ -288,8 +288,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val providers = zcodeProviders(catalog)
         val old = mutable.value.selection
         val chosen = old ?: ZSelection.parse(catalog.optJSONObject("preferred"))
+        val quotaValid = chosen == old && providers.find { it.id == chosen?.provider }?.guard == mutable.value.selectionGuard
         // Keep a stale explicit selection visible; never silently switch its billing source.
         mutable.update { it.copy(providers = providers, selection = chosen,
+            quota = if (quotaValid) it.quota else "点击读取额度", quotaSummary = if (quotaValid) it.quotaSummary else "额度 ▾",
             selectionGuard = it.selectionGuard.ifBlank { providers.find { p -> p.id == chosen?.provider }?.guard.orEmpty() }) }
     }
     private suspend fun loadProjects() {
@@ -378,7 +380,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun choose(selection: ZSelection) {
         if (mutable.value.busy || mutable.value.pending) return
-        mutable.update { it.copy(selection = selection, selectionGuard = it.providers.find { p -> p.id == selection.provider }?.guard.orEmpty(), quota = "点击读取额度", notice = "下次发送使用此计划和模型") }
+        mutable.update { it.copy(selection = selection, selectionGuard = it.providers.find { p -> p.id == selection.provider }?.guard.orEmpty(), quota = "点击读取额度", quotaSummary = "额度 ▾", notice = "下次发送使用此计划和模型") }
     }
     private fun selectionParams(): JSONObject {
         val choice = mutable.value.selection ?: error("请选择计划与模型")
@@ -388,10 +390,17 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         return obj("selection" to choice.json(), "guard" to mutable.value.selectionGuard)
     }
     fun quota() = action {
-        mutable.update { it.copy(quota = "正在读取…") }
-        try { val quota = zcodeQuota(call("quota", selectionParams())); mutable.update { it.copy(quota = quota) } }
+        val selected = mutable.value.selection
+        val guard = mutable.value.selectionGuard
+        val startGeneration = generation
+        fun stillSelected() = generation == startGeneration && mutable.value.selection == selected && mutable.value.selectionGuard == guard
+        mutable.update { it.copy(quota = "正在读取…", quotaSummary = "额度 ▾") }
+        try {
+            val data = call("quota", selectionParams())
+            if (stillSelected()) mutable.update { it.copy(quota = zcodeQuota(data), quotaSummary = zcodeQuotaSummary(data, selected?.model.orEmpty())) }
+        }
         catch (e: CancellationException) { throw e }
-        catch (e: Exception) { mutable.update { it.copy(quota = "额度暂不可用，请重试") } }
+        catch (e: Exception) { if (stillSelected()) mutable.update { it.copy(quota = "额度暂不可用，请重试", quotaSummary = "额度 ▾") } }
     }
     fun create(project: ZProject) = action {
         check(project.roots.size == 1) { "当前仅支持单目录项目" }
@@ -434,6 +443,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         older = emptyList()
         val outKey = outgoingKey(session.id)
         mutable.update { it.copy(selected = session, historyCached = false, items = emptyList(), queue = emptyList(), phase = "", executionId = "",
+            quota = "点击读取额度", quotaSummary = "额度 ▾",
             historyLoading = true, historyError = null, sending = false,
             outgoing = (outgoingBySession[outKey] ?: emptyList()).toList(),
             draft = vault.get(key("draft", session.id)).orEmpty(), beforeRow = null, notice = "", currentSelection = null, permission = "") }

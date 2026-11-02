@@ -29,6 +29,47 @@ class ZcodeModelsTest {
         assertTrue(zcodeQuota(JSONObject("""{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"remaining":547}]}""")).contains("剩余 547"))
         assertFalse(zcodeQuota(JSONObject("""{"limits":[{"type":"UNKNOWN"}]}""")).contains("剩余 0"))
     }
+    @Test fun freePlanUsesTokenBalancesAndRemainingRatio() {
+        val data = JSONObject("""{"planKind":"start-plan","limits":[{"unit":5000000000,"number":5000000000,
+            "remaining":2250000000,"usage":2750000000,"currentValue":2750000000,"percentage":0.45,
+            "unitType":"token","period":"one_time","nextResetTime":1793581200000,
+            "usageDetails":[{"modelCode":"glm-flash","displayName":"GLM Flash"}]}]}""")
+        val text = zcodeQuota(data)
+        assertTrue(text.contains("GLM Flash · 一次性额度"))
+        assertTrue(text.contains("剩余 2,250,000,000 Tokens · 45%"))
+        assertTrue(text.contains("已用 2,750,000,000 Tokens / 总量 5,000,000,000 Tokens"))
+        assertTrue(text.contains("到期"))
+        assertFalse(text.contains("小时"))
+        assertEquals("剩余 45%", zcodeQuotaSummary(data, "GLM-Flash"))
+        assertEquals("额度 ▾", zcodeQuotaSummary(data, "other-model"))
+    }
+    @Test fun paidPercentageMeansUsedAndNumberMeansWindowNotTotal() {
+        val data = JSONObject("""{"planKind":"individual-coding-plan","limits":[{"unit":3,"number":5,
+            "percentage":30,"currentValue":21,"usage":70}]}""")
+        assertEquals("5 小时额度\n剩余 70%\n已用 21", zcodeQuota(data))
+        assertEquals("剩余 70%", zcodeQuotaSummary(data, "model"))
+    }
+    @Test fun unknownQuotaNeverInventsZeroAndRealZeroRemainsVisible() {
+        val data = JSONObject("""{"planKind":"start-plan","limits":[{"remaining":null,"currentValue":"bad",
+            "percentage":null},{"remaining":0,"currentValue":10,"number":10,"unitType":"token"}]}""")
+        val text = zcodeQuota(data).split("\n\n")
+        assertTrue(text[0].contains("剩余量暂不可用"))
+        assertFalse(text[0].contains("剩余 0"))
+        assertTrue(text[1].contains("剩余 0 Tokens · 0%"))
+        assertEquals("Start Plan 已到期", zcodeQuota(JSONObject("""{"startPlanExpired":true,"limits":[]}""")))
+    }
+    @Test fun multipleBucketsRemainSeparateAndDailyQuotaResets() {
+        val data = JSONObject("""{"planKind":"start-plan","limits":[
+            {"number":3,"remaining":1.5,"period":"daily","nextResetTime":1793581200000,
+             "usageDetails":[{"modelCode":"m","displayName":"每日"}]},
+            {"number":6,"remaining":4,"usageDetails":[{"modelCode":"m","displayName":"赠送"}]}]}""")
+        val text = zcodeQuota(data)
+        assertTrue(text.contains("每日 · 每日额度"))
+        assertTrue(text.contains("剩余 1.5 · 50%"))
+        assertTrue(text.contains("重置"))
+        assertTrue(text.contains("赠送\n剩余 4"))
+        assertEquals("额度 ▾", zcodeQuotaSummary(data, "m"))
+    }
     @Test fun sessionListOrdersByMostRecentActivity() {
         val data = JSONObject("""{"sessions":[
           {"taskId":"a","title":"旧","updatedAt":1700000000},

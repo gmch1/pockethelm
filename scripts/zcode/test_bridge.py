@@ -9,12 +9,72 @@ import zlib
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).parent))
-from bridge import Assembler, Bridge, RequestError, guard_for, project_rows
+from bridge import Assembler, Bridge, RequestError, guard_for, project_rows, project_quota
 from wire import Client, WireError, decode, encode
 from install import dispatcher
 
 
 class BridgeTests(unittest.TestCase):
+    def quota_bridge(self, kind):
+        bridge = Bridge(Mock()); bridge.client_id = 'test'
+        chosen = {'providerId': 'account:bigmodel-' + kind, 'modelId': 'model'}
+        bridge.check_selection = Mock(return_value=chosen)
+        view = {'providers': [{'providerId': chosen['providerId'], 'config': {'access': {
+            'type': 'zhipu-account', 'accountType': 'bigmodel', 'mode': kind}}}]}
+        return bridge, view, chosen
+
+    def test_start_plan_uses_bound_entitlement_without_account_data(self):
+        bridge, view, chosen = self.quota_bridge('start-plan')
+        bridge.call = Mock(side_effect=[view, {'quota': {'limits': [{'number': 1000,
+            'remaining': 750, 'currentValue': 250, 'period': 'one_time', 'unitType': 'token',
+            'bucketId': 'SECRET', 'userPlanId': 'SECRET',
+            'usageDetails': [{'modelCode': 'model', 'displayName': 'Model', 'secret': 'SECRET'}]}]},
+            'subscription': {'identityMasked': 'SECRET'}}])
+        result = bridge.dispatch('quota', {})
+        self.assertEqual(bridge.call.call_args.args[:2], ('usage-stats', 'getEntitlementSnapshot'))
+        request = bridge.call.call_args.args[2]
+        self.assertEqual(request['accountAccess'], {'type': 'zhipu-account', 'family': 'bigmodel', 'planKind': 'start-plan'})
+        self.assertEqual(request['preferredProviderId'], chosen['providerId'])
+        self.assertTrue(request['requirePreferredProvider'])
+        self.assertFalse(request['allowEnvApiKey'])
+        self.assertNotIn('range', request)
+        self.assertEqual(bridge.check_selection.call_count, 2)
+        self.assertEqual(result['planKind'], 'start-plan')
+        self.assertEqual(result['limits'][0]['remaining'], 750)
+        self.assertEqual(result['limits'][0]['usageDetails'], [{'modelCode': 'model', 'displayName': 'Model'}])
+        self.assertNotIn('SECRET', json.dumps(result))
+
+    def test_paid_quota_keeps_monitor_and_team_scope(self):
+        for kind in ('individual-coding-plan', 'team-coding-plan'):
+            bridge, view, chosen = self.quota_bridge(kind)
+            team = {'kind': kind, 'productId': 'product', 'organizationId': 'org', 'projectId': 'project'}
+            responses = [view]
+            if kind == 'team-coding-plan':
+                responses.append({'providerFamilyConnectionSelections': {'bigmodel': team}})
+            responses.append({'quota': {'limits': [{'unit': 3, 'number': 5, 'remaining': 8}]}})
+            bridge.call = Mock(side_effect=responses)
+            result = bridge.dispatch('quota', {})
+            self.assertEqual(bridge.call.call_args.args[:2], ('usage-stats', 'getCodingPlanUsageSnapshot'))
+            account = bridge.call.call_args.args[2]['accountAccess']
+            self.assertEqual(account['planKind'], kind)
+            if kind == 'team-coding-plan':
+                self.assertEqual(account['projectId'], 'project')
+            self.assertEqual(result['limits'][0]['number'], 5)
+
+    def test_quota_changed_account_rejects_completed_response(self):
+        bridge, view, _ = self.quota_bridge('start-plan')
+        bridge.check_selection.side_effect = [bridge.check_selection.return_value, RequestError('changed')]
+        bridge.call = Mock(side_effect=[view, {'quota': {'limits': []}}])
+        with self.assertRaises(RequestError):
+            bridge.dispatch('quota', {})
+
+    def test_quota_missing_invalid_and_expired_are_not_zero(self):
+        result = project_quota({'quota': {'limits': [None, {'remaining': None, 'usage': True,
+            'number': float('inf'), 'currentValue': -1, 'percentage': 'bad', 'usageDetails': [None]}]}}, 'start-plan')
+        self.assertEqual(result['limits'], [{'usageDetails': []}])
+        self.assertEqual(project_quota({'quota': None, 'unavailableReason': 'no_plan', 'startPlanExpired': True}, 'start-plan'),
+            {'planKind': 'start-plan', 'limits': [], 'unavailableReason': 'no_plan', 'startPlanExpired': True})
+
     def test_wire_roundtrip_including_bool_null_unicode(self):
         for value in [None, False, True, [100, 1, '频道', 'method'], {'text': '中文\n', 'bool': True}]:
             self.assertEqual(decode(io.BytesIO(encode(value))), value)

@@ -71,23 +71,30 @@ internal fun RemoteApp(vm: RemoteViewModel) {
     val pages = rememberSaveableStateHolder()
     val chat = state.selected != null && state.tab == 0
     BackHandler(chat) { vm.back() }
-    WorkspaceScaffold(
-        title = if (chat) state.selected!!.title else listOf("会话", "任务中心", "连接")[state.tab],
-        subtitle = if (chat) state.selected!!.project else state.profile.name,
-        chat = chat, tab = state.tab, busy = state.busy, back = vm::back, refresh = vm::refresh, selectTab = vm::tab,
-        actions = { if (chat) IconButton({ rename = true }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Edit, "重命名") } }
-    ) {
-        WorkspaceError(state.error, vm::dismissError) { title, text -> details = title to text }
-            pages.SaveableStateProvider("${state.profile.resumeIdentity}:${if (chat) "chat:${state.selected!!.id}" else "tab:${state.tab}"}") {
-            when {
-                chat -> key(state.selected!!.id) {
+    pages.SaveableStateProvider("${state.profile.resumeIdentity}:${if (chat) "chat:${state.selected!!.id}" else "tab:${if (state.tab == 2) 2 else 0}"}") {
+        when {
+            chat -> key(state.selected!!.id) {
+                WorkspaceScaffold(title = state.selected!!.title, subtitle = state.selected!!.project, chat = true,
+                    busy = state.busy, back = vm::back, refresh = vm::refresh,
+                    actions = { IconButton({ rename = true }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Edit, "重命名") } }) {
+                    WorkspaceError(state.error, vm::dismissError) { title, text -> details = title to text }
                     ChatScreen(state, vm) { title, text -> details = title to text }
                 }
-                state.tab == 0 -> SessionScreen(state, vm) { newThread = true }
-                state.tab == 1 -> TasksScreen(state, vm) { newThread = true }
-                else -> ConnectionScreen(state, vm)
             }
+            state.tab == 2 -> WorkspaceScaffold("连接", tab = state.tab, busy = state.busy, refresh = vm::refresh, selectTab = vm::tab,
+                engine = "codex" to { vm.engine(it) }) {
+                WorkspaceError(state.error, vm::dismissError) { title, text -> details = title to text }
+                ConnectionScreen(state, vm)
             }
+            else -> WorkspaceListPage(engine = "codex", onEngine = { vm.engine(it) },
+                sessions = state.sessions.map { it.workspace(state.sessionsCached || !state.connected) },
+                connected = state.connected, busy = state.busy,
+                canCreate = state.connected && !state.busy, canOpen = state.connected && !state.busy,
+                open = { id -> state.sessions.find { it.id == id }?.let(vm::openThread) }, create = { newThread = true },
+                reconnect = vm::connect, refresh = vm::refresh, addProject = null,
+                error = state.error, dismissError = vm::dismissError, detail = { title, text -> details = title to text },
+                selectTab = vm::tab, more = state.cursor?.takeIf { it.isNotBlank() }?.let { { vm.moreSessions(); Unit } })
+        }
     }
     if (newThread) NewThreadDialog(state, onClose = { newThread = false }) { cwd, title -> newThread = false; vm.createThread(cwd, title) }
     if (rename) {
@@ -121,22 +128,6 @@ internal fun HostTrustDialog(state: UiState, vm: RemoteViewModel) {
             } }, confirmButton = { if (!challenge.changed) TextButton(onClick = vm::trustHost) { Text("指纹一致，保存并连接") } },
             dismissButton = { TextButton(onClick = vm::cancelTrust) { Text("取消") } })
     }
-}
-
-@Composable
-private fun SessionScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit) {
-    WorkspaceSessions(state.sessions.map { it.workspace() }, state.connected, state.busy, state.sessionsCached,
-        state.profile.name, state.error, state.connected && !state.busy,
-        open = { id -> state.sessions.find { it.id == id }?.let(vm::openThread) }, create = onNew,
-        connection = { vm.tab(2) }, refresh = vm::refresh, more = if (state.cursor != null) ({ vm.moreSessions(); Unit }) else null)
-}
-
-@Composable
-private fun TasksScreen(state: UiState, vm: RemoteViewModel, onNew: () -> Unit) {
-    WorkspaceSessions(state.sessions.map { it.workspace() }, state.connected, state.busy, state.sessionsCached,
-        state.profile.name, state.error, state.connected && !state.busy,
-        open = { id -> state.sessions.find { it.id == id }?.let(vm::openThread) }, create = onNew,
-        connection = { vm.tab(2) }, refresh = vm::refresh, more = if (state.cursor != null) ({ vm.moreSessions(); Unit }) else null, tasks = true)
 }
 
 @Composable

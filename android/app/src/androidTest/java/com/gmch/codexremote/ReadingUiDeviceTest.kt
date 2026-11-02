@@ -40,10 +40,19 @@ class ReadingUiDeviceTest {
         assertTrue("Expected UI state was not reached", predicate())
     }
     private fun click(text: String) {
+        await { matching(text).isNotEmpty() }
         var node: AccessibilityNodeInfo? = matching(text).first()
         while (node != null && !node.isClickable) node = node.parent
         assertNotNull("No clickable node for $text", node)
         assertTrue(node!!.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+    }
+
+    private fun captureList(name: String) {
+        val bitmap = instrumentation.uiAutomation.takeScreenshot()
+        val folder = java.io.File(instrumentation.targetContext.cacheDir, "list-review").apply { mkdirs() }
+        try { java.io.File(folder, "$name.png").outputStream().use {
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+        } } finally { bitmap.recycle() }
     }
 
     private fun tabSelected(label: String): Boolean {
@@ -54,6 +63,17 @@ class ReadingUiDeviceTest {
             node = node.parent
         }
         return false
+    }
+
+    private fun deliveryMode(): String? {
+        // Compose exposes the content description as a virtual child; the button
+        // ancestor owns its state description and click action.
+        var node = matching("发送方式").firstOrNull()
+        while (node != null) {
+            node.stateDescription?.toString()?.let { return it }
+            node = node.parent
+        }
+        return null
     }
     private fun touch(node: AccessibilityNodeInfo) {
         val rect = android.graphics.Rect().also { node.getBoundsInScreen(it) }
@@ -67,7 +87,7 @@ class ReadingUiDeviceTest {
         }
     }
 
-    @Test fun deliveryTabsKeepKeyboardFocusSelectionAndDraftWhileTyping() {
+    @Test fun deliveryToggleKeepsKeyboardFocusSelectionAndDraftWhileTyping() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             val inserted = java.util.concurrent.atomic.AtomicBoolean(false)
             val sends = java.util.concurrent.atomic.AtomicInteger(0)
@@ -99,11 +119,13 @@ class ReadingUiDeviceTest {
             assertTrue(editor().performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selection))
             await { editor().textSelectionStart == 2 && editor().textSelectionEnd == 4 }
             val before = android.graphics.Rect().also { editor().getBoundsInScreen(it) }
+            captureList("composer-queue")
             for (label in listOf("插入", "排队", "插入", "排队")) {
-                var target: AccessibilityNodeInfo? = matching(label).first { it.text?.toString() == label }
+                var target: AccessibilityNodeInfo? = matching("发送方式").first()
                 while (target != null && !target.isClickable) target = target.parent
                 touch(target!!)
-                await { inserted.get() == (label == "插入") && tabSelected(label) }
+                await { inserted.get() == (label == "插入") && deliveryMode() == label }
+                assertTrue(matching(if (label == "插入") "排队" else "插入").isEmpty())
                 // Observe the animation interval as well as the final state; a hide/show flash fails.
                 repeat(6) {
                     assertTrue("Keyboard must stay open", keyboardVisible())
@@ -114,6 +136,7 @@ class ReadingUiDeviceTest {
                     assertEquals(before, android.graphics.Rect().also { field.getBoundsInScreen(it) })
                     Thread.sleep(60)
                 }
+                if (label == "插入") captureList("composer-insert")
             }
             instrumentation.sendStringSync("X")
             await { editor().text?.toString() == "任务Xcdef" }
@@ -209,19 +232,36 @@ class ReadingUiDeviceTest {
                 }
                 await { matching("Codex草稿").isNotEmpty() }
                 val send = bounds("发送消息"); val back = bounds("返回会话"); val question = bounds("选择要跳转的消息")
-                click("ZCode")
+                fun assertChatToolbar() {
+                    val bottom = bounds("返回会话").bottom
+                    assertFalse(nodes().any { node -> node.isVisibleToUser &&
+                        node.text?.toString() in listOf("Codex", "ZCode") &&
+                        android.graphics.Rect().also { node.getBoundsInScreen(it) }.top < bottom })
+                    assertTrue(matching("刷新").isNotEmpty())
+                }
+                assertChatToolbar()
+                assertTrue(matching("重命名").isNotEmpty())
+                captureList("codex-chat-toolbar")
+                // Chat deliberately has no engine tabs. Switch the fixture's engine
+                // directly here to compare retained chat states; list tabs are tested separately.
+                scenario.onActivity { c.engine("zcode") }
                 await { matching("ZCode草稿").isNotEmpty() }
+                assertChatToolbar()
+                captureList("zcode-chat-toolbar")
                 assertEquals(send, bounds("发送消息")); assertEquals(back, bounds("返回会话"))
                 assertEquals(question, bounds("选择要跳转的消息"))
-                click("插入")
+                click("发送方式")
                 await { z.state.value.delivery == "guide" }
-                await { tabSelected("插入") }; assertFalse(tabSelected("排队"))
-                click("Codex")
+                await { deliveryMode() == "插入" }
+                assertTrue(matching("排队").isEmpty())
+                scenario.onActivity { c.engine("codex") }
                 await { matching("Codex草稿").isNotEmpty() }
-                await { tabSelected("排队") }; assertFalse(tabSelected("插入"))
-                click("ZCode")
+                await { deliveryMode() == "排队" }
+                assertTrue(matching("插入").isEmpty())
+                scenario.onActivity { c.engine("zcode") }
                 await { matching("ZCode草稿").isNotEmpty() }
-                await { tabSelected("插入") }; assertFalse(tabSelected("排队"))
+                await { deliveryMode() == "插入" }
+                assertTrue(matching("排队").isEmpty())
                 assertFalse(z.state.value.busy)
                 // Shared connection UI must act on the selected engine, not the other channel.
                 scenario.onActivity {
@@ -235,6 +275,18 @@ class ReadingUiDeviceTest {
                 click("断开连接")
                 await { matching("ZCode · 未连接").isNotEmpty() }
                 assertFalse(z.state.value.connected); assertTrue(c.state.value.connected)
+                click("Codex")
+                await { matching("返回会话").isNotEmpty() }
+                click("返回会话")
+                await { matching("新建会话").isNotEmpty() }
+                assertTrue(matching("任务").isEmpty())
+                click("连接")
+                await {
+                    var node = nodes().firstOrNull { it.contentDescription?.toString() == "连接" }
+                    var selected = false
+                    while (node != null) { selected = selected || node.isSelected; node = node.parent }
+                    selected
+                }
             }
         } finally {
             instrumentation.runOnMainSync { c.viewModelScope.cancel(); z.viewModelScope.cancel() }
@@ -244,7 +296,63 @@ class ReadingUiDeviceTest {
         }
     }
 
-    @Test fun zcodeTaskPageCreatesIntoChatUsingCompactAccessibleEntry() {
+    @Test fun startPlanQuotaLoadsAndClearsWhenSwitchingPlan() {
+        val app = TestPrefsApp(java.util.UUID.randomUUID().toString()).apply { attach(instrumentation.targetContext) }
+        lateinit var c: RemoteViewModel
+        lateinit var z: ZcodeViewModel
+        fun field(vm: Any, name: String) = vm.javaClass.getDeclaredField(name).apply { isAccessible = true }
+        instrumentation.runOnMainSync { c = RemoteViewModel(app); z = ZcodeViewModel(app) }
+        kotlinx.coroutines.runBlocking {
+            (field(c, "restoreJob").get(c) as kotlinx.coroutines.Job).join()
+            (field(z, "restoreJob").get(z) as kotlinx.coroutines.Job).join()
+        }
+        val bridge = FakeRpcBridge(z).also { it.install() }
+        bridge.scripted["session/read"] = { obj("title" to "额度显示验证", "phase" to "idle", "items" to org.json.JSONArray()) }
+        bridge.scripted["quota"] = { request ->
+            if (request.getJSONObject("params").getJSONObject("selection").getString("providerId") == "free")
+                org.json.JSONObject("""{"planKind":"start-plan","limits":[{"number":500000000,"unit":500000000,
+                    "remaining":225000000,"currentValue":275000000,"unitType":"token","period":"one_time",
+                    "nextResetTime":1793581200000,"usageDetails":[{"modelCode":"glm-flash","displayName":"GLM Flash"}]}]}""")
+            else org.json.JSONObject("""{"planKind":"individual-coding-plan","limits":[{"unit":3,"number":5,"percentage":30}]}""")
+        }
+        try {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.onActivity { activity ->
+                    @Suppress("UNCHECKED_CAST")
+                    (field(c, "mutable").get(c) as kotlinx.coroutines.flow.MutableStateFlow<UiState>).value = UiState(engine = "zcode", saved = false)
+                    @Suppress("UNCHECKED_CAST")
+                    (field(z, "mutable").get(z) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState>).value = ZcodeState(
+                        connected = true, selected = ZSession("z", "额度显示验证", "/work"), phase = "idle",
+                        providers = listOf(ZProvider("free", "免费计划", "start-plan", "free-guard", listOf(ZModel("glm-flash", emptyList()))),
+                            ZProvider("paid", "付费计划", "individual-coding-plan", "paid-guard", listOf(ZModel("glm", emptyList())))),
+                        selection = ZSelection("free", "glm-flash"), selectionGuard = "free-guard")
+                    field(z, "historySyncedAt").set(z, System.currentTimeMillis())
+                    activity.setContent { PocketHelmTheme { EngineApp(c, z) } }
+                }
+                click("额度 ▾")
+                await { matching("剩余 225,000,000 Tokens · 45%").isNotEmpty() }
+                assertTrue(matching("已用 275,000,000 Tokens / 总量 500,000,000 Tokens").isNotEmpty())
+                assertTrue(matching("一次性额度").isNotEmpty())
+                assertTrue(matching("到期").isNotEmpty())
+                assertEquals("剩余 45%", z.state.value.quotaSummary)
+                captureList("start-plan-quota")
+                click("Start Plan")
+                click("付费计划")
+                await { matching("点击读取额度").isNotEmpty() }
+                assertTrue(matching("225,000,000").isEmpty())
+                assertEquals("额度 ▾", z.state.value.quotaSummary)
+                click("点击读取额度")
+                await { matching("5 小时额度").isNotEmpty() && matching("剩余 70%").isNotEmpty() }
+                assertEquals("剩余 70%", z.state.value.quotaSummary)
+            }
+        } finally {
+            instrumentation.runOnMainSync { c.viewModelScope.cancel(); z.viewModelScope.cancel() }
+            bridge.close(); bridge.assertClean(); app.noBackupFilesDir.deleteRecursively()
+            instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault")
+        }
+    }
+
+    @Test fun mergedSessionPageCreatesAndPreservesProjectFilter() {
         val app = TestPrefsApp(java.util.UUID.randomUUID().toString()).apply { attach(instrumentation.targetContext) }
         lateinit var c: RemoteViewModel
         lateinit var z: ZcodeViewModel
@@ -258,8 +366,13 @@ class ReadingUiDeviceTest {
         val bridge = FakeRpcBridge(z).also { it.install() }
         bridge.scripted["session/create"] = { creates.incrementAndGet(); obj("status" to "accepted", "result" to obj("sessionId" to "new")) }
         bridge.scripted["session/read"] = { obj("title" to "新建测试会话", "phase" to "draft", "items" to org.json.JSONArray()) }
-        bridge.scripted["projects"] = { obj("projects" to org.json.JSONArray(), "sessions" to org.json.JSONArray()
-            .put(obj("taskId" to "new", "title" to "新建测试会话", "workspacePath" to "/work"))) }
+        bridge.scripted["projects"] = { obj("projects" to org.json.JSONArray()
+            .put(obj("id" to "p", "name" to "合成项目", "roots" to org.json.JSONArray().put("/work")))
+            .put(obj("id" to "q", "name" to "其他项目", "roots" to org.json.JSONArray().put("/other"))),
+            "sessions" to org.json.JSONArray()
+                .put(obj("taskId" to "new", "title" to "新建测试会话", "workspacePath" to "/work", "projectId" to "p"))
+                .put(obj("taskId" to "old", "title" to "已有会话", "workspacePath" to "/work", "projectId" to "p"))
+                .put(obj("taskId" to "other", "title" to "其他会话", "workspacePath" to "/other", "projectId" to "q"))) }
         try {
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 scenario.onActivity { activity ->
@@ -267,7 +380,10 @@ class ReadingUiDeviceTest {
                     (field(c, "mutable").get(c) as kotlinx.coroutines.flow.MutableStateFlow<UiState>).value = UiState(engine = "zcode", saved = false)
                     @Suppress("UNCHECKED_CAST")
                     (field(z, "mutable").get(z) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState>).value = ZcodeState(
-                        connected = true, sessionsFresh = true, projects = listOf(ZProject("p", "合成项目", listOf("/work"))),
+                        connected = true, sessionsFresh = true,
+                        projects = listOf(ZProject("p", "合成项目", listOf("/work")), ZProject("q", "其他项目", listOf("/other"))),
+                        sessions = listOf(ZSession("old", "已有会话", "/work", project = "p"),
+                            ZSession("other", "其他会话", "/other", project = "q")),
                         providers = listOf(ZProvider("p", "计划", "subscription", "guard", listOf(ZModel("m", emptyList())))),
                         selection = ZSelection("p", "m"), selectionGuard = "guard")
                     field(z, "listSyncedAt").set(z, System.currentTimeMillis())
@@ -275,20 +391,99 @@ class ReadingUiDeviceTest {
                 }
                 await { nodes().any { it.isVisibleToUser && it.contentDescription?.toString() == "新建会话" } }
                 // Icons remain accessible, without adding visible bottom-nav text.
-                assertFalse(nodes().any { it.isVisibleToUser && it.text?.toString() == "任务" })
-                click("任务")
-                await { matching("任务中心").isNotEmpty() }
+                assertFalse(nodes().any { it.isVisibleToUser && it.text?.toString() == "会话" })
+                assertTrue(matching("任务").isEmpty())
+                assertTrue(nodes().any { it.isVisibleToUser && it.contentDescription?.toString() == "会话" })
+                assertTrue(matching("连接").isNotEmpty())
+                await { matching("2 个会话").isNotEmpty() }
+                captureList("merged-sessions")
+                click("筛选项目")
+                await { matching("关闭项目列表").isNotEmpty() }
+                click("合成项目")
+                await { matching("1 个会话").isNotEmpty() }
                 click("新建会话")
-                await { matching("合成项目").isNotEmpty() }
+                await { matching("取消").isNotEmpty() && matching("新会话默认完全访问").isNotEmpty() }
                 click("合成项目")
                 await { z.state.value.selected?.id == "new" && matching("发送消息").isNotEmpty() }
                 assertEquals(1, creates.get())
-                assertFalse(matching("任务中心").isNotEmpty())
+                // The chat page replaces the two-row list header entirely.
+                assertFalse(matching("个会话").isNotEmpty())
+                click("返回会话")
+                // One list owns the filter across creation, chat and connection navigation.
+                await { matching("2 个会话").isNotEmpty() }
+                assertTrue(matching("其他会话").isEmpty())
+                click("连接")
+                await { matching("ZCode · 已连接").isNotEmpty() }
+                click("会话")
+                await { matching("2 个会话").isNotEmpty() }
             }
         } finally {
             instrumentation.runOnMainSync { c.viewModelScope.cancel(); z.viewModelScope.cancel() }
             bridge.close(); bridge.assertClean(); app.noBackupFilesDir.deleteRecursively()
             instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault")
+        }
+    }
+
+    @Test fun listMenuSortAndSearchReturnToTopAndProjectSheetScrolls() {
+        val added = java.util.concurrent.atomic.AtomicBoolean(false)
+        val data = (0 until 35).map { i -> WorkspaceSession("s$i", "测试会话%02d".format(i),
+            "/test/project%02d".format(i), "项目%02d".format(i), if (i % 2 == 0) "执行中" else "已完成", 1000L + i) }
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity -> activity.setContent {
+                PocketHelmTheme {
+                    var engine by remember { mutableStateOf("codex") }
+                    Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+                        WorkspaceListPage(engine, { require(it in setOf("codex", "zcode")); engine = it },
+                            data, connected = true, busy = false, canCreate = true, canOpen = true,
+                            open = {}, create = {}, reconnect = {}, refresh = {}, addProject = { added.set(true) },
+                            error = null, dismissError = {}, detail = { _, _ -> }, selectTab = {})
+                    }
+                }
+            } }
+            await { matching("测试会话34").isNotEmpty() }
+            captureList("list")
+            assertTrue(tabSelected("Codex")); assertFalse(tabSelected("ZCode"))
+            click("ZCode")
+            await { tabSelected("ZCode") }; assertFalse(tabSelected("Codex"))
+            fun scroll(): Boolean {
+                val scroller = nodes().lastOrNull { node -> node.isVisibleToUser && node.isScrollable &&
+                    node.actionList.any { it.id == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD } }
+                val moved = scroller?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) == true
+                instrumentation.waitForIdleSync()
+                return moved
+            }
+            repeat(3) { assertTrue(scroll()); Thread.sleep(350) }
+            await { matching("测试会话34").isEmpty() }
+            click("列表菜单"); await { matching("较早活动优先").isNotEmpty() }; click("较早活动优先")
+            await { matching("测试会话00").isNotEmpty() }
+            repeat(2) { assertTrue(scroll()); Thread.sleep(350) }
+            click("搜索会话")
+            await { nodes().any { it.isEditable && it.isFocused } }
+            val editor = nodes().first { it.isEditable && it.isVisibleToUser }
+            assertTrue(editor.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, android.os.Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "会话34")
+            }))
+            assertTrue(editor.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id))
+            await { matching("1 个会话").isNotEmpty() && matching("测试会话34").isNotEmpty() }
+            captureList("search")
+            click("退出搜索")
+            await { matching("35 个会话").isNotEmpty() }
+            click("筛选项目")
+            await { matching("关闭项目列表").isNotEmpty() && matching("添加项目").isNotEmpty() }
+            Thread.sleep(350) // Capture the settled sheet, not its entrance animation.
+            captureList("projects")
+            // Long lists must scroll while the add action stays reachable.
+            assertTrue(matching("添加项目").isNotEmpty())
+            for (attempt in 0 until 20) {
+                // Accessibility removes the forward action at the boundary before
+                // its next tree snapshot exposes the final row. Verify that row below.
+                if (matching("项目34").isNotEmpty() || !scroll()) break
+                Thread.sleep(350)
+            }
+            await { matching("项目34").isNotEmpty() }
+            captureList("projects-end")
+            click("添加项目")
+            await { added.get() && matching("关闭项目列表").isEmpty() }
         }
     }
 

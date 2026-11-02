@@ -39,6 +39,34 @@ def pick(source, keys):
     return {key: source[key] for key in keys if key in source}
 
 
+def project_quota(data, kind):
+    # Export display fields only; subscription, account and bucket identities stay on host.
+    quota = data.get('quota')
+    result = {'planKind': kind, 'limits': []}
+    reason = data.get('unavailableReason')
+    if reason in ('not_authenticated', 'not_configured', 'no_plan', 'unavailable'):
+        result['unavailableReason'] = reason
+    if data.get('startPlanExpired') is True:
+        result['startPlanExpired'] = True
+    if not isinstance(quota, dict):
+        return result
+    limits = quota.get('limits')
+    for limit in limits if isinstance(limits, list) else []:
+        if not isinstance(limit, dict):
+            continue
+        item = {k: v for k, v in pick(limit, ['unit', 'number', 'usage', 'currentValue',
+            'remaining', 'percentage', 'nextResetTime']).items()
+            if type(v) in (int, float) and math.isfinite(v) and v >= 0}
+        item.update({k: v[:160] for k, v in pick(limit, ['type', 'period', 'unitType']).items()
+            if isinstance(v, str)})
+        details = limit.get('usageDetails')
+        item['usageDetails'] = [{k: v[:160] for k, v in pick(detail, ['modelCode', 'displayName']).items()
+            if isinstance(v, str)} for detail in (details if isinstance(details, list) else [])
+            if isinstance(detail, dict)]
+        result['limits'].append(item)
+    return result
+
+
 def selection(source):
     require(isinstance(source, dict) and set(source) <= {'providerId', 'modelId', 'options'}, '模型配置无效')
     result = {k: string(source.get(k)) for k in ('providerId', 'modelId')}
@@ -339,10 +367,11 @@ class Bridge:
             return {'ack': pick(result, ['commandId', 'status', 'reasonCode', 'result']) if isinstance(result, dict) else result}
         if method == 'quota':
             chosen = self.check_selection(params)
-            require('coding-plan' in chosen['providerId'], '该来源暂未提供可读取的额度')
             view = self.call('model-selection', 'getView')
             provider = next(p for p in view['providers'] if p['providerId'] == chosen['providerId'])
             access = provider.get('config', {}).get('access', {})
+            kind = access.get('mode', '')
+            require(kind == 'start-plan' or 'coding-plan' in chosen['providerId'], '该来源暂未提供可读取的额度')
             request = {'preferredProviderId': chosen['providerId'], 'range': 'today', 'timeZone': 'Asia/Shanghai'}
             if access.get('type') == 'zhipu-account':
                 account = {'type': 'zhipu-account', 'family': access['accountType'], 'planKind': access['mode']}
@@ -352,13 +381,17 @@ class Bridge:
                     require(team.get('kind') == 'team-coding-plan', '团队计划已变化，请刷新')
                     account.update({k: string(team.get(k)) for k in ('productId', 'organizationId', 'projectId')})
                 request['accountAccess'] = account
-            data = self.call('usage-stats', 'getCodingPlanUsageSnapshot', request)
+            if kind == 'start-plan':
+                require(access.get('type') == 'zhipu-account', '该来源暂未提供可读取的额度')
+                request.pop('range')
+                request.pop('timeZone')
+                request.update(includeSubscription=True, requirePreferredProvider=True,
+                    allowDisabledPreferredProvider=True, allowEnvApiKey=False)
+                data = self.call('usage-stats', 'getEntitlementSnapshot', request)
+            else:
+                data = self.call('usage-stats', 'getCodingPlanUsageSnapshot', request)
             self.check_selection(params)  # Do not label another account's quota with an old selection.
-            quota = data.get('quota')
-            require(isinstance(quota, dict), 'ZCode 暂未返回额度数据')
-            limits = [{k: v for k, v in pick(limit, ['type', 'unit', 'number', 'usage', 'currentValue', 'remaining', 'percentage', 'nextResetTime']).items()
-                if isinstance(v, str) or (type(v) in (int, float) and math.isfinite(v))} for limit in quota.get('limits', [])]
-            return {'level': quota.get('level'), 'limits': limits, 'generatedAt': data.get('generatedAt')}
+            return project_quota(data, kind)
         raise RequestError('不支持的操作')
 
 
