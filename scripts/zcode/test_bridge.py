@@ -1,3 +1,4 @@
+import copy
 import base64
 import io
 import json
@@ -159,14 +160,40 @@ class BridgeTests(unittest.TestCase):
                 bridge.dispatch(name, {})
         client.call.assert_not_called()
 
-    def test_guard_changes_with_team_scope_and_account(self):
-        provider = {'providerId': 'team', 'accountState': {'connectionKey': 'account-a'}}
-        settings = {'providerFamilyConnectionSelections': {'bigmodel': {'kind': 'team-coding-plan', 'projectId': 'one'}}}
-        old = guard_for(provider, settings)
-        settings['providerFamilyConnectionSelections']['bigmodel']['projectId'] = 'two'
-        self.assertNotEqual(old, guard_for(provider, settings))
-        provider['accountState']['connectionKey'] = 'account-b'
-        self.assertNotEqual(old, guard_for(provider, settings))
+    def test_guard_ignores_refresh_timestamp_and_key_order(self):
+        provider = {'providerId': 'p', 'accountState': {'connectionKey': 'a'},
+            'effectiveConfig': {'mode': 'start-plan'}}
+        settings = {'providerFamilyDomain': {'bigmodel': 'cn'},
+            'providerFamilyConnectionSelections': {}, 'providerFamilyDomainUpdatedAt': 1000}
+        expected = guard_for(provider, settings)
+        for timestamp in (2000, None):
+            changed = dict(settings, providerFamilyDomainUpdatedAt=timestamp)
+            self.assertEqual(expected, guard_for(provider, changed))
+        del settings['providerFamilyDomainUpdatedAt']
+        self.assertEqual(expected, guard_for(provider, dict(reversed(list(settings.items())))))
+
+    def test_each_identity_change_independently_rejects_old_selection(self):
+        original_provider = {'providerId': 'p', 'accountState': {'connectionKey': 'a'},
+            'effectiveConfig': {'mode': 'start-plan'}}
+        original_settings = {'providerFamilyDomain': {'bigmodel': 'cn'},
+            'providerFamilyConnectionSelections': {'bigmodel': {'organizationId': 'org-a', 'projectId': 'one'}}}
+        old = guard_for(original_provider, original_settings)
+        for field in ('account', 'config', 'domain', 'team', 'project'):
+            with self.subTest(field=field):
+                provider, settings = copy.deepcopy(original_provider), copy.deepcopy(original_settings)
+                if field == 'account': provider['accountState']['connectionKey'] = 'b'
+                if field == 'config': provider['effectiveConfig']['mode'] = 'team-coding-plan'
+                if field == 'domain': settings['providerFamilyDomain']['bigmodel'] = 'intl'
+                if field == 'team': settings['providerFamilyConnectionSelections']['bigmodel']['organizationId'] = 'org-b'
+                if field == 'project': settings['providerFamilyConnectionSelections']['bigmodel']['projectId'] = 'two'
+                new = guard_for(provider, settings)
+                self.assertNotEqual(old, new)
+                client = Mock(); bridge = Bridge(client)
+                bridge.catalog = lambda: {'providers': [{'id': 'p', 'guard': new,
+                    'models': [{'id': 'flash', 'levels': []}]}]}
+                with self.assertRaises(RequestError):
+                    bridge.check_selection({'selection': {'providerId': 'p', 'modelId': 'flash'}, 'guard': old})
+                client.call.assert_not_called()
 
     def test_stale_guard_and_provider_remap_prevent_any_send(self):
         client = Mock(); bridge = Bridge(client); bridge.client_id = 'pockethelm-test'
