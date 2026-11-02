@@ -40,6 +40,7 @@ data class UiState(
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
+    private data class ThreadAttachment(val response: JSONObject, val unmaterialized: Boolean = false)
     private val vault = Vault(app)
     private val mutable = MutableStateFlow(UiState())
     val state = mutable.asStateFlow()
@@ -405,15 +406,34 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             sessions = state.sessions.map { if (it.id == id) it.copy(model = settings.model) else it }) }
     }
 
-    private suspend fun resumeSettings(id: String, connection: RpcClient = client(), yoloMode: Boolean = false): JSONObject {
+    private suspend fun resumeSettings(id: String, connection: RpcClient = client(), yoloMode: Boolean = false): ThreadAttachment {
         val generation = epoch; val selection = selectionVersion
         val params = (if (yoloMode) yolo() else obj()).put("threadId", id).put("excludeTurns", true)
-        return connection.call("thread/resume", params, onResult = { result ->
-            withContext(Dispatchers.Main) {
-                if (generation == epoch && selection == selectionVersion && mutable.value.selected?.id == id)
-                    acceptSettings(id, ModelSettings.parse(result))
+        try {
+            return ThreadAttachment(connection.call("thread/resume", params, onResult = { result ->
+                withContext(Dispatchers.Main) {
+                    if (generation == epoch && selection == selectionVersion && mutable.value.selected?.id == id)
+                        acceptSettings(id, ModelSettings.parse(result))
+                }
+            }))
+        } catch (e: RpcException) {
+            // An unnamed thread already exists in memory, but has no rollout until its
+            // first input. A metadata read and the target-specific history error must
+            // both confirm this case; never bypass an arbitrary resume rejection.
+            if (e.code != -32600 || e.message != "no rollout found for thread id $id") throw e
+            val metadata = connection.call("thread/read", obj("threadId" to id, "includeTurns" to false)).getJSONObject("thread")
+            if (metadata.string("id") != id || metadata.optJSONObject("status")?.string("type") !in setOf("idle", "active")) throw e
+            try {
+                connection.call("thread/turns/list", obj("threadId" to id, "limit" to 1,
+                    "sortDirection" to "desc", "itemsView" to "notLoaded"))
+            } catch (history: RpcException) {
+                if (history.code == -32600 && history.message ==
+                    "thread $id is not materialized yet; thread/turns/list is unavailable before first user message")
+                    return ThreadAttachment(obj("thread" to metadata), unmaterialized = true)
+                throw e
             }
-        })
+            throw e
+        }
     }
 
     fun prepareModelSettings(id: String, force: Boolean = false) {
@@ -570,8 +590,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val metadata = connection.call("thread/read", obj("threadId" to id, "includeTurns" to false)).getJSONObject("thread")
         val session = SessionInfo.parse(metadata)
         // Subscribe to a thread already owned by this daemon. Merely viewing a disk-only thread never starts another engine.
-        if (session.runtime != "notLoaded") resumeSettings(id, connection)
-        else if (generation == epoch && version == selectionVersion && mutable.value.selected?.id == id)
+        val attachment = if (session.runtime != "notLoaded") resumeSettings(id, connection) else null
+        if (attachment?.unmaterialized == true) {
+            if (generation != epoch || version != selectionVersion || mutable.value.selected?.id != id) return
+            val live = mutable.value.selected!!
+            val empty = SessionInfo.parse(attachment.response.getJSONObject("thread"))
+            val updated = if ((statusRevisions[id] ?: 0L) == statusRevision) empty else empty.copy(
+                runtime = live.runtime, lastTurnStatus = live.lastTurnStatus, activeTurnId = live.activeTurnId)
+            mutable.update { it.copy(selected = updated, items = timeline.values.toList(), historyCursor = null,
+                historyLoading = false, historyError = null, historyCached = false,
+                modelSettings = it.modelSettings ?: ModelSettings.metadata(metadata), lastSync = System.currentTimeMillis()) }
+            reconcilePending(id); reconcileOutgoing(id)
+            return
+        }
+        if (session.runtime == "notLoaded" && generation == epoch && version == selectionVersion && mutable.value.selected?.id == id)
             mutable.update { it.copy(modelSettings = ModelSettings.metadata(metadata)) }
         val turns = connection.call("thread/turns/list", obj("threadId" to id, "limit" to 1, "sortDirection" to "desc", "itemsView" to "notLoaded"))
             .optJSONArray("data").objects()
@@ -683,10 +715,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         var dispatched = false
         var ackAccepted = false
         try {
-            val result = resumeSettings(selected.id, yoloMode = true)
-            assertYolo(result)
+            val attachment = resumeSettings(selected.id, yoloMode = true)
+            val result = attachment.response
+            if (!attachment.unmaterialized) assertYolo(result)
             check(generation == epoch && selection == selectionVersion) { "会话已切换，消息尚未发送" }
             val resumed = SessionInfo.parse(result.getJSONObject("thread"))
+            // The first turn carries explicit YOLO overrides below. A thread already
+            // starting elsewhere must settle before we choose queue/steer semantics.
+            if (attachment.unmaterialized) check(resumed.runtime == "idle") { "会话正在初始化，请稍后刷新再发送；草稿已保留" }
             if (steer) check(resumed.runtime == "active" && selected.activeTurnId.isNotBlank()) { "当前没有可介入的执行，请刷新后重试" }
             val params = obj("threadId" to selected.id, "clientUserMessageId" to clientId, "input" to textInput(text))
             // Persist before the write only. On timeout/disconnect after this point, do not

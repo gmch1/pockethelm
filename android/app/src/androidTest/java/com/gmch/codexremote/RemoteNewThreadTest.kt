@@ -39,6 +39,7 @@ class RemoteNewThreadTest {
     private val messages = CopyOnWriteArrayList<JSONObject>()
     private var mode = "legacy"
     private var title = ""
+    private var materialized = false
 
     private fun fresh() {
         app = TestPrefsApp(UUID.randomUUID().toString()).also { it.attach(instrumentation.targetContext) }
@@ -59,18 +60,19 @@ class RemoteNewThreadTest {
         fun on(method: String, handler: (JSONObject) -> JSONObject) {
             bridge.scripted[method] = { request -> requests.add(request); handler(request.getJSONObject("params")) }
         }
-        on("thread/start") { mode = it.string("historyMode", "legacy"); resumed() }
-        on("thread/name/set") { title = it.getString("name"); obj() }
+        on("thread/start") { mode = it.string("historyMode", "legacy"); materialized = false; resumed() }
+        on("thread/name/set") { title = it.getString("name"); materialized = true; obj() }
         on("thread/list") { obj("data" to JSONArray()) }
         on("thread/read") { obj("thread" to metadata()) }
         on("thread/resume") {
-            if (mode == "legacy" && messages.isEmpty())
+            if (!materialized)
                 throw FakeRpcBridge.FakeRpcError(-32600, "no rollout found for thread id new-thread")
             resumed()
         }
         on("thread/turns/list") {
-            if (mode == "legacy" && messages.isEmpty())
-                throw FakeRpcBridge.FakeRpcError(-32600, "thread is not materialized yet")
+            if (!materialized)
+                throw FakeRpcBridge.FakeRpcError(-32600,
+                    "thread new-thread is not materialized yet; thread/turns/list is unavailable before first user message")
             obj("data" to JSONArray())
         }
         on("thread/items/list") {
@@ -79,6 +81,9 @@ class RemoteNewThreadTest {
         }
         on("thread/queue/list") { obj("data" to JSONArray()) }
         on("turn/start") { params ->
+            assertEquals("never", params.getString("approvalPolicy"))
+            assertEquals("dangerFullAccess", params.getJSONObject("sandboxPolicy").getString("type"))
+            materialized = true
             messages.add(obj("id" to "message-${messages.size}", "type" to "userMessage",
                 "clientId" to params.getString("clientUserMessageId"), "content" to params.getJSONArray("input")))
             obj("turn" to obj("id" to "turn-${messages.size}", "status" to "inProgress"))
@@ -137,6 +142,13 @@ class RemoteNewThreadTest {
         assertNull(state.value.historyError); assertFalse(state.value.historyLoading)
         assertFalse(state.value.historyCached); assertFalse(state.value.sending)
         assertTrue(state.value.outgoing.isEmpty())
+        // The real server still has no rollout despite historyMode=paginated.
+        // Refresh and settings preparation must recognize the live empty thread.
+        instrumentation.runOnMainSync { vm.retryHistory() }
+        settled()
+        assertNull(state.value.error); assertNull(state.value.historyError)
+        assertFalse(state.value.historyLoading)
+        assertFalse(materialized)
         instrumentation.runOnMainSync { vm.draft("首条消息"); vm.send(false) }
         settled()
         assertNull(state.value.error)
@@ -160,6 +172,49 @@ class RemoteNewThreadTest {
         assertNull(state.value.error)
         assertEquals("重连后首条消息", state.value.items.single().text)
         assertEquals(1, calls("thread/start").size)
+    }
+
+    @Test fun missingRolloutForStoredHistoryIsNotTreatedAsANewThread() = runBlocking {
+        fresh(); script()
+        instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "[测试]已有历史") }
+        settled()
+        bridge.scripted["thread/resume"] = { throw FakeRpcBridge.FakeRpcError(-32600,
+            "no rollout found for thread id new-thread") }
+        // A valid history response, even an empty one, does not prove the special
+        // unmaterialized state. The original rejection must remain authoritative.
+        instrumentation.runOnMainSync { vm.draft("不能擅自发送"); vm.send(false) }
+        settled()
+        assertEquals("no rollout found for thread id new-thread", state.value.error)
+        assertEquals("不能擅自发送", state.value.draft)
+        assertEquals(OutgoingState.FAILED, state.value.outgoing.single().state)
+        assertTrue(calls("turn/start").isEmpty())
+    }
+
+    @Test fun anotherThreadsUnmaterializedErrorCannotAuthorizeThisSend() = runBlocking {
+        fresh(); script()
+        instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
+        settled()
+        bridge.scripted["thread/turns/list"] = { throw FakeRpcBridge.FakeRpcError(-32600,
+            "thread other-thread is not materialized yet; thread/turns/list is unavailable before first user message") }
+        instrumentation.runOnMainSync { vm.draft("保留当前草稿"); vm.send(false) }
+        settled()
+        assertEquals("no rollout found for thread id new-thread", state.value.error)
+        assertEquals("保留当前草稿", state.value.draft)
+        assertTrue(calls("turn/start").isEmpty())
+    }
+
+    @Test fun activeUnmaterializedThreadDoesNotStartOrQueueAnotherTurn() = runBlocking {
+        fresh(); script()
+        instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
+        settled()
+        bridge.scripted["thread/read"] = { obj("thread" to metadata().put("status", obj("type" to "active"))) }
+        instrumentation.runOnMainSync { vm.draft("初始化期间保留"); vm.send(false) }
+        settled()
+        assertEquals("会话正在初始化，请稍后刷新再发送；草稿已保留", state.value.error)
+        assertEquals("初始化期间保留", state.value.draft)
+        assertNull(state.value.uncertain)
+        assertTrue(calls("turn/start").isEmpty())
+        assertTrue(calls("thread/queue/add").isEmpty())
     }
 
     @Test fun resumeFailureIsStillAuthoritativeAndDoesNotCreateOrSendAgain() = runBlocking {
@@ -191,6 +246,8 @@ class RemoteNewThreadTest {
         val fixture = File(instrumentation.targetContext.filesDir, "new-thread-live-target.json")
         assumeTrue("Dedicated live new-thread fixture is not installed", fixture.isFile)
         val target = JSONObject(fixture.readText())
+        val unnamed = target.optBoolean("unnamed")
+        val singleMessage = target.optBoolean("singleMessage")
         fresh(); bridge.close()
         fun attach(): Pair<Socket, RpcClient> {
             val socket = Socket("127.0.0.1", target.getInt("port"))
@@ -205,7 +262,7 @@ class RemoteNewThreadTest {
                 scenario.onActivity { activity -> activity.setContent { PocketHelmTheme { RemoteApp(vm) } } }
                 click("新建会话")
                 awaitUi { nodes().count { it.isEditable } == 2 }
-                setText(nodes().first { it.isEditable }, "[测试]新会话首次发送")
+                if (!unnamed) setText(nodes().first { it.isEditable }, "[测试]新会话首次发送")
                 click("创建会话")
                 withTimeout(20_000) { while (state.value.selected == null || state.value.busy) delay(50) }
                 val id = state.value.selected!!.id
@@ -213,17 +270,22 @@ class RemoteNewThreadTest {
                 assertNull(state.value.error); assertNull(state.value.historyError)
                 assertTrue(state.value.items.isEmpty())
 
-                // Reconnect before any message: the empty thread must already be resumable.
-                instrumentation.runOnMainSync { vm.disconnect() }
-                connection.second.close(); connection.first.close()
-                connection = attach()
-                state.value = state.value.copy(connected = true)
-                instrumentation.runOnMainSync { vm.retryHistory() }; settled()
-                assertNull(state.value.error); assertNull(state.value.historyError)
-                for ((index, marker) in listOf("FIRST_SEND_OK", "CONTINUE_OK").withIndex()) {
+                // Naming materializes the empty rollout. The unnamed case must send
+                // without naming first, rather than accidentally hiding that regression.
+                if (!unnamed) {
+                    instrumentation.runOnMainSync { vm.disconnect() }
+                    connection.second.close(); connection.first.close()
+                    connection = attach()
+                    state.value = state.value.copy(connected = true)
+                    instrumentation.runOnMainSync { vm.retryHistory() }; settled()
+                    assertNull(state.value.error); assertNull(state.value.historyError)
+                }
+                val markers = listOf("FIRST_SEND_OK", "CONTINUE_OK").take(if (singleMessage) 1 else 2)
+                for ((index, marker) in markers.withIndex()) {
                     instrumentation.waitForIdleSync()
                     awaitUi { nodes().any { it.isEditable } }
-                    val prompt = "Reply exactly $marker. Do not use tools."
+                    val previousReplies = state.value.items.filter { it.kind == "agentMessage" }.map { it.id }.toSet()
+                    val prompt = if (unnamed && index == 0) "123" else "Reply exactly $marker. Do not use tools."
                     // Reentry replaces the Compose editor. Do not write to a detached node
                     // left over from the preceding chat frame, even if its action succeeds.
                     awaitUi {
@@ -232,7 +294,10 @@ class RemoteNewThreadTest {
                     }
                     click("发送消息")
                     withTimeout(120_000) {
-                        while (state.value.items.none { it.kind == "agentMessage" && it.text.trim() == marker }) {
+                        while (state.value.selected?.lastTurnStatus != "completed" || state.value.items.none {
+                            it.kind == "agentMessage" && it.id !in previousReplies &&
+                                (if (unnamed && index == 0) it.text.isNotBlank() else it.text.trim() == marker)
+                        }) {
                             delay(700)
                             if (!state.value.busy) instrumentation.runOnMainSync { vm.retryHistory() }
                         }
@@ -243,13 +308,25 @@ class RemoteNewThreadTest {
                     assertEquals(id, state.value.selected!!.id)
                     assertEquals(index + 1, state.value.items.count { it.kind == "userMessage" })
                     assertEquals("gpt-6-luna", state.value.modelSettings?.model)
+                    if (unnamed && index == 0) {
+                        // Apply the user's test marker only after the unnamed first-send
+                        // assertion has passed. The fixture forbids earlier naming.
+                        connection.second.call("thread/name/set", obj("threadId" to id, "name" to "[测试]未命名首次发送回归"))
+                        instrumentation.runOnMainSync { vm.disconnect() }
+                        connection.second.close(); connection.first.close()
+                        connection = attach()
+                        state.value = state.value.copy(connected = true)
+                        instrumentation.runOnMainSync { vm.retryHistory() }; settled()
+                        assertNull(state.value.error); assertNull(state.value.historyError)
+                        assertEquals("123", state.value.items.single { it.kind == "userMessage" }.text)
+                    }
                     // Reenter the stored thread, then continue in the same native session.
                     if (index == 0) {
                         val session = state.value.selected!!
                         instrumentation.runOnMainSync { vm.back(); vm.openThread(session) }; settled()
                     }
                 }
-                awaitUi { nodes().any { it.text?.toString() == "CONTINUE_OK" } }
+                awaitUi { nodes().any { it.text?.toString() == if (unnamed) "123" else markers.last() } }
                 instrumentation.waitForIdleSync()
                 val screenshot = instrumentation.uiAutomation.takeScreenshot()
                 try {
