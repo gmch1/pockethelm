@@ -33,7 +33,7 @@
 
 1. **桥接器（核心修复）**：`guard_for` 的 `pick(settings, [...])` 输入中移除 `providerFamilyDomainUpdatedAt`，保留 `providerFamilyDomain` 与 `providerFamilyConnectionSelections`。这些是真正的身份/一致性字段；域配置真实变化时 guard 仍会变化并拦截，无害刷新不再误伤。
 2. **测试**：
-   - `test_bridge.py` 现有 `test_guard_changes_with_team_scope_and_account` 保持通过（真实变化仍改变 guard）。
+   - 将原 `test_guard_changes_with_team_scope_and_account` 替换为 `test_each_identity_change_independently_rejects_old_selection`，分别验证账号、配置、域、组织和项目变化，避免测试状态相互污染。
    - 新增：仅 `providerFamilyDomainUpdatedAt` 变化时 guard 不变。
 3. **文档**：README「ZCode 集成」中关于账号/计划变化拒绝旧选择的描述保持不变（行为语义不变）；任务文档记录一次性影响。
 4. **不做**（本次）：App 端 guard 自动愈合（`loadCatalog` 自动更新非空 selectionGuard）——涉及交互语义变化，若 Codex 认为需要，另立任务。
@@ -72,3 +72,5 @@ guard 算法变更会使已部署手机上缓存的旧 guard 失配一次（与�
 - 私有证据：`~/.local/state/pockethelm/guard-volatile-timestamp/`，live-result.json、deploy-result.json、instrument.txt 与 device.log。真实 quota 验证是本机 bridge→原生服务端；真机脚本化回归与此分开记录，不宣称旧 0.4.12 真机或真实手机 SSH 额度 UI 已验收。
 - 129 当前已安装 0.4.16 上执行 ZcodeSendRealtimeTest，12 项全部通过，OEM 确认弹窗 0；测试包自动清理、授权基线保留。该回归为脚本化协议发送/回执保护，不产生模型请求。
 - 基线 `85399c3`，改动仅 bridge.py、test_bridge.py 和本任务文档；部署桥接器 SHA-256 `0ad049be6d53c3327a29846d7abd4186202a5f8296ac668f84b2a2b03877fd89`。无新 APK、无商店更新，任务分支推送，不合并 main。
+
+- 提交后复查（2026-11-03）：产品改动仅排除刷新时间戳，全部身份字段仍参与确定性 hash，check_selection 拒绝逻辑未变。现有自动化和真机证据适用于相同源码，部署文件 hash 再次核对一致；未发现阻塞问题。纠正修复方案中已被替换的旧测试名称引用，无需重跑未变更的产品测试。产品提交 `1b2d827`。
