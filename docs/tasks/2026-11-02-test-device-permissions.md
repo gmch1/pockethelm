@@ -47,3 +47,4 @@
 - 用户同时明确删除默认“ZCode 实现、Codex review”的分工。已修改本项目 AGENTS、开发流程和任务模板，改为当前 Codex 默认直接完成实现、测试与 review，仅在用户明确指定时委派；全局指令记录同一规则。历史任务交付事实保留。
 - 通用记录位置：`/home/ming/projects/ops-notes/runbooks/android-agent-unattended-testing.md`；全局副本：`configs/249/codex/AGENTS.md`；通用入口：`configs/android-129/agent-testing/android_test.py`。
 - 通用入口另完成两轮重装验证，每轮 2 项 UI 测试通过，授权弹窗均为 0，无模型请求；原始证据在 `~/.local/state/android-agent-testing/global-rollout-20261102/`。全局记录已提交 ops-notes：`f4cb0b6`（main）；本项目工作区仍未提交，历史任务事实未改写。
+- 后续随 0.4.14 发布，本项目权限入口及执行方式文档已纳入 `7449129`，并随 `fix-new-thread-first-message` 分支推送；上文未提交状态保留为当时记录。发行 APK 的 18 项真机验收同样全程无授权弹窗，持久基线继续保留。

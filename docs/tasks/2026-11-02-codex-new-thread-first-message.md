@@ -1,6 +1,6 @@
 # Codex 新会话首条消息发送失败
 
-状态：发布中（用户已授权更新商店，计划 0.4.14 / 24）
+状态：已发布（0.4.14 / 24，2026-11-02）
 
 ## 需求与验收 由 Codex 维护
 
@@ -76,3 +76,7 @@
 - 已检查实际 APK 的包名 `com.gmch.codexremote`、0.4.14 / 24、debuggable=false；原发行签名 SHA-256 `54c2508d89048ef721e3d67d0a192397f103886a9f40e65ba31d696c2e2fbab5`。待发布与设备已安装 APK 的 SHA-256 均为 `c1a2e49b6e60da06a4c20e8ce1795135aa192727e85cfd4c55c1a6e0451bd3b6`。
 - 最终源码快照（同前述路径 + NUL + 内容算法，72 文件）SHA-256 `a63da6d4a5f1f4bbcf130eff4c30aa21ffda5424ecf68e913c95e43de070b10d`；构建后产品与测试源码未变。保留私有 source.tar.gz、source-snapshot.json、build.log、instrument.txt、verification.json 及签名包。
 - 已查看合成输入 UI 截图；键盘、选区和插入切换正常，未出现授权遮挡。真机测试包、临时 APK 及本轮截图缓存已清理，测试权限基线和用户数据保留。
+- 发布源码已提交 `7449129`，构建时为 `8f79a1e` 加本轮未提交改动，二者产品/测试源码指纹一致；保留已测原 APK，没有为了提交后的 VCS 元数据重新构建或替换产物。
+- 原商店上传 API 返回 `published`，条目仍为 PocketHelm / `com.gmch.codexremote`，版本 0.4.14 / 24。公开 HTTPS 索引的版本、签名、哈希，以及完整下载 APK，均与实际已测试/已安装包一致：`c1a2e49b6e60da06a4c20e8ce1795135aa192727e85cfd4c55c1a6e0451bd3b6`。
+- 验证使用正常 TLS 校验、绕过本机不可用代理；未修改商店运行服务、签名身份或 DNS。公开 APK 为 `com.gmch.codexremote_24.apk`。证据补齐 `upload.json`、`index-v1.jar`、`download.apk`、`store-verified.json` 和 `store-check.log`。
+- 发布完成并推送本次 `fix-new-thread-first-message` 分支；不合并 main，不推送其他分支或 `.zcode/` 私有计划。更新后重新新建会话使用分页历史；旧 legacy 失败空会话不会自动迁移。
