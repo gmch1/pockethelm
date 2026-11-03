@@ -47,6 +47,33 @@ class ReadingUiDeviceTest {
         assertTrue(node!!.performAction(AccessibilityNodeInfo.ACTION_CLICK))
     }
 
+    @Test fun failedBubbleStaysBeforeLaterReplyAndRemovalKeepsUncertain() {
+        val failed = OutgoingMessage("s", "failed", "旧失败文本", OutgoingState.FAILED,
+            precedingItemIds = emptyList())
+        val uncertain = OutgoingMessage("s", "unknown", "待确认文本", OutgoingState.UNCERTAIN)
+        val outgoing = mutableStateOf(listOf(failed, uncertain))
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity -> activity.setContent {
+                PocketHelmTheme {
+                    ChatTimeline("s", "ZCode", listOf(
+                        TimelineItem("user", "userMessage", "后续成功消息"),
+                        TimelineItem("answer", "agentMessage", "后续回复")), outgoing.value, emptyList(),
+                        false, false, null, true, false, Modifier.fillMaxSize(), {}, {}, { _, _ -> },
+                        dismissFailed = { m -> outgoing.value = outgoing.value.filterNot { it.clientId == m.clientId } })
+                }
+            } }
+            await { matching("旧失败文本").isNotEmpty() && matching("后续回复").isNotEmpty() }
+            fun top(text: String): Int = android.graphics.Rect().also { matching(text).first().getBoundsInScreen(it) }.top
+            assertTrue(top("旧失败文本") < top("后续成功消息"))
+            assertTrue(top("后续成功消息") < top("后续回复"))
+            click("移除失败记录")
+            await { matching("旧失败文本").isEmpty() }
+            assertTrue(matching("后续回复").isNotEmpty())
+            assertTrue(matching("待确认文本").isNotEmpty())
+            assertTrue(matching("移除失败记录").isEmpty())
+        }
+    }
+
     private fun captureList(name: String) {
         val bitmap = instrumentation.uiAutomation.takeScreenshot()
         val folder = java.io.File(instrumentation.targetContext.cacheDir, "list-review").apply { mkdirs() }

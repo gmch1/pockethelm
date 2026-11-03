@@ -21,7 +21,9 @@ data class OutgoingMessage(
     val state: OutgoingState,
     /** Receipt from the server ack, e.g. 已接收 / 已排队 / 已插入; may be refined per engine. */
     val receipt: String = "",
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    /** Server rows visible at submission; null denotes a restored record without an anchor. */
+    val precedingItemIds: List<String>? = null
 )
 
 /**
@@ -119,7 +121,19 @@ fun buildChatRows(
         .map { ChatRow(key = "outgoing-${it.clientId}", outgoing = it) }
     val queueRows = queue.filter { it.clientId !in itemClientIds }
         .map { ChatRow(key = "queue-${it.id.ifBlank { it.clientId }}", queued = it) }
-    return rows + pending + queueRows
+    val anchoredFailures = pending.filter { it.outgoing?.state == OutgoingState.FAILED && it.outgoing.precedingItemIds != null }
+    val positions = items.mapIndexed { index, item -> item.id to index }.toMap()
+    val groups = anchoredFailures.groupBy { row ->
+        row.outgoing!!.precedingItemIds!!.asReversed().firstNotNullOfOrNull { positions[it] } ?: -1
+    }
+    // Insert failures at their submission boundary, never behind future replies. If
+    // the anchor left the loaded window, show before that window rather than at its tail.
+    return buildList {
+        addAll(groups[-1].orEmpty())
+        rows.forEachIndexed { index, row -> add(row); addAll(groups[index].orEmpty()) }
+        addAll(pending.filterNot { it in anchoredFailures })
+        addAll(queueRows)
+    }
 }
 
 /** ZCode queue rows carry queueItemId plus sourceCommandId linking back to the sent command. */

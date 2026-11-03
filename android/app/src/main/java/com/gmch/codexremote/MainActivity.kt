@@ -159,11 +159,16 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
             dismissButton = { TextButton({ confirmUncertain = false }) { Text("返回") } })
         ChatTimeline(session.id, "Codex", state.items, state.outgoing, state.queue, state.historyCursor != null,
             state.historyLoading, state.historyError, state.connected, state.busy, Modifier.weight(1f),
-            vm::moreHistory, vm::retryHistory, detail, state.diff, vm::deleteQueued)
+            vm::moreHistory, vm::retryHistory, detail, state.diff, vm::deleteQueued, dismissFailed = vm::dismissFailed)
         ExecutionControls(state, vm)
+        val pickImage = rememberAttachmentPicker(vm::attachmentScope, vm::addAttachment)
         ChatComposer(state.draft, vm::draft, state.sending,
-            state.connected && !state.busy && !state.sending && state.draft.isNotBlank() && state.uncertain == null,
-            steer, { steer = it }, { vm.send(steer && session.runtime == "active") })
+            state.connected && !state.busy && !state.sending && !state.attachmentsBusy && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.uncertain == null,
+            steer, { steer = it }, { vm.send(steer && session.runtime == "active") },
+            attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
+            canAttach = !state.attachmentsBusy && state.attachments.size < ImagePolicy.MESSAGE_MAX && !state.sending,
+            attach = pickImage,
+            removeAttachment = vm::removeAttachment)
     }
     if (approvalSheet && approvals.isNotEmpty()) {
         CodexApprovalSheet(approvals, state.items, state.connected && !state.busy, vm::decide) { approvalSheet = false }

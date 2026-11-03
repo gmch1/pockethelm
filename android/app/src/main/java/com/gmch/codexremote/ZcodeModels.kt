@@ -61,7 +61,11 @@ fun zcodeItems(j: JSONObject) = j.optJSONArray("items").objects().map {
         "success", "complete" -> "completed"; "streaming", "inputStreaming" -> "running"
         "error" -> "failed"; "cancelled" -> "interrupted"; else -> it.string("status")
     }
-    TimelineItem(it.getString("id"), kind, it.string("text"), status, it.string("commandId"), it.string("entityId"))
+    // Attachment rows carry names only; image bytes stay behind the read-back API (P2).
+    val text = if (kind == "userMessage")
+        it.string("text") + AttachmentUploadPlan.rowAttachmentText(it.optJSONArray("attachments"))
+    else it.string("text")
+    TimelineItem(it.getString("id"), kind, text, status, it.string("commandId"), it.string("entityId"))
 }
 
 /**

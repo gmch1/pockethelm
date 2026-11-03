@@ -1,6 +1,7 @@
 package com.gmch.codexremote
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
@@ -34,6 +35,11 @@ data class ZcodeState(
     val notice: String = "", val beforeRow: Double? = null, val logEpoch: String = "", val revision: Long = 0,
     val permission: String = "", val currentSelection: ZSelection? = null,
     val browser: ZcodeBrowserState = ZcodeBrowserState(),
+    // Image attachments: entry hidden unless the bridge advertises the capability; refs
+    // and bytes are connection/session-scoped memory state, never persisted.
+    val attachmentsEnabled: Boolean = false,
+    val attachments: List<ChatAttachment> = emptyList(),
+    val attachmentsBusy: Boolean = false,
     // Interaction answering (task 2026-11-02): details only flow when the bridge advertises
     // the capability; otherwise the legacy count-only placeholder stays.
     val interactionsEnabled: Boolean = false,
@@ -158,6 +164,13 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (index >= 0) { list[index] = transform(list[index]); publishOutgoing(key) }
     }
 
+    fun dismissFailed(message: OutgoingMessage) {
+        if (mutable.value.selected?.id != message.sessionId) return
+        val key = outgoingKey(message.sessionId)
+        val current = outgoingBySession[key]?.find { it.clientId == message.clientId } ?: return
+        if (current.state == OutgoingState.FAILED) removeOutgoing(key, current.clientId)
+    }
+
     private fun removeOutgoing(key: OutgoingKey, clientId: String?) {
         if (clientId.isNullOrBlank()) return
         val list = outgoingBySession[key] ?: return
@@ -256,6 +269,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnectManually() = disconnect()
     private fun disconnect() {
         generation++
+        attachmentSerial.incrementAndGet()
         supportsSessionIndex = false
         backgroundJob?.cancel(); backgroundJob = null
         browser(ZcodeBrowserEvent.Disconnect)
@@ -271,6 +285,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         snoozeStates.clear()
         interactionFlights.clear()
         persistSeen()
+        // Refs are connection-scoped upstream (the bridge registry dies with the process);
+        // attachment drafts are memory-only and dropped with an explicit re-pick prompt.
+        attachmentRefs.clear(); attachmentUploading.clear()
         mutable.update {
             it.copy(connected = false, busy = false, sending = false, historyLoading = false, sessionsFresh = false, liveStatuses = emptyList(),
                 // A session opened but never loaded must not fall back to a blank timeline.
@@ -280,7 +297,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 interactionsEnabled = false, interactions = emptyList(), interactionsComplete = false,
                 interactSubmitting = emptySet(), interactReleasable = emptySet(), interactionPresence = emptyMap(), interactionNotice = "", snoozeUnconfirmed = emptySet(),
                 turn = null, queueOpsEnabled = false, diffEnabled = false, indexMetaEnabled = false,
-                listMeta = emptyMap(), diffText = null)
+                listMeta = emptyMap(), diffText = null,
+                attachmentsEnabled = false, attachments = emptyList(), attachmentsBusy = false)
         }
     }
     fun connect() {
@@ -322,12 +340,14 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 // Optional capability: an older bridge without it keeps the count-only placeholder.
                 val capabilities = hello.optJSONObject("capabilities")
                 interactSupport = capabilities?.optBoolean("interactions") == true
+                attachmentsEnabled = capabilities?.optBoolean("attachments") == true
                 val queueOps = capabilities?.optBoolean("queueOps") == true
                 val turnSummary = capabilities?.optBoolean("turnSummary") == true
                 val fileChanges = capabilities?.optBoolean("fileChanges") == true
                 val indexMeta = capabilities?.optBoolean("indexMeta") == true
                 restoreSeen()
                 mutable.update { it.copy(connected = true, interactionsEnabled = interactSupport,
+                    attachmentsEnabled = attachmentsEnabled,
                     queueOpsEnabled = queueOps, diffEnabled = turnSummary && fileChanges, indexMetaEnabled = indexMeta) }
                 recoverPending()
                 try { recoverInteractions() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
@@ -509,9 +529,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     private fun select(session: ZSession) {
+        attachmentSelection++; attachmentSerial.incrementAndGet()
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
         persistSeen()
         older = emptyList()
+        // Refs are bound to the uploading session upstream; a switch invalidates them all.
+        attachmentRefs.clear()
         val outKey = outgoingKey(session.id)
         mutable.update { it.copy(selected = session, historyCached = false, items = emptyList(), queue = emptyList(), phase = "", executionId = "",
             quota = "点击读取额度", quotaSummary = "额度 ▾",
@@ -520,7 +543,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             draft = vault.get(key("draft", session.id)).orEmpty(), beforeRow = null, notice = "", currentSelection = null, permission = "",
             interactions = emptyList(), interactionsComplete = false, interactionPresence = emptyMap(),
             interactSubmitting = emptySet(), interactReleasable = emptySet(), interactionNotice = "",
-            logEpoch = "", revision = 0, turn = null, diffText = null) }
+            logEpoch = "", revision = 0, turn = null, diffText = null,
+            attachments = emptyList(), attachmentsBusy = false) }
         // A persisted pending send restores its 待确认 bubble for exactly this session —
         // but never over an existing record: an in-flight SENDING, or a settled
         // ACCEPTED/FAILED receipt, must not be downgraded by replaying the old receipt.
@@ -535,6 +559,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun back() {
         if (mutable.value.busy) return
+        attachmentSelection++; attachmentSerial.incrementAndGet()
         navigationVersion++
         if (mutable.value.selected == null) return
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
@@ -542,8 +567,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false,
             historyError = null, outgoing = emptyList(), sessionsFresh = it.connected && it.sessionsFresh,
             interactions = emptyList(), interactionsComplete = false, interactSubmitting = emptySet(),
-            interactionNotice = "", snoozeUnconfirmed = emptySet(), turn = null, diffText = null) }
+            interactionNotice = "", snoozeUnconfirmed = emptySet(), turn = null, diffText = null,
+            attachments = emptyList(), attachmentsBusy = false) }
         older = emptyList()
+        // Refs die with the session scope upstream; unsent attachment drafts are dropped.
+        attachmentRefs.clear()
         val epoch = generation
         viewModelScope.launch {
             actions.withLock {
@@ -666,11 +694,15 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun send() = action {
         val state = mutable.value; val session = state.selected ?: error("请先选择会话")
-        val text = state.draft.trim(); check(text.isNotBlank()) { "请输入消息" }
+        val text = state.draft.trim()
+        val attachments = state.attachments
+        check(!state.attachmentsBusy) { "图片处理中，请稍候再发送" }
+        check(text.isNotBlank() || attachments.isNotEmpty()) { "请输入消息或添加图片" }
         val params = session.target()
         val selection = selectionParams()
         params.put("selection", selection.get("selection")).put("guard", selection.get("guard"))
             .put("text", text).put("delivery", state.delivery)
+        val ownerSelection = attachmentSelection
         val gen = generation
         val scope = RequestScope(gen, sessionId = session.id)
         val key = outgoingKey(session.id)
@@ -678,11 +710,26 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val commandId = UUID.randomUUID().toString()
         // The bubble appears before any RPC: pending persistence, the dispatch, and the ack
         // all happen after the user already sees the message with 发送中.
-        addOutgoing(key, OutgoingMessage(session.id, commandId, text, OutgoingState.SENDING))
-        mutable.update { it.copy(sending = true) }
+        addOutgoing(key, OutgoingMessage(session.id, commandId,
+            listOf(text, attachments.joinToString(" ") { "[图片]" }).filter { it.isNotBlank() }.joinToString(" "),
+            OutgoingState.SENDING, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
+        mutable.update { it.copy(sending = true, attachmentsBusy = true) }
         var dispatched = false
         var ackAccepted = false
         try {
+            // The upload runs inside the try: its failure must flow the normal FAILED
+            // receipt + finally reset like every other pre-dispatch failure. Attachment
+            // params are assembled only afterwards — refs exist exclusively after upload.
+            if (attachments.isNotEmpty()) {
+                uploadAttachments(session)
+                val sent = attachments.map { attachment ->
+                    val ref = attachmentRefs[attachment.id]
+                        ?: error("图片尚未上传完成：${attachment.displayName}")
+                    obj("ref" to ref, "fileName" to attachment.fileName,
+                        "mime" to attachment.mime, "bytes" to attachment.bytes)
+                }
+                params.put("attachments", org.json.JSONArray().apply { sent.forEach { put(it) } })
+            }
             // dispatched flips only after the pending record was persisted and just before
             // the RPC leaves; a failed guard or vault write below this point is a definite
             // local failure (nothing was sent) and must not touch the previous pending.
@@ -700,6 +747,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 if (vault.get(draftKey)?.trim() == text) vault.put(draftKey, "")
                 if (scope.appliesToSession(generation, mutable.value.selected?.id) && mutable.value.draft.trim() == text)
                     mutable.update { it.copy(draft = "") }
+                if (scope.appliesToSession(generation, mutable.value.selected?.id))
+                    mutable.update { state -> state.copy(
+                        attachments = state.attachments.filterNot { a -> attachments.any { b -> b.id == a.id } },
+                        attachmentsBusy = if (ownerSelection == attachmentSelection) false else state.attachmentsBusy) }
                 // Refresh only while the sending session is still the current one on the
                 // current connection; a stale read must not report errors into a new session.
                 if (scope.appliesToSession(generation, mutable.value.selected?.id)) read(session)
@@ -733,7 +784,99 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         } finally {
             // Compare the captured scope against the CURRENT generation: a reconnect must
             // detach this request's finally from the new connection's state.
-            if (scope.appliesToSession(generation, mutable.value.selected?.id)) mutable.update { it.copy(sending = false) }
+            if (scope.appliesToSession(generation, mutable.value.selected?.id))
+                mutable.update { it.copy(sending = false, attachmentsBusy = if (ownerSelection == attachmentSelection) false else it.attachmentsBusy) }
+        }
+    }
+
+    // ---- Image attachments (task 2026-11-03-image-attachments) ----
+
+    private val imageProcessor by lazy { ImageProcessor(app) }
+    private var attachmentSelection = 0L
+    private val attachmentSerial = java.util.concurrent.atomic.AtomicLong(0)
+    /** attachmentId -> committed upstream ref, valid for this connection scope only. */
+    private val attachmentRefs = LinkedHashMap<String, String>()
+    private val attachmentUploading = HashSet<String>()
+    private var attachmentsEnabled = false
+
+    fun attachmentScope(): String = "${generation}:${attachmentSelection}:${mutable.value.selected?.id}"
+
+    fun addAttachment(uri: Uri, displayName: String, mime: String?, scope: String = attachmentScope()) {
+        if (scope != attachmentScope()) return
+        if (mutable.value.attachmentsBusy) return
+        check(mutable.value.attachments.size < ImagePolicy.MESSAGE_MAX) { "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片" }
+        // Scope-bound pick: late results after a session switch or reconnect are dropped.
+        val generation = generation
+        val selection = attachmentSelection
+        val sessionId = mutable.value.selected?.id ?: return
+        val serial = attachmentSerial.incrementAndGet()
+        mutable.update { it.copy(attachmentsBusy = true, error = null) }
+        viewModelScope.launch {
+            val processed = withContext(Dispatchers.IO) { imageProcessor.process(uri, displayName, mime) }
+            if (attachmentSerial.get() != serial) return@launch
+            mutable.update { state ->
+                if (generation != this@ZcodeViewModel.generation || selection != attachmentSelection || state.selected?.id != sessionId)
+                    state.copy(attachmentsBusy = false)
+                else {
+                    val value = processed.getOrElse { e ->
+                        return@update state.copy(attachmentsBusy = false, error = e.message ?: "图片处理失败")
+                    }
+                    if (state.attachments.size >= ImagePolicy.MESSAGE_MAX)
+                        state.copy(attachmentsBusy = false, error = "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片")
+                    else state.copy(attachments = state.attachments + value, attachmentsBusy = false)
+                }
+            }
+        }
+    }
+
+    fun removeAttachment(id: String) {
+        if (mutable.value.attachmentsBusy || id in attachmentUploading) return
+        mutable.update { it.copy(attachments = it.attachments.filterNot { a -> a.id == id }, error = null) }
+        attachmentRefs.remove(id)
+    }
+
+    /** Uploads every attachment without a ref through the two-stage bridge transaction.
+     *  Serial by design; any failure keeps the batch (uploaded refs stay reusable). */
+    private suspend fun uploadAttachments(session: ZSession) {
+        val startGeneration = generation
+        val selection = attachmentSelection
+        val connection = client()
+        fun stillValid() = startGeneration == generation && selection == attachmentSelection &&
+            mutable.value.selected?.id == session.id
+        val pending = mutable.value.attachments.filter { it.id !in attachmentRefs }
+        for (attachment in pending) {
+            attachmentUploading.add(attachment.id)
+            try {
+                check(stillValid()) { "连接已切换，请重新上传图片" }
+                val uploadId = "upl-${attachment.id}"
+                val begin = connection.call("session/attachment/begin",
+                    AttachmentUploadPlan.beginParams(session.target(), attachment), timeout = 90_000)
+                check(stillValid()) { "连接已切换，请重新上传图片" }
+                if (begin.string("state") != "committed") {
+                    var index = begin.optInt("nextChunkIndex", 0)
+                    while (true) {
+                        val chunk = AttachmentUploadPlan.chunkParams(uploadId, attachment, index) ?: break
+                        val ack = connection.call("session/attachment/chunk", chunk, timeout = 90_000)
+                        check(stillValid()) { "连接已切换，请重新上传图片" }
+                        if (ack.optInt("nextChunkIndex", index) <= index) break
+                        index = ack.optInt("nextChunkIndex")
+                    }
+                    check(index == AttachmentUploadPlan.totalChunks(attachment.bytes)) { "图片上传未完成，请重试" }
+                    val commit = connection.call("session/attachment/commit", obj("uploadId" to uploadId), timeout = 90_000)
+                    check(stillValid()) { "连接已切换，请重新上传图片" }
+                    check(commit.string("state") == "committed") { "图片提交未确认，请重试" }
+                    if (stillValid()) attachmentRefs[attachment.id] = commit.string("ref")
+                } else if (stillValid()) {
+                    attachmentRefs[attachment.id] = begin.string("ref")
+                }
+            } finally {
+                if (!stillValid()) withContext(NonCancellable) {
+                    // Abort only this old transaction on its captured connection.
+                    runCatching { withTimeout(3000) { connection.call("session/attachment/abort",
+                        obj("uploadId" to "upl-${attachment.id}"), timeout = 2500) } }
+                }
+                attachmentUploading.remove(attachment.id)
+            }
         }
     }
     fun stop() = action {

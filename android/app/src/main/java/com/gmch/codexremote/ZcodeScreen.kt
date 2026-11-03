@@ -1,6 +1,8 @@
 package com.gmch.codexremote
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -109,9 +111,15 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
                     ZcodeTimeline(state, vm, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
                     ChatSettingsBar(zcodeSettingsSummary(state), state.quotaSummary,
                         { showSettings = true }, { showSettings = true; vm.quota() })
+                    val pickImage = rememberAttachmentPicker(vm::attachmentScope, vm::addAttachment)
                     ChatComposer(state.draft, vm::draft, state.sending,
-                        state.connected && !state.busy && !state.pending && !state.sending && state.draft.isNotBlank() && state.selection != null,
-                        state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send)
+                        state.connected && !state.busy && !state.pending && !state.sending && !state.attachmentsBusy && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.selection != null,
+                        state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send,
+                        attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
+                        canAttach = state.attachmentsEnabled && !state.attachmentsBusy
+                            && state.attachments.size < ImagePolicy.MESSAGE_MAX && !state.sending && !state.busy,
+                        attach = pickImage,
+                        removeAttachment = vm::removeAttachment)
                     if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false },
                         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
                         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
@@ -415,5 +423,6 @@ internal fun ZcodeTimeline(state: ZcodeState, vm: ZcodeViewModel, modifier: Modi
             ({ vm.loadTurnDiff() }) else null,
         removeQueued = if (state.queueOpsEnabled) ({ vm.removeQueued(it) }) else null,
         promoteQueued = if (state.queueOpsEnabled) ({ vm.promoteQueued(it) }) else null,
+        dismissFailed = vm::dismissFailed,
         editQueued = if (state.queueOpsEnabled) ({ queued, text -> vm.editQueued(queued, text, queueContext) }) else null)
 }

@@ -21,8 +21,23 @@ fun JSONArray?.objects(): List<JSONObject> = if (this == null) emptyList() else
 fun JSONArray?.strings(): List<String> = if (this == null) emptyList() else
     (0 until length()).map { optString(it) }
 fun textInput(text: String) = JSONArray().put(obj("type" to "text", "text" to text))
+/** Codex local-image input item: the path is App-generated and points at dev-machine /tmp. */
+fun imageInput(path: String) = obj("type" to "localImage", "path" to path, "detail" to "auto")
+/** Message input mixing optional text with images: no empty text item for image-only sends. */
+fun messageInput(text: String, imagePaths: List<String> = emptyList()): JSONArray {
+    val input = if (text.isNotBlank()) textInput(text) else JSONArray()
+    imagePaths.forEach { input.put(imageInput(it)) }
+    return input
+}
 fun yolo() = obj("approvalPolicy" to "never", "sandbox" to "danger-full-access")
 fun shellQuote(value: String) = "'" + value.replace("'", "'\"'\"'") + "'"
+
+/** Placeholder label for image input items in timelines — never the path or data URL. */
+fun imageItemLabel(item: JSONObject): String = when (item.string("type")) {
+    "localImage" -> "[图片] " + item.string("path").substringAfterLast('/').takeLast(64)
+    "image" -> "[图片]"
+    else -> item.string("text", "[${item.string("type")}]")
+}
 
 data class SessionInfo(
     val id: String, val title: String, val cwd: String, val preview: String,
@@ -56,7 +71,7 @@ data class TimelineItem(val id: String, val kind: String, val text: String, val 
         fun parse(j: JSONObject): TimelineItem {
             val type = j.string("type")
             val text = when (type) {
-                "userMessage" -> j.optJSONArray("content").objects().joinToString("\n") { it.string("text", "[${it.string("type")}]") }
+                "userMessage" -> j.optJSONArray("content").objects().joinToString("\n") { imageItemLabel(it) }
                 "agentMessage", "plan" -> j.string("text")
                 "reasoning" -> j.optJSONArray("summary").strings().joinToString("\n")
                 "commandExecution" -> "$ ${j.string("command")}\n${j.string("aggregatedOutput")}"

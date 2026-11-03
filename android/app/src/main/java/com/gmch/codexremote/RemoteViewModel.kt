@@ -36,7 +36,8 @@ data class UiState(
     val historyLoading: Boolean = false, val historyError: String? = null, val sending: Boolean = false,
     val modelSettings: ModelSettings? = null, val settingsNotice: String? = null,
     val quota: AccountQuota? = null, val quotaLoading: Boolean = false, val quotaError: String? = null,
-    val approvals: List<PendingApproval> = emptyList()
+    val approvals: List<PendingApproval> = emptyList(),
+    val attachments: List<ChatAttachment> = emptyList(), val attachmentsBusy: Boolean = false
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
@@ -60,6 +61,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var jumpPassphrase = ""
     private var selectionVersion = 0
     private val timeline = LinkedHashMap<String, TimelineItem>()
+    private val imageProcessor by lazy { ImageProcessor(app) }
+    private val attachmentSerial = java.util.concurrent.atomic.AtomicLong(0)
+    // attachmentId -> dev-machine path written this scope. A retried batch reuses its path.
+    private val writtenFiles = LinkedHashMap<String, String>()
+    // Ids whose message may already reference the file (dispatch started, outcome known or
+    // unknown): never fs/remove'd. Once a send settles, entries leave writtenFiles instead.
+    private val protectedIds = HashSet<String>()
     private val statusRevisions = mutableMapOf<String, Long>()
     private val turnRevisions = mutableMapOf<String, Long>()
     // Locally-sent messages awaiting reconciliation, keyed by environment identity + session
@@ -178,6 +186,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun disconnect(reason: String = "已断开 · 执行保留在开发机") {
         epoch++
+        attachmentSerial.incrementAndGet()
         backgroundJob?.cancel(); backgroundJob = null; statusJob?.cancel()
         connectionJob?.cancel(); connectionJob = null; refreshJob?.cancel()
         resumeJob?.cancel(); resumeJob = null
@@ -196,8 +205,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 modelsLoading = false, quotaLoading = false, modelSettings = it.modelSettings?.copy(confirmed = false),
                 // Local cards die with the connection; the server keeps the request for
                 // other clients and a stale answer must never reach a new connection.
-                approvals = emptyList())
+                approvals = emptyList(),
+                // Attachment drafts are memory-scoped: a reconnect does not restore them,
+                // and the file registry dies with the connection scope.
+                attachments = emptyList(), attachmentsBusy = false)
         }
+        writtenFiles.clear()
     }
 
     fun saveProfile(profile: ConnectionProfile, targetPass: String, jumpPass: String) {
@@ -532,6 +545,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun openThread(session: SessionInfo) {
         selectionVersion++
         timeline.clear()
+        discardAttachmentDraft("切换会话")
         val outKey = OutgoingKey(mutable.value.profile.identity, session.id)
         // Re-entering a thread with a request still in flight must show 发送中 again —
         // otherwise the settled-protection banner would appear for an unsettled send.
@@ -578,7 +592,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             throw t
         }
     }
-    fun back() { selectionVersion++; mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", uncertain = null, diff = "", historyLoading = false, historyError = null, sending = false, outgoing = emptyList()) }; timeline.clear() }
+    fun back() { selectionVersion++; discardAttachmentDraft("返回列表"); mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", uncertain = null, diff = "", historyLoading = false, historyError = null, sending = false, outgoing = emptyList(), attachments = emptyList(), attachmentsBusy = false) }; timeline.clear() }
 
     private suspend fun loadThread(id: String) {
         val version = selectionVersion
@@ -692,6 +706,88 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { vault.put(localKey("draft", id), text) }.onFailure(::fail)
     }
 
+    /** Picks one image, decodes/normalizes it off the main thread, appends to the batch.
+     *  The pick is bound to its scope: a late result after a session switch, reconnect or
+     *  another pick is dropped, never appended into whatever is on screen now. */
+    fun attachmentScope(): String = "${epoch}:${selectionVersion}:${mutable.value.selected?.id}"
+
+    fun addAttachment(uri: Uri, displayName: String, mime: String?, scope: String = attachmentScope()) {
+        if (scope != attachmentScope()) return
+        if (mutable.value.attachmentsBusy) return
+        check(mutable.value.attachments.size < ImagePolicy.MESSAGE_MAX) { "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片" }
+        val generation = epoch
+        val selection = selectionVersion
+        val sessionId = mutable.value.selected?.id ?: return
+        val serial = attachmentSerial.incrementAndGet()
+        mutable.update { it.copy(attachmentsBusy = true, error = null) }
+        viewModelScope.launch {
+            val processed = withContext(Dispatchers.IO) { imageProcessor.process(uri, displayName, mime) }
+            // Only this pick may clear its own busy flag (the entry gate rejects parallel
+            // picks), but appending additionally requires the original scope.
+            if (attachmentSerial.get() != serial) return@launch
+            mutable.update { state ->
+                if (epoch != generation || selectionVersion != selection || state.selected?.id != sessionId)
+                    state.copy(attachmentsBusy = false)  // late result for a dead scope: drop it
+                else {
+                    val value = processed.getOrElse { e ->
+                        return@update state.copy(attachmentsBusy = false, error = e.message ?: "图片处理失败")
+                    }
+                    if (state.attachments.size >= ImagePolicy.MESSAGE_MAX)
+                        state.copy(attachmentsBusy = false, error = "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片")
+                    else state.copy(attachments = state.attachments + value, attachmentsBusy = false)
+                }
+            }
+        }
+    }
+
+    /** Removes a draft attachment. Files of dispatched (or dispatched-but-unsettled)
+     *  batches may already be referenced by the server and are never deleted; unsent
+     *  written files are removed exactly. */
+    fun removeAttachment(id: String) = action {
+        mutable.value.attachments.firstOrNull { it.id == id } ?: return@action
+        mutable.update { it.copy(attachments = it.attachments.filterNot { a -> a.id == id }, error = null) }
+        if (id in protectedIds) return@action
+        val path = writtenFiles.remove(id)
+        if (path != null && mutable.value.connected) {
+            val cleanupKey = "attachment-cleanup:${mutable.value.profile.identity}"
+            recordAttachmentCleanup(cleanupKey, path, true)
+            try { client().call("fs/remove", obj("path" to path)); recordAttachmentCleanup(cleanupKey, path, false) }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* Cleanup is best-effort; the file sits in /tmp. */ }
+        }
+    }
+
+    // Only exact, definitely-unsent paths enter this metadata-only cleanup journal.
+    private fun recordAttachmentCleanup(key: String, path: String, add: Boolean) {
+        val paths = runCatching { JSONArray(vault.get(key) ?: "[]") }.getOrDefault(JSONArray())
+        val values = (0 until paths.length()).map { paths.getString(it) }.toMutableSet()
+        if (add) values.add(path) else values.remove(path)
+        vault.put(key, JSONArray(values.toList()).toString())
+    }
+
+    /** Drops the in-memory attachment batch on scope switches; unsent written files are
+     *  removed exactly, dispatched/protected ones keep their files for the server. */
+    private fun discardAttachmentDraft(@Suppress("UNUSED_PARAMETER") reason: String) {
+        attachmentSerial.incrementAndGet()
+        val doomed = writtenFiles.filterKeys { it !in protectedIds }
+        writtenFiles.keys.removeAll { it !in protectedIds }
+        mutable.update { it.copy(attachments = emptyList(), attachmentsBusy = false) }
+        if (doomed.isEmpty() || !mutable.value.connected) return
+        val connection = client()
+        val cleanupKey = "attachment-cleanup:${mutable.value.profile.identity}"
+        viewModelScope.launch {
+            try {
+                doomed.values.forEach { recordAttachmentCleanup(cleanupKey, it, true) }
+                doomed.values.forEach { path ->
+                    connection.call("fs/remove", obj("path" to path))
+                    recordAttachmentCleanup(cleanupKey, path, false)
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* Best-effort cleanup of unsent files. */ }
+
+        }
+    }
+
     fun send(steer: Boolean) = action {
         val selected = mutable.value.selected ?: return@action
         val selection = selectionVersion
@@ -701,7 +797,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val pendingKey = localKey("pending", selected.id)
         val draftKey = localKey("draft", selected.id)
         val text = mutable.value.draft.trim()
-        require(text.isNotBlank()) { "请先输入消息" }
+        val attachments = mutable.value.attachments
+        require(text.isNotBlank() || attachments.isNotEmpty()) { "请先输入消息或添加图片" }
+        check(!steer || attachments.isEmpty()) { "带图片的消息暂不支持介入执行，请关闭插入模式" }
+        check(!mutable.value.attachmentsBusy) { "图片处理中，请稍候再发送" }
         check(mutable.value.uncertain == null) { "先核对上一条消息的发送状态" }
         // A previous send may still be in flight after a switch away and back; its persisted
         // receipt must not be overwritten by a second dispatch.
@@ -710,8 +809,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val receipt = obj("clientId" to clientId, "text" to text)
         // The bubble appears before any RPC: resumeSettings, the dispatch, and the first
         // streamed output all happen after the user already sees the message with 发送中.
-        addOutgoing(key, OutgoingMessage(selected.id, clientId, text, OutgoingState.SENDING))
-        mutable.update { it.copy(sending = true) }
+        addOutgoing(key, OutgoingMessage(selected.id, clientId,
+            listOf(text, attachments.joinToString(" ") { "[图片]" }).filter { it.isNotBlank() }.joinToString(" "),
+            OutgoingState.SENDING, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
+        mutable.update { it.copy(sending = true, attachmentsBusy = attachments.isNotEmpty()) }
         var dispatched = false
         var ackAccepted = false
         try {
@@ -724,12 +825,32 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // starting elsewhere must settle before we choose queue/steer semantics.
             if (attachment.unmaterialized) check(resumed.runtime == "idle") { "会话正在初始化，请稍后刷新再发送；草稿已保留" }
             if (steer) check(resumed.runtime == "active" && selected.activeTurnId.isNotBlank()) { "当前没有可介入的执行，请刷新后重试" }
-            val params = obj("threadId" to selected.id, "clientUserMessageId" to clientId, "input" to textInput(text))
+            // Images upload to fixed dev-machine paths first; a failed write keeps the whole
+            // batch for retry, and a retried batch reuses its already-written paths.
+            // Captured connection + scope: every suspension re-checks before touching
+            // shared registries, so a switch/reconnect mid-upload can never carry the old
+            // batch (or its writes) into the new connection.
+            val connection = client()
+            val imagePaths = attachments.map { item ->
+                check(generation == epoch && selection == selectionVersion) { "会话已切换，图片未发送" }
+                writtenFiles[item.id] ?: ImagePolicy.codexPath(item.id).also { path ->
+                    connection.call("fs/writeFile", obj("path" to path,
+                        "dataBase64" to java.util.Base64.getEncoder().encodeToString(item.data)))
+                    check(generation == epoch && selection == selectionVersion) { "会话已切换，图片未发送" }
+                    writtenFiles[item.id] = path
+                }
+            }
+            if (imagePaths.isNotEmpty()) receipt.put("imagePaths", JSONArray(imagePaths))
+            val params = obj("threadId" to selected.id, "clientUserMessageId" to clientId,
+                "input" to messageInput(text, imagePaths))
             // Persist before the write only. On timeout/disconnect after this point, do not
             // automatically replay a possibly accepted write.
             vault.put(pendingKey, receipt.toString())
             // Display only: the protection prompt stays owned by uncertain; sending merely hides it in flight.
             mutable.update { it.copy(uncertain = receipt) }
+            // From this point the server may consume the files at any time — even an
+            // unsettled (timeout/lost-receipt) send keeps them undeletable forever.
+            protectedIds.addAll(attachments.map { it.id })
             dispatched = true
             when {
                 steer -> {
@@ -751,8 +872,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             vault.put(pendingKey, null)
             val clearDraft = vault.get(draftKey)?.trim() == text
             if (clearDraft) vault.put(draftKey, "")
+            // Dispatched batches keep their dev-machine files (history restores by path);
+            // they leave the removable-registry so later cleanup can never touch them.
+            writtenFiles.keys.removeAll { it in protectedIds }
             if (generation == epoch && mutable.value.selected?.id == selected.id)
-                mutable.update { it.copy(draft = if (clearDraft) "" else it.draft, uncertain = null) }
+                mutable.update { it.copy(draft = if (clearDraft) "" else it.draft, uncertain = null,
+                    attachments = it.attachments.filterNot { a -> a.id in attachments.map { b -> b.id } },
+                    attachmentsBusy = if (selection == selectionVersion) false else it.attachmentsBusy) }
         } catch (e: RpcException) {
             // An explicit server rejection is authoritative: 发送失败, draft kept. Before the
             // write this also means nothing was sent; afterwards the server answered for the write.
@@ -783,7 +909,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // see the settled state; a different session's flag is untouched.
             if (epoch == generation && mutable.value.profile.identity == env &&
                 mutable.value.selected?.id == selected.id)
-                mutable.update { it.copy(sending = false) }
+                mutable.update { it.copy(sending = false, attachmentsBusy = if (selection == selectionVersion) false else it.attachmentsBusy) }
         }
         // Refresh boundary: after the ack was accepted, a failing history read must never
         // turn the already-accepted message into 发送失败/待确认 — it surfaces as historyError.
@@ -815,6 +941,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val list = outgoingBySession[key] ?: return
         val index = list.indexOfFirst { it.clientId == clientId }
         if (index >= 0) { list[index] = transform(list[index]); publishOutgoing(key) }
+    }
+
+    fun dismissFailed(message: OutgoingMessage) {
+        if (mutable.value.selected?.id != message.sessionId) return
+        val key = OutgoingKey(mutable.value.profile.identity, message.sessionId)
+        val current = outgoingBySession[key]?.find { it.clientId == message.clientId } ?: return
+        if (current.state == OutgoingState.FAILED) removeOutgoing(key, current.clientId)
     }
 
     private fun removeOutgoing(key: OutgoingKey, clientId: String) {

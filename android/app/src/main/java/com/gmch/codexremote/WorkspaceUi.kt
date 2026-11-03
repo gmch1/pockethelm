@@ -1,8 +1,10 @@
 package com.gmch.codexremote
 
+import kotlinx.coroutines.launch
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -20,6 +22,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -233,30 +236,33 @@ internal fun WorkspaceListPage(engine: String, onEngine: (String) -> Unit,
             if (!connected) OfflineBanner(busy, reconnect)
             WorkspaceError(error, dismissError, detail)
             topExtra()
-            LazyColumn(Modifier.weight(1f), state = list) {
-                if (filtered.isEmpty()) item(key = "empty") {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 72.dp), horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(when {
-                            filtersActive -> "没有匹配的会话"
-                            sessions.isNotEmpty() -> "没有匹配的会话"
-                            busy -> "正在加载会话…"
-                            !connected -> "连接后加载会话"
-                            error != null -> "会话加载失败"
-                            else -> "暂无会话"
-                        }, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (filtersActive) TextButton({ search = ""; projectPath = ""; onlyRunning = false }) { Text("清除筛选") }
-                        if (error != null && !busy) TextButton(refresh, enabled = connected) { Text("重试") }
+            PullToRefreshBox(isRefreshing = busy, onRefresh = { if (connected && !busy) refresh() },
+                modifier = Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(Modifier.fillMaxSize(), state = list) {
+                    if (filtered.isEmpty()) item(key = "empty") {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 72.dp), horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(when {
+                                filtersActive -> "没有匹配的会话"
+                                sessions.isNotEmpty() -> "没有匹配的会话"
+                                busy -> "正在加载会话…"
+                                !connected -> "连接后加载会话"
+                                error != null -> "会话加载失败"
+                                else -> "暂无会话"
+                            }, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (filtersActive) TextButton({ search = ""; projectPath = ""; onlyRunning = false }) { Text("清除筛选") }
+                            if (error != null && !busy) TextButton(refresh, enabled = connected) { Text("重试") }
+                        }
                     }
+                    items(filtered, key = { it.id }) { row ->
+                        SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
+                            preview = row.preview, pending = row.pendingInteractions,
+                            unread = row.unread, background = row.backgroundWork) { open(row.id) }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
+                    }
+                    if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
+                    item { Spacer(Modifier.height(8.dp)) }
                 }
-                items(filtered, key = { it.id }) { row ->
-                    SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
-                        preview = row.preview, pending = row.pendingInteractions,
-                        unread = row.unread, background = row.backgroundWork) { open(row.id) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
-                }
-                if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
-                item { Spacer(Modifier.height(8.dp)) }
             }
         }
     }
@@ -359,37 +365,83 @@ private fun SheetOption(selected: Boolean, onClick: () -> Unit, content: @Compos
     }
 }
 
+/** Captures the scope at launch, before Android may pause/recreate the picker UI. */
+@Composable
+internal fun rememberAttachmentPicker(scope: () -> String,
+    picked: (android.net.Uri, String, String?, String) -> Unit): () -> Unit {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val processor = remember(context) { ImageProcessor(context) }
+    val jobs = rememberCoroutineScope()
+    var pendingScope by rememberSaveable { mutableStateOf<String?>(null) }
+    val launcher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()) { uri ->
+        val token = pendingScope
+        pendingScope = null
+        if (uri != null && token != null) jobs.launch {
+            val info = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { processor.sourceInfo(uri) }
+            picked(uri, info.first, info.second, token)
+        }
+    }
+    return { pendingScope = scope(); launcher.launch(androidx.activity.result.PickVisualMediaRequest(
+        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+}
+
 @Composable
 internal fun ChatComposer(draft: String, change: (String) -> Unit, sending: Boolean, canSend: Boolean,
-    insert: Boolean, changeInsert: (Boolean) -> Unit, send: () -> Unit) {
+    insert: Boolean, changeInsert: (Boolean) -> Unit, send: () -> Unit,
+    attachments: List<ChatAttachment> = emptyList(), attachmentsBusy: Boolean = false,
+    canAttach: Boolean = false, attach: () -> Unit = {}, removeAttachment: (String) -> Unit = {}) {
     val compact = WindowInsets.ime.getBottom(LocalDensity.current) > 0 || LocalConfiguration.current.screenHeightDp < 480
     var editing by remember { mutableStateOf(false) }
     Surface(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), shape = RoundedCornerShape(16.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp,
             if (editing) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            val mode = if (insert) "插入" else "排队"
-            Box(Modifier.width(64.dp).height(48.dp).focusProperties { canFocus = false }
-                .semantics { contentDescription = "发送方式"; stateDescription = mode }
-                .clickable(role = Role.Button, onClickLabel = if (insert) "切换为排队" else "切换为插入") { changeInsert(!insert) },
-                contentAlignment = Alignment.Center) {
-                Surface(Modifier.fillMaxWidth().height(28.dp), shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                    Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center) {
-                        Text(mode, fontSize = 12.sp, maxLines = 1, fontWeight = FontWeight.Medium)
-                        Spacer(Modifier.width(4.dp))
-                        Icon(Icons.Outlined.SwapVert, null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Column {
+            if (attachments.isNotEmpty() || attachmentsBusy) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 2.dp)
+                    .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    attachments.forEach { attachment ->
+                        InputChip(selected = false, onClick = {},
+                            label = { Text(attachment.summary(), fontSize = 11.sp, maxLines = 1) },
+                            trailingIcon = {
+                                Icon(Icons.Outlined.Close, "移除图片", Modifier.size(14.dp).clickable(
+                                    role = Role.Button, onClickLabel = "移除图片") { removeAttachment(attachment.id) })
+                            })
                     }
+                    if (attachmentsBusy) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
                 }
             }
-            TextField(draft, change, Modifier.weight(1f).onFocusChanged { editing = it.isFocused }.heightIn(max = if (compact) 88.dp else 160.dp),
-                placeholder = { Text("描述任务，或补充要求…", fontSize = 13.sp) }, maxLines = if (compact) 2 else 5,
-                colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
-                    focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
-            FilledIconButton(send, enabled = canSend, modifier = Modifier.size(48.dp)) {
-                if (sending) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                else Icon(Icons.AutoMirrored.Outlined.Send, "发送消息")
+            Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                val mode = if (insert) "插入" else "排队"
+                Box(Modifier.width(64.dp).height(48.dp).focusProperties { canFocus = false }
+                    .semantics { contentDescription = "发送方式"; stateDescription = mode }
+                    .clickable(role = Role.Button, onClickLabel = if (insert) "切换为排队" else "切换为插入") { changeInsert(!insert) },
+                    contentAlignment = Alignment.Center) {
+                    Surface(Modifier.fillMaxWidth().height(28.dp), shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                        Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center) {
+                            Text(mode, fontSize = 12.sp, maxLines = 1, fontWeight = FontWeight.Medium)
+                            Spacer(Modifier.width(4.dp))
+                            Icon(Icons.Outlined.SwapVert, null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+                IconButton(attach, enabled = canAttach, modifier = Modifier.size(40.dp)
+                    .semantics { contentDescription = "添加图片" }) {
+                    if (attachmentsBusy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.Outlined.Image, "添加图片", Modifier.size(20.dp))
+                }
+                TextField(draft, change, Modifier.weight(1f).onFocusChanged { editing = it.isFocused }.heightIn(max = if (compact) 88.dp else 160.dp),
+                    placeholder = { Text("描述任务，或补充要求…", fontSize = 13.sp) }, maxLines = if (compact) 2 else 5,
+                    colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+                FilledIconButton(send, enabled = canSend, modifier = Modifier.size(48.dp)) {
+                    if (sending) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.AutoMirrored.Outlined.Send, "发送消息")
+                }
             }
         }
     }
@@ -445,7 +497,8 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
     modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit,
     diff: String = "", removeQueued: ((QueuedMessage) -> Unit)? = null,
     turnSummary: TurnDiffSummary? = null, onTurnDiff: (() -> Unit)? = null,
-    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null) {
+    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null,
+    dismissFailed: ((OutgoingMessage) -> Unit)? = null) {
     val list = rememberLazyListState()
     var follow by rememberSaveable { mutableStateOf(true) }
     var jump by remember { mutableStateOf<String?>(null) }
@@ -491,7 +544,11 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
             items(rows, key = { it.key }) { row -> when {
                 row.activity.isNotEmpty() -> ActivitySummary(row.activity, detail)
                 row.item != null -> TimelineCard(row.item, agentName = agent, detail = detail)
-                row.outgoing != null -> OutgoingCard(row.outgoing, detail)
+                row.outgoing != null -> Column {
+                    OutgoingCard(row.outgoing, detail)
+                    if (row.outgoing.state == OutgoingState.FAILED && dismissFailed != null)
+                        TextButton({ dismissFailed(row.outgoing) }) { Text("移除失败记录") }
+                }
                 row.queued != null -> Column {
                     OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队"), detail)
                     QueuedItemActions(row.queued, connected && !busy, removeQueued, promoteQueued,
