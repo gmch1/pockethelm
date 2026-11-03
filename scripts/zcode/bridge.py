@@ -5,9 +5,11 @@ No generic RPC forwarding, account mutations, token export or shell endpoint.
 The user's Full access tasks still execute with the development account's rights.
 """
 import base64
+import fcntl
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import signal
@@ -19,6 +21,26 @@ from wire import Client, WireError, MAX_FRAME
 from session_index import SessionIndexes
 
 MAX_LINE = 256 * 1024
+
+# Start Plan cross-day recovery (task 2026-11-03-start-plan-daily-recovery). One dev
+# machine hosts one bridge process per SSH connection; the lock/cooldown files below
+# are shared by all of them. Storage problems skip recovery entirely (fail-closed):
+# an unrecordable attempt must never allow an unrecordable refresh.
+RECOVERY_COOLDOWN_SECONDS = 90.0
+RECOVERY_WORK_BUDGET_SECONDS = 25.0
+RECOVERY_STEP_CAP_SECONDS = 10.0
+RECOVERY_MIN_STEP_SECONDS = 2.0
+RECOVERY_CLEANUP_BUDGET_SECONDS = 3.0
+RECOVERY_LOG_MAX_LINES = 100
+# Protocol values are hyphenated (shared/src/account-provider-state.ts).
+RECOVERABLE_REASONS = ('not-entitled', 'credential-failed')
+
+
+def recovery_paths(root=None):
+    base = Path(root) if root else Path.home() / '.local/state/pockethelm'
+    return {'lock': base / 'zcode-start-plan-refresh.lock',
+        'cooldown': base / 'zcode-start-plan-refresh',
+        'log': base / 'zcode-start-plan-recovery' / 'log.jsonl'}
 
 # Interaction projection limits. Identity fields (interaction/option IDs, option values,
 # question texts that key content.answers) are validated against these bounds and never
@@ -555,12 +577,13 @@ class AttachmentTransaction:
 
 
 class Bridge:
-    def __init__(self, client):
+    def __init__(self, client, recovery=None):
         self.client = client
         self.client_id = None
         self.target = None
         self.subscription = None
         self.listener = None
+        self.recovery = recovery or recovery_paths()
         self.indexes = SessionIndexes(self, Assembler)
         self.client.event_handler = self.indexes.event
         self.attachments = {}                   # uploadId -> AttachmentTransaction (open)
@@ -573,9 +596,23 @@ class Bridge:
         return self.call('zcode-agent', method, params)
 
     def catalog(self):
-        view = self.call('model-selection', 'getView')
-        settings_view = self.call('provider-settings', 'getView')
-        settings = self.call('setting', 'get')
+        data = self._catalog_views()
+        if self.stale_start_plans(data['settings_view']):
+            # Self-healing recovery runs on an isolated transport with its own budgets;
+            # the business connection never carries recovery traffic (task
+            # 2026-11-03-start-plan-daily-recovery, review-approved plan).
+            fresh = self.attempt_start_plan_recovery(data)
+            if fresh is not None:
+                data = fresh
+        return self._assemble_catalog(data)
+
+    def _catalog_views(self):
+        return {'view': self.call('model-selection', 'getView'),
+            'settings_view': self.call('provider-settings', 'getView'),
+            'settings': self.call('setting', 'get')}
+
+    def _assemble_catalog(self, data):
+        view, settings_view, settings = data['view'], data['settings_view'], data['settings']
         records = {p['providerId']: p for p in settings_view['providers']}
         providers = []
         for provider in view['providers']:
@@ -597,6 +634,138 @@ class Bridge:
                 'guard': guard_for(record, settings)})
         return {'providers': providers, 'preferred': view.get('preferredSelection'),
             'planScope': '开发机已连接的计划；团队/账号切换暂需在 ZCode 完成，刷新后生效。'}
+
+    def stale_start_plans(self, settings_view):
+        """Start Plan settings records that are enabled and current but not executable
+        with a potentially self-healing account state (transient judgment inside the
+        daily rollover window). Definitive reasons (never connected / logged out) and
+        non-current or disabled providers never trigger recovery."""
+        found = []
+        for record in settings_view.get('providers') or []:
+            if not isinstance(record, dict):
+                continue
+            effective = record.get('effectiveConfig')
+            access = effective.get('access') if isinstance(effective, dict) else None
+            if not isinstance(access, dict) or access.get('mode') != 'start-plan':
+                continue
+            if record.get('executable') is True or record.get('enabled') is not True:
+                continue
+            state = record.get('accountState')
+            if not isinstance(state, dict) or state.get('current') is not True:
+                continue
+            availability = state.get('availability')
+            recoverable = availability in ('pending', 'unknown') or (
+                availability == 'unavailable'
+                and state.get('unavailableReason') in RECOVERABLE_REASONS)
+            if recoverable:
+                found.append({'providerId': record.get('providerId'),
+                    'availability': availability,
+                    'unavailableReason': state.get('unavailableReason')})
+        return found
+
+    def recovery_gate(self):
+        """Fail-closed rate limiter shared by every bridge process on this machine.
+        Returns the held lock fd, or None when recovery must be skipped (cooldown
+        active, another instance holding the lock, or any storage problem)."""
+        paths = self.recovery
+        try:
+            paths['lock'].parent.mkdir(parents=True, exist_ok=True)
+            try:
+                last = float(paths['cooldown'].read_text().strip())
+                if time.time() - last < RECOVERY_COOLDOWN_SECONDS:
+                    return None
+            except FileNotFoundError:
+                pass
+            fd = os.open(paths['lock'], os.O_RDWR | os.O_CREAT, 0o600)
+        except (OSError, ValueError):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        try:
+            # The attempt record IS the start of the attempt: failures count too.
+            paths['cooldown'].write_text(str(time.time()))
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    def attempt_start_plan_recovery(self, old):
+        """One bounded recovery attempt on an isolated transport (its own proxy-stdio
+        child and handshake). The business connection never carries recovery traffic,
+        so a half-frame desync here can never touch it. Any failure — init, refresh,
+        any of the three view reads — closes the temporary transport and returns None
+        (the caller keeps the complete pre-recovery data, never half of it)."""
+        fd = self.recovery_gate()
+        if fd is None:
+            return None
+        transport = None
+        try:
+            deadline = time.monotonic() + RECOVERY_WORK_BUDGET_SECONDS
+            transport = Client()
+            def bounded(channel, method):
+                remaining = deadline - time.monotonic()
+                if remaining < RECOVERY_MIN_STEP_SECONDS:
+                    raise TimeoutError('恢复预算不足')
+                return transport.call(channel, method, None,
+                    timeout=min(remaining, RECOVERY_STEP_CAP_SECONDS))
+            data = {'view': bounded('model-selection', 'getView'),
+                'settings_view': bounded('provider-settings', 'getView'),
+                'settings': bounded('setting', 'get')}
+            self.log_recovery(old, data, None)
+            return data
+        except Exception as error:
+            self.log_recovery(old, None, error)
+            return None
+        finally:
+            if transport is not None:
+                transport.close(cleanup_budget=RECOVERY_CLEANUP_BUDGET_SECONDS)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def log_recovery(self, old, fresh, error):
+        """Desensitized before/after evidence for H1/H2 adjudication. Best-effort:
+        storage problems never affect the recovery result. The bridge cannot see
+        HTTP status, response Date or entitlement times — root-cause attribution
+        beyond provider recovery needs upstream diagnostics."""
+        def summarize(data):
+            if not isinstance(data, dict):
+                return None
+            records = {}
+            for record in (data.get('settings_view') or {}).get('providers') or []:
+                if isinstance(record, dict) and record.get('providerId'):
+                    records[record['providerId']] = record
+            models_by_id = {}
+            for provider in (data.get('view') or {}).get('providers') or []:
+                if isinstance(provider, dict) and provider.get('providerId'):
+                    models_by_id[provider['providerId']] = provider.get('models') or []
+            out = []
+            for provider_id, record in records.items():
+                access = (record.get('effectiveConfig') or {}).get('access') or {}
+                if access.get('mode') != 'start-plan':
+                    continue
+                state = record.get('accountState') or {}
+                out.append({'providerId': provider_id,
+                    'executable': record.get('executable'),
+                    'availability': state.get('availability'),
+                    'unavailableReason': state.get('unavailableReason'),
+                    'modelCount': len(models_by_id.get(provider_id) or [])})
+            return out or None
+        entry = {'at': int(time.time() * 1000), 'before': summarize(old), 'after': summarize(fresh)}
+        if error is not None:
+            entry['error'] = str(error)[:200]
+        try:
+            path = self.recovery['log']
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = path.read_text().splitlines()[-RECOVERY_LOG_MAX_LINES:] if path.exists() else []
+            lines.append(json.dumps(entry, ensure_ascii=False))
+            path.write_text('\n'.join(lines) + '\n')
+        except Exception:
+            pass
 
     def check_selection(self, params):
         chosen = selection(params.get('selection'))

@@ -59,11 +59,64 @@ class QuotaAutoRefreshTest {
         // The summary bar reflects the fetched quota, not the placeholder.
         withTimeout(10_000) { while (vm.state.value.quotaSummary == "额度 ▾") delay(20) }
         assertTrue(vm.state.value.quotaSummary.contains("剩余"))
-        // Dedup: re-opening within the window does not fire a second quota RPC.
+        // Dedup: re-opening within the TTL does not fire a second quota RPC.
         val count = quotaCalls.size
         instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
         delay(1_500)
-        assertEquals("30s 内不重复拉取", count, quotaCalls.size)
+        assertEquals("TTL 内不重复拉取", count, quotaCalls.size)
+        instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
+        bridge.close()
+    }
+
+    @Test fun expiredCacheRefetchesOnNextSessionEntry() = runBlocking {
+        fresh()
+        val quotaCalls = ConcurrentLinkedQueue<JSONObject>()
+        bridge.scripted["session/read"] = { readResult() }
+        bridge.scripted["quota"] = { req ->
+            quotaCalls.add(req.optJSONObject("params")!!)
+            obj("planKind" to "individual-coding-plan", "limits" to JSONArray().put(
+                obj("unit" to 3, "number" to 5, "percentage" to 10.0, "currentValue" to 4.5))) }
+        bridge.install()
+        instrumentation.runOnMainSync { vm.quotaTtlMs = 300 }
+        instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
+        withTimeout(15_000) { while (quotaCalls.isEmpty()) delay(20) }
+        withTimeout(10_000) { while (vm.state.value.quotaSummary == "额度 ▾") delay(20) }
+        // TTL elapsed: the next entry re-fetches even though the selection is unchanged,
+        // so consumption and period resets surface without a manual tap.
+        val first = quotaCalls.size
+        withTimeout(15_000) {
+            while (quotaCalls.size <= first) {
+                delay(300)
+                instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
+            }
+        }
+        assertTrue(quotaCalls.size > first)
+        instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
+        bridge.close()
+    }
+
+    @Test fun failedFetchKeepsPlaceholderAndRetriesOnNextEntry() = runBlocking {
+        fresh()
+        val quotaCalls = ConcurrentLinkedQueue<JSONObject>()
+        var fail = true
+        bridge.scripted["session/read"] = { readResult() }
+        bridge.scripted["quota"] = { req ->
+            quotaCalls.add(req.optJSONObject("params")!!)
+            if (fail) throw FakeRpcBridge.FakeRpcError(-32001, "额度服务暂不可用")
+            obj("planKind" to "individual-coding-plan", "limits" to JSONArray().put(
+                obj("unit" to 3, "number" to 5, "percentage" to 20.0, "currentValue" to 4.0))) }
+        bridge.install()
+        instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
+        withTimeout(15_000) { while (quotaCalls.isEmpty()) delay(20) }
+        withTimeout(10_000) { while (vm.state.value.quota != "额度暂不可用，请重试") delay(20) }
+        assertEquals("额度 ▾", vm.state.value.quotaSummary)
+        // Failure keeps the placeholder, which bypasses the cache: the next entry
+        // retries instead of deduping against the failed attempt.
+        fail = false
+        instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
+        withTimeout(15_000) { while (vm.state.value.quotaSummary == "额度 ▾") delay(20) }
+        assertTrue(vm.state.value.quotaSummary.contains("剩余"))
+        assertTrue(quotaCalls.size >= 2)
         instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
         bridge.close()
     }

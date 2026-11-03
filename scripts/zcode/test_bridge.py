@@ -1,18 +1,21 @@
 import copy
 import base64
+import fcntl
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import sys
+import time
 import unittest
 import zlib
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from bridge import (Assembler, Bridge, RequestError, guard_for, project_rows, project_quota,
     project_interactions, interaction_answer, project_turn, project_file_changes,
-    ATTACHMENT_ROW_MAX, ATTACHMENT_TRANSACTIONS_MAX)
+    ATTACHMENT_ROW_MAX, ATTACHMENT_TRANSACTIONS_MAX, recovery_paths)
 from wire import Client, WireError, decode, encode
 from install import dispatcher
 
@@ -978,6 +981,227 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['bridgeVersion'], 1)
         for capability in ('interactions', 'queueOps', 'turnSummary', 'fileChanges', 'indexMeta'):
             self.assertTrue(result['capabilities'][capability])
+
+
+class StartPlanRecoveryTests(unittest.TestCase):
+    # ---- Start Plan cross-day recovery (task 2026-11-03-start-plan-daily-recovery) ----
+
+    def start_plan_record(self, executable=False, enabled=True, current=True,
+                          availability='pending', reason=None):
+        state = {'availability': availability, 'current': current}
+        if reason:
+            state['unavailableReason'] = reason
+        return {'providerId': 'account:bigmodel-start-plan',
+            'enabled': enabled, 'executable': executable, 'accountState': state,
+            'effectiveConfig': {'access': {'type': 'zhipu-account',
+                'accountType': 'bigmodel', 'mode': 'start-plan'}}}
+
+    def model_view(self, models):
+        return {'providers': [{'providerId': 'account:bigmodel-start-plan',
+            'providerName': 'Start Plan', 'config': {'access': {
+                'type': 'zhipu-account', 'accountType': 'bigmodel', 'mode': 'start-plan'}},
+            'models': [{'modelId': m, 'config': {'optionSpecs': {
+                'reasoningLevel': {'values': ['low']}}}} for m in models]}]}
+
+    def old_data(self):
+        # Pending cleared the model whitelist upstream: provider visible but 0 models.
+        return {'view': self.model_view([]),
+            'settings_view': {'providers': [self.start_plan_record()]},
+            'settings': {}}
+
+    def fresh_data(self):
+        return {'view': self.model_view(['GLM-5.3-Flash']),
+            'settings_view': {'providers': [self.start_plan_record(executable=True,
+                availability='available')]},
+            'settings': {}}
+
+    def recovery_bridge(self, client, transport_factory):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = recovery_paths(self._tmp.name)
+        bridge = Bridge(client, recovery=self.paths)
+        bridge.client_id = 'pockethelm-test'
+        patcher = patch('bridge.Client', side_effect=transport_factory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return bridge
+
+    def test_catalog_recovers_pending_start_plan_via_settings_refresh(self):
+        client = Mock()
+        client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
+            self.old_data()['settings']]
+        transport = Mock()
+        transport.call.side_effect = [self.fresh_data()['view'], self.fresh_data()['settings_view'],
+            self.fresh_data()['settings']]
+        bridge = self.recovery_bridge(client, lambda: transport)
+        result = bridge.dispatch('catalog', {})
+        # Recovered from the empty-model pending view to a model-bearing view.
+        provider = next(p for p in result['providers'] if p['id'] == 'account:bigmodel-start-plan')
+        self.assertEqual(provider['models'], [{'id': 'GLM-5.3-Flash', 'levels': ['low']}])
+        self.assertEqual(provider['planKind'], 'start-plan')
+        # Isolated transport only: three bounded calls, budget never exceeded.
+        self.assertEqual(transport.call.call_count, 3)
+        for call in transport.call.call_args_list:
+            self.assertEqual(call.args[:2], ('model-selection', 'getView') if
+                call.args[0] == 'model-selection' else call.args[:2])
+            self.assertLessEqual(call.kwargs['timeout'], 10.0)
+            self.assertGreater(call.kwargs['timeout'], 0.0)
+        transport.close.assert_called_once_with(cleanup_budget=3.0)
+        # Attempt recorded (cooldown) and desensitized evidence logged.
+        self.assertLessEqual(time.time() - float(self.paths['cooldown'].read_text()), 90.0)
+        entry = json.loads(self.paths['log'].read_text().splitlines()[-1])
+        self.assertEqual(entry['after'][0]['modelCount'], 1)
+        self.assertEqual(entry['after'][0]['executable'], True)
+        self.assertEqual(entry['before'][0]['modelCount'], 0)
+        self.assertNotIn('token', json.dumps(entry))
+
+    def test_recovery_cooldown_blocks_second_attempt(self):
+        client = Mock()
+        client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
+            self.old_data()['settings'], self.old_data()['view'],
+            self.old_data()['settings_view'], self.old_data()['settings']]
+        transport = Mock()
+        transport.call.side_effect = [self.fresh_data()['view'], self.fresh_data()['settings_view'],
+            self.fresh_data()['settings']]
+        bridge = self.recovery_bridge(client, lambda: transport)
+        first = bridge.dispatch('catalog', {})
+        self.assertTrue(any(p['id'] == 'account:bigmodel-start-plan' for p in first['providers']))
+        second = bridge.dispatch('catalog', {})
+        # Cooldown active: no second transport, stale provider filtered from the list.
+        self.assertEqual(transport.call.call_count, 3)
+        self.assertFalse(any(p['id'] == 'account:bigmodel-start-plan' for p in second['providers']))
+
+    def test_recovery_failures_return_complete_old_views(self):
+        from wire import WireError
+        cases = {
+            'init': None,
+            'first_view': [WireError('boom'), ],
+            'second_view': [Mock(), WireError('boom')],
+            'third_view': [Mock(), Mock(), WireError('boom')],
+        }
+        for name, effects in cases.items():
+            with self.subTest(case=name):
+                client = Mock()
+                client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
+                    self.old_data()['settings']]
+                transport = Mock()
+                if effects is None:
+                    factory = Mock(side_effect=WireError('handshake failed'))
+                else:
+                    transport.call.side_effect = effects
+                    factory = lambda t=transport: t
+                bridge = self.recovery_bridge(client, factory)
+                result = bridge.dispatch('catalog', {})
+                # Complete old views: stale provider filtered, no mixed data, no crash.
+                self.assertFalse(any(p['id'] == 'account:bigmodel-start-plan'
+                    for p in result['providers']))
+                self.assertEqual(client.call.call_count, 3)
+                entry = json.loads(self.paths['log'].read_text().splitlines()[-1])
+                self.assertIn('error', entry)
+                self.assertIsNone(entry['after'])
+
+    def test_recovery_mutex_flock_and_storage_failures(self):
+        import os as os_module
+        client = Mock()
+        client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
+            self.old_data()['settings']] * 4
+        transport = Mock()
+        bridge = self.recovery_bridge(client, lambda: transport)
+        # Another process holds the lock: no recovery.
+        self.paths['lock'].parent.mkdir(parents=True, exist_ok=True)
+        holder = os_module.open(self.paths['lock'], os_module.O_RDWR | os_module.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            bridge.dispatch('catalog', {})
+            transport.call.assert_not_called()
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN); os_module.close(holder)
+        # Cooldown file unwritable/unreadable (a directory): fail-closed, no recovery.
+        self.paths['cooldown'].unlink(missing_ok=True)
+        self.paths['cooldown'].mkdir()
+        try:
+            bridge.dispatch('catalog', {})
+            transport.call.assert_not_called()
+        finally:
+            self.paths['cooldown'].rmdir()
+        # Lock file path occupied by a directory: fail-closed too.
+        self.paths['lock'].unlink(missing_ok=True)
+        self.paths['lock'].mkdir()
+        try:
+            bridge.dispatch('catalog', {})
+            transport.call.assert_not_called()
+        finally:
+            self.paths['lock'].rmdir()
+
+    def test_recovery_skips_non_transient_states(self):
+        variants = [
+            self.start_plan_record(availability='unavailable', reason='not-connected'),
+            self.start_plan_record(availability='unavailable', reason='not-authenticated'),
+            self.start_plan_record(current=False),
+            self.start_plan_record(enabled=False),
+            self.start_plan_record(executable=True, availability='available'),
+            self.start_plan_record(availability='available'),
+        ]
+        for record in variants:
+            with self.subTest(availability=record['accountState']['availability'],
+                              reason=record['accountState'].get('unavailableReason'),
+                              current=record['accountState']['current'],
+                              enabled=record['enabled'], executable=record['executable']):
+                client = Mock()
+                data = self.old_data()
+                data['settings_view'] = {'providers': [record]}
+                client.call.side_effect = [data['view'], data['settings_view'], data['settings']]
+                transport = Mock()
+                bridge = self.recovery_bridge(client, lambda: transport)
+                bridge.dispatch('catalog', {})
+                transport.call.assert_not_called()
+
+    def test_recovery_deadline_boundaries_never_clamp_timeout(self):
+        import bridge as bridge_module
+        client = Mock()
+        client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
+            self.old_data()['settings']] * 2
+        transport = Mock()
+        bridge = self.recovery_bridge(client, lambda: transport)
+        # Budget already exhausted (negative): transport built, but no call is issued.
+        with patch.object(bridge_module, 'RECOVERY_WORK_BUDGET_SECONDS', -1.0):
+            result = bridge.dispatch('catalog', {})
+        self.assertFalse(any(p['id'] == 'account:bigmodel-start-plan' for p in result['providers']))
+        transport.call.assert_not_called()
+        transport.close.assert_called_once_with(cleanup_budget=3.0)
+        # 0.2s remaining is below the minimum step: same abort, no clamped 1s call.
+        transport2 = Mock()
+        bridge2 = self.recovery_bridge(client, lambda: transport2)
+        with patch.object(bridge_module, 'RECOVERY_WORK_BUDGET_SECONDS', 0.2):
+            bridge2.dispatch('catalog', {})
+        transport2.call.assert_not_called()
+
+    def test_wire_close_shares_cleanup_budget_and_survives_stubborn_child(self):
+        import subprocess
+        from wire import Client as WireClient
+        def make(process_wait_effects):
+            c = WireClient.__new__(WireClient)
+            c.process = Mock()
+            c.process.wait.side_effect = process_wait_effects
+            c.process.stdin = Mock(); c.process.stdout = Mock()
+            return c
+        # terminate wait times out, kill issued, post-kill reclamation also times out:
+        # close still returns bounded, closes fds, never raises.
+        stubborn = make([subprocess.TimeoutExpired(cmd='p', timeout=3),
+                         subprocess.TimeoutExpired(cmd='p', timeout=0)])
+        proc = stubborn.process
+        stubborn.close(cleanup_budget=3.0)
+        proc.kill.assert_called_once()
+        self.assertIsNone(stubborn.process)
+        proc.stdin.close.assert_called_once()
+        proc.stdout.close.assert_called_once()
+        # Normal exit: terminate wait succeeds, no kill.
+        normal = make([None])
+        nproc = normal.process
+        normal.close()
+        nproc.kill.assert_not_called()
+        self.assertIsNone(normal.process)
 
 
 if __name__ == '__main__':

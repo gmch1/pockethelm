@@ -501,12 +501,22 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
      *  keeps the cached display; a different plan or reconnect re-fetches. Silently
      *  skipped while no valid selection exists (manual tap stays as the fallback). */
     private var quotaFetchedFor: ZSelection? = null
+    private var quotaFetchedAt: Long = 0
+    /** Successful-quota display TTL (task 2026-11-03-start-plan-daily-recovery R1): a
+     *  cached summary older than this re-fetches on the next session entry, so plan
+     *  consumption and period resets surface without a manual tap. A failed fetch
+     *  keeps the placeholder, which bypasses the cache and retries anyway. The cache
+     *  source is the selection it was fetched for (plan + model + guard). */
+    internal var quotaTtlMs: Long = 10 * 60_000L
+
     private fun autoRefreshQuota() {
         val choice = mutable.value.selection ?: return
         val provider = mutable.value.providers.find { it.id == choice.provider } ?: return
         if (provider.guard != mutable.value.selectionGuard || provider.models.none { it.id == choice.model }) return
-        if (choice == quotaFetchedFor && mutable.value.quotaSummary != "额度 ▾") return
+        val cached = choice == quotaFetchedFor && mutable.value.quotaSummary != "额度 ▾"
+        if (cached && System.currentTimeMillis() - quotaFetchedAt < quotaTtlMs) return
         quotaFetchedFor = choice
+        quotaFetchedAt = System.currentTimeMillis()
         quota()
     }
     fun create(project: ZProject) = action {

@@ -218,14 +218,27 @@ class Client:
         self.frame(struct.pack('!BIII', 1, 0, 0, len(payload)) + payload)
         self.events[:] = [(listener, body) for listener, body in self.events if listener != identity]
 
-    def close(self):
-        if self.process is not None:
-            self.process.terminate()
+    def close(self, cleanup_budget=3.0):
+        """Terminate the proxy within a bounded cleanup budget shared between the
+        terminate wait and post-kill reclamation (task 2026-11-03 start-plan recovery:
+        the caller's business thread must never execute an unbounded wait here). A
+        SIGKILLed child always exits; if the budget runs out before reaping, the
+        connection-scoped bridge process exit leaves the reaping to init."""
+        process, self.process = self.process, None
+        if process is None:
+            return
+        deadline = time.monotonic() + max(0.0, cleanup_budget)
+        process.terminate()
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
             try:
-                self.process.wait(timeout=3)
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-            for stream in (self.process.stdin, self.process.stdout):
+                pass
+        for stream in (process.stdin, process.stdout):
+            try:
                 stream.close()
-            self.process = None
+            except Exception:
+                pass
