@@ -9,7 +9,7 @@
   1. `RemoteViewModel.scheduleRefresh()` 的刷新循环用 `runCatching { loadSessions(false) }.onFailure { fail(it) }`——`runCatching` 会捕获 `CancellationException`；`refreshJob?.cancel()`（锁屏 `background()`、切标签 `leave()`、重连重建）取消挂起中的 `delay(20_000)` 时，`JobCancellationException("StandaloneCoroutine was cancelled")` 被吞掉并经 `fail()` 写进错误横幅。`leave()/background()` 均会 `refreshJob?.cancel()`，与「锁屏/后台一段时间再打开」场景吻合。
   2. `connect()` 的失败路径 `fail(t)` 直接展示 `UnknownHostException` 原文（类名 + 主机名），恢复前台网络未就绪时（Wi-Fi/蜂窝尚未完成关联、Private DNS 延迟）必现且不友好。
 - 本次范围：
-  - `scheduleRefresh` 改为显式 try/catch 并重抛 `CancellationException`（不进横幅）；审计确认其余 `runCatching` 均为静默路径，无同类泄漏。
+  - `scheduleRefresh` 改为显式 try/catch 并重抛 `CancellationException`（不进横幅；refreshTick 已抽出便于定向回归）；审计确认（按实际范围）其余 `runCatching` 为静默路径或非挂起调用，无同类泄漏。
   - 新增 `connectionFailureMessage(t)`（ChatStatus.kt 共享纯函数）：`UnknownHostException` → 「无法解析跳板机地址 {host}：设备网络可能尚未就绪，请稍后点击重连」；其他异常保持原 message。`connect()` 失败路径经其包装。不自动重试（沿用既有「重新连接」按钮语义）。
 - 明确不做：网络就绪探测/自动重连（维持「进入前台刷新 + 手动重连」的既有产品语义）。
 - 验收条件：
@@ -23,8 +23,8 @@
 - 改动摘要与关键文件：
   - `ChatStatus.kt`：新增 `connectionFailureMessage(t)`——`UnknownHostException` → 「无法解析跳板机地址 {host}：设备网络可能尚未就绪，请稍后点击重连」（主机名截断 200 字符）；其他异常保持原 message。
   - `RemoteViewModel.kt`：`connect()` 失败路径改为 `error = connectionFailureMessage(t)`（不再暴露 `java.net.UnknownHostException:` 类名原文）；`scheduleRefresh()` 的刷新循环由 `runCatching { loadSessions(false) }.onFailure { fail(it) }` 改为显式 try/catch 并重抛 `CancellationException`（根因修复：`refreshJob?.cancel()`——锁屏 `background()`、切标签 `leave()`、重连重建——取消挂起中的 `delay(20_000)` 时，取消异常曾被吞并写进错误横幅）。
-  - 审计确认：两引擎其余 `runCatching`/`catch (e: Exception)` 站点均为静默路径或已重抛取消异常，无同类泄漏（ZcodeViewModel 轮询已正确重抛）。
-- 自动化检查：JVM 116 通过、0 失败、1 条件跳过（新增 `unknownHostBecomesActionableMessageKeepingHost` / `otherConnectionFailuresKeepOriginalMessage` 两项；0.4.24 / versionCode 34）。
+  - 审计确认（按实际范围）：两引擎其余 `runCatching` 为静默路径或非挂起调用（RemoteViewModel 草稿 vault 写入 `onFailure(::fail)` 不涉及协程取消），catch 站点均已重抛取消异常（ZcodeViewModel 轮询已正确重抛），无同类泄漏。
+- 自动化检查：JVM 119 运行、118 通过、1 条件跳过（新增文案 2 项 + R10 的 JSch 包装/双层包装/空主机回退 3 项；0.4.24 / versionCode 34）。
 - 真机验证（129，进行中）：设备此前从未配对（vault 从无 profile 条目），已通过「从二维码图片连接」+ 5 分钟票据完成配对（连接码 `~/.local/state/pockethelm/connect/`，真机证据目录 `~/.local/state/pockethelm/connection-leaks/`）；配对后基线列表干净（04-paired-baseline.png）。复现序列因飞行模式切断无线 ADB 中断（教训：WiFi-ADB 测试设备禁用断网式 DNS 注入，改用 Private DNS hostname 注入模拟），待设备恢复后按 `verify-steps.sh` 完成：① DNS 失败友好文案；② 锁屏/后台循环不再出现 `StandaloneCoroutine was cancelled`；③ 重连正常。
 
 
