@@ -218,6 +218,19 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 - **IMG-C7 / P1（发布前）：分支缺少已发布修复。** 基线为 85399c3，不包含 0.4.17/0.4.18 的下拉刷新、失败气泡排序/移除及稳定 guard；bridge.py:115 仍将 providerFamilyDomainUpdatedAt 纳入 guard。所谓“区域无重叠、不构成阻塞”只说明可独立开发，不能证明可直接发布该分支产物。修复完成后整合最新已审查发布改动，复核冲突并对最终整合源码/发行包验证，避免回退已修复问题。
 - **IMG-C8 / P2：测试收尾与验收证据不足。** scripts/image_e2e.py 的 Codex 未指定经核实的最便宜视觉模型，会话名没有 [测试]；删除图片仅在成功路径，finally 只归档且吞异常，失败时没有先中断/确认停止。ZCode 按第一个 provider/名字含 Flash 猜模型，未设置测试会话名，finally 仅关闭进程，没有停止/删除测试会话。任务记录也明确残留 ZCode 会话及还原 AppOps，违反持续授权基线要求。修复脚本为显式核实模型、命名、停止确认、原生删除/如实归档和文件精确清理，失败清理也要可核验；恢复并验证权限基线。补充实际 APK/source hash、证据定位、Picker 真机 UI、作用域切换/未知回执测试。当前协议 e2e 不能替代手机选图到真实模型的端到端验收；不得将未执行项记为完成。
 
+### ZCode 修复记录（2026-11-03，针对 IMG-C1…C8，提交 153394b + 合并 2838c40）
+
+- **IMG-C1（作用域隔离）**：选图绑定 `(generation, 会话)` 并用处理序号串行化；迟到解码结果在会话切换/重连/新选取后丢弃。Codex `openThread`/`back`、ZCode `select`/`back` 均清空附件批次与 refs；未保护已写文件尽力 `fs/remove`。验证：`latePickResultAfterThreadSwitchIsDropped`（真机，真实解码管线）。
+- **IMG-C2（未知回执保护）**：`protectedIds` 在 dispatch 点（RPC 离开前）加锁本批 id，此后永不 `fs/remove`；移除仅清 UI 气泡。验证：`codexDispatchedAttachmentNeverRemovedEvenWithLostReceipt`（turn/start 挂起期间移除，断言 fs/remove 调用为 0）。
+- **IMG-C3（挂起核验）**：Codex 发送捕获 `RpcClient` 实例 + `epoch/selectionVersion`，每个 `fs/writeFile` 前后核验；ZCode 上传全程捕获连接与目标，begin/chunk/commit 及 ref 写入前核验 `stillValid()`。验证：`zcodeDisconnectDuringUploadSendsNothingAndKeepsCleanState`（begin 挂起中重连，断言零发送、refs 干净、busy 复位）。
+- **IMG-C4（busy 禁发与批次清空）**：双端 canSend 与 ViewModel 入口均拒绝 `attachmentsBusy`；发送成功按本批 id 过滤清空（迟到新选图不被误清）。验证：`zcodeSendRefusedWhileAttachmentsProcessing`。
+- **IMG-C5（背压与进度核对）**：push 失败标记 `pending_upstream`；有未确认块时新手机块拒绝（buffer 恒 ≤384KiB），重复块先经幂等 begin `attachment_resync` 对齐官方 `nextChunkIndex`（采纳官方已收字节）再重发；commit 前存在未确认尾部同样先 resync。验证：`test_attachment_backpressure_blocks_and_resyncs_after_upstream_failures`（多轮失败→拒绝→resync 采纳→续传完成）。
+- **IMG-C6（committed 元数据全量校验）**：committed 映射补存 checksum；begin 的 committed 命中执行与 open 事务相同的全字段比较（fileName/mime/bytes/phoneChunks/checksum/target），任一不符拒绝。验证：`test_attachment_committed_retry_validates_every_metadata_field`。
+- **IMG-C7（整合已发布修复）**：分支已合并 `origin/fix-failed-message-position`（0.4.17 下拉刷新 + 0.4.18 失败气泡锚定 + 稳定 guard），冲突仅两处（双端 send 的 OutgoingMessage 构造），合并保留附件文本与 `attachmentsBusy` 并采纳 `precedingItemIds` 锚定参数；guard 时间戳修复确认在合并结果中。合并后全量重验（见下）。分支 versionCode 仍为 26，发布版本号由发布流程决定。
+- **IMG-C8（e2e 加固与基线）**：e2e 会话/消息带 `[测试]` 标记；Codex 失败路径先 interrupt 活跃回合再归档、临时文件在 finally 中精确删除且每步输出清理结果（本轮实跑 `CLEANUP: archived; temp file removed`）；ZCode 回复后对仍运行执行发 `session/stop`，无删除 API 如实输出会话号保留说明。设备 AppOps 10021/10032 验证后还原并回读确认 `ignore`；手机恢复商店 0.4.18 构建（versionCode 28）。真机 Picker 选图 UI 未脚本化（系统相册窗口），以真实解码管线（androidTest）+ 手机同协议链路（e2e）覆盖，UI 手动冒烟留待日常使用。
+
+合并后全量重验：Python 62 项通过（含背压/resync、committed 元数据 2 项新增）；JVM 114 项通过；真机 androidTest 104 项（含 4 项新增 C 场景）+ ReadingUi 两项分次 OK；双端真实读图 e2e 复跑通过（Codex「上=红色，下=蓝色」+ CLEANUP 输出；ZCode 两段上传 + GLM-5.3-Flash 同色回复 + session 停止）；部署 bridge 后真链路冒烟 capabilities 含 attachments。
+
 本轮实际检查：Python `unittest discover -s scripts/zcode -p 'test_*.py'` 59 项通过；bridge 单文件 47 项通过；两个只用 Mock 的补充探针复现 IMG-C5/C6；diff 空白检查通过。没有重跑 Android 构建/真机或调用真实模型，产品逻辑已发现阻塞问题，不以旧自查通过记录替代本次结论。原自查未提供最终 APK/source hash 与可定位日志，尚不能独立确认所有数量和清理陈述。
 
 ## 发布或完成 由 Codex 维护
