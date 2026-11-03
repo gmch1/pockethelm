@@ -126,6 +126,122 @@ class ImageAttachmentDeviceTest {
         assertNotNull("非白名单 MIME 直接拒绝", wrongMime)
     }
 
+    // ---- review fixes IMG-C1..C4: scope isolation, protection, busy gate ----
+
+    @Test fun codexDispatchedAttachmentNeverRemovedEvenWithLostReceipt() = runBlocking {
+        val app = TestPrefsApp(UUID.randomUUID().toString())
+        app.attach(instrumentation.targetContext)
+        cleaners += { instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault") }
+        lateinit var vm: RemoteViewModel
+        instrumentation.runOnMainSync { vm = RemoteViewModel(app) }
+        val state = RemoteViewModel::class.java.getDeclaredField("mutable").let {
+            it.isAccessible = true; it.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<UiState> }
+        state.value = UiState(connected = true, foreground = true,
+            selected = SessionInfo("s1", "集成", "/tmp/remote", "", "idle", 0))
+        val attachment = ChatAttachment.new(ByteArray(2048) { 3 }, "挂起.jpg")
+        state.value = state.value.copy(attachments = listOf(attachment))
+        instrumentation.runOnMainSync { vm.draft("图") }
+        val gate = java.util.concurrent.CountDownLatch(1)
+        val removes = java.util.concurrent.atomic.AtomicInteger(0)
+        val sent = java.util.concurrent.atomic.AtomicInteger(0)
+        val bridge = FakeRpcBridge(vm)
+        bridge.scripted["thread/resume"] = {
+            obj("thread" to obj("id" to "s1", "cwd" to "/tmp/remote", "status" to obj("type" to "idle"), "updatedAt" to 0L),
+                "approvalPolicy" to "never", "sandbox" to obj("type" to "dangerFullAccess")) }
+        bridge.scripted["fs/writeFile"] = { obj() }
+        bridge.scripted["turn/start"] = { sent.incrementAndGet(); gate.await(15, java.util.concurrent.TimeUnit.SECONDS); obj() }
+        bridge.scripted["fs/remove"] = { removes.incrementAndGet(); obj() }
+        bridge.scripted["thread/read"] = {
+            obj("thread" to obj("id" to "s1", "cwd" to "/tmp/remote", "status" to obj("type" to "idle"), "updatedAt" to 0L)) }
+        bridge.scripted["thread/turns/list"] = { obj("data" to org.json.JSONArray()) }
+        bridge.scripted["thread/queue/list"] = { obj("data" to org.json.JSONArray()) }
+        bridge.scripted["thread/items/list"] = { obj("data" to org.json.JSONArray(), "nextCursor" to "") }
+        bridge.install()
+        instrumentation.runOnMainSync { vm.send(false) }
+        withTimeout(10_000) { while (sent.get() == 0) delay(20) }
+        // Dispatch parked in turn/start (receipt unknown): removing the image clears the
+        // draft chip but must NEVER delete the file the server may already reference.
+        instrumentation.runOnMainSync { runCatching { vm.removeAttachment(attachment.id) } }
+        delay(300)
+        assertEquals("结果未知时不得删除图片文件", 0, removes.get())
+        gate.countDown()
+        withTimeout(10_000) { while (vm.state.value.sending) delay(20) }
+        instrumentation.runOnMainSync { vm.background(); vm.viewModelScope.cancel() }
+        bridge.close(); bridge.assertClean()
+    }
+
+    @Test fun latePickResultAfterThreadSwitchIsDropped() = runBlocking {
+        val app = TestPrefsApp(UUID.randomUUID().toString())
+        app.attach(instrumentation.targetContext)
+        cleaners += { instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault") }
+        lateinit var vm: RemoteViewModel
+        instrumentation.runOnMainSync { vm = RemoteViewModel(app) }
+        val state = RemoteViewModel::class.java.getDeclaredField("mutable").let {
+            it.isAccessible = true; it.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<UiState> }
+        state.value = UiState(connected = true, foreground = true, tab = 0,
+            selected = SessionInfo("s1", "A", "/tmp/remote", "", "idle", 0))
+        val source = tempFile("late.png")
+        source.writeBytes(encode(bitmap(32, 32)))
+        vm.addAttachment(Uri.fromFile(source), "late.png", "image/png")
+        // Switch threads while the decode is in flight: the late result must not follow.
+        instrumentation.runOnMainSync { vm.openThread(SessionInfo("s2", "B", "/tmp/other", "", "idle", 0)) }
+        withTimeout(10_000) { while (vm.state.value.attachmentsBusy) delay(20) }
+        assertTrue("迟到处理结果不得进入新会话", vm.state.value.attachments.isEmpty())
+        instrumentation.runOnMainSync { vm.background(); vm.viewModelScope.cancel() }
+    }
+
+    @Test fun zcodeDisconnectDuringUploadSendsNothingAndKeepsCleanState() = runBlocking {
+        val app = TestPrefsApp(UUID.randomUUID().toString())
+        app.attach(instrumentation.targetContext)
+        cleaners += { instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault") }
+        lateinit var vm: ZcodeViewModel
+        instrumentation.runOnMainSync { vm = ZcodeViewModel(app) }
+        val state = ZcodeViewModel::class.java.getDeclaredField("mutable").let {
+            it.isAccessible = true; it.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState> }
+        val attachment = ChatAttachment.new(ByteArray(4096) { 5 }, "断开.jpg")
+        state.value = zSessionState(listOf(attachment))
+        instrumentation.runOnMainSync { vm.draft("hi") }
+        val gate = java.util.concurrent.CountDownLatch(1)
+        val sends = java.util.concurrent.atomic.AtomicInteger(0)
+        val bridge = FakeRpcBridge(vm)
+        bridge.scripted["session/attachment/begin"] = { gate.await(15, java.util.concurrent.TimeUnit.SECONDS)
+            obj("state" to "staging", "nextChunkIndex" to 0) }
+        bridge.scripted["session/send"] = { sends.incrementAndGet(); obj("commandId" to "c", "status" to "accepted") }
+        bridge.install()
+        instrumentation.runOnMainSync { runCatching { vm.send() } }
+        delay(200)
+        // Reconnect mid-upload: the parked begin belongs to a dead scope now.
+        instrumentation.runOnMainSync { vm.disconnectManually() }
+        gate.countDown()
+        delay(500)
+        val refs = ZcodeViewModel::class.java.getDeclaredField("attachmentRefs").let {
+            it.isAccessible = true; @Suppress("UNCHECKED_CAST") it.get(vm) as Map<String, String> }
+        assertTrue("旧作用域不得写入 refs", refs.isEmpty())
+        assertEquals("断开后不得发送", 0, sends.get())
+        assertFalse(vm.state.value.attachmentsBusy)
+        instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
+        bridge.close()
+    }
+
+    @Test fun zcodeSendRefusedWhileAttachmentsProcessing() = runBlocking {
+        val app = TestPrefsApp(UUID.randomUUID().toString())
+        app.attach(instrumentation.targetContext)
+        cleaners += { instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault") }
+        lateinit var vm: ZcodeViewModel
+        instrumentation.runOnMainSync { vm = ZcodeViewModel(app) }
+        val state = ZcodeViewModel::class.java.getDeclaredField("mutable").let {
+            it.isAccessible = true; it.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState> }
+        state.value = zSessionState(emptyList()).copy(attachmentsBusy = true)
+        val bridge = FakeRpcBridge(vm)
+        bridge.scripted["session/send"] = { error("处理中不得发送") }
+        bridge.install()
+        instrumentation.runOnMainSync { runCatching { vm.send() } }
+        delay(200)
+        assertTrue(vm.state.value.error?.contains("图片处理中") == true)
+        instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
+        bridge.close(); bridge.assertClean()
+    }
+
     // ---- ZCode send path: two-stage upload through the scripted bridge ----
 
     private fun zSessionState(attachments: List<ChatAttachment>) = ZcodeState(

@@ -34,7 +34,7 @@ def png_two_colors(width=320, height=160, top=(255, 0, 0), bottom=(0, 0, 255)):
             + chunk(b'IEND', b''))
 
 
-PROMPT = ('这张图片的上半部分和下半部分分别是什么颜色？请只用中文回答两个颜色词，'
+PROMPT = ('[测试] 这张图片的上半部分和下半部分分别是什么颜色？请只用中文回答两个颜色词，'
           '格式：上=XX，下=XX。不要使用工具，不要读取文件。')
 
 
@@ -47,13 +47,15 @@ def codex_image_smoke():
     image = png_two_colors()
     client = Client()
     thread = None
+    path = None
     try:
         import uuid
         path = f'/tmp/pockethelm-img-e2e-{uuid.uuid4().hex}.png'
         client.call('fs/writeFile', {'path': path, 'dataBase64': base64.b64encode(image).decode()})
         result = client.call('thread/start', {'cwd': '/tmp', 'approvalPolicy': 'never', 'sandbox': 'danger-full-access'})
         thread = result['thread']['id']
-        client.call('thread/name/set', {'threadId': thread, 'name': 'Image attachment e2e smoke'})
+        client.call('thread/name/set', {'threadId': thread, 'name': '[测试] Image attachment e2e smoke'})
+        # The turn uses the account's configured default model (thread-level setting).
         turn = client.call('turn/start', {'threadId': thread,
             'input': [{'type': 'text', 'text': PROMPT}, {'type': 'localImage', 'path': path, 'detail': 'auto'}],
             'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'}})['turn']
@@ -79,12 +81,29 @@ def codex_image_smoke():
         print(f'PASS: Codex real turn read the image; reply = {replies[-1].strip()[:80]!r}', flush=True)
         client.call('fs/remove', {'path': path})
     finally:
+        cleanup = []
         if thread:
             try:
+                turns = client.call('thread/turns/list', {'threadId': thread, 'limit': 1,
+                    'sortDirection': 'desc', 'itemsView': 'notLoaded'}).get('data') or []
+                if turns and turns[0]['status'] == 'inProgress':
+                    client.call('turn/interrupt', {'threadId': thread, 'turnId': turns[0]['id']})
+                    cleanup.append('interrupted live turn')
+            except Exception as e:
+                cleanup.append(f'WARN interrupt: {type(e).__name__}')
+            try:
                 client.call('thread/archive', {'threadId': thread})
-            except Exception:
-                pass
+                cleanup.append('archived')
+            except Exception as e:
+                cleanup.append(f'WARN archive: {type(e).__name__}')
+        if path:
+            try:
+                client.call('fs/remove', {'path': path})
+                cleanup.append('temp file removed')
+            except Exception as e:
+                cleanup.append(f'WARN fs/remove: {type(e).__name__}')
         client.close()
+        print('CLEANUP:', '; '.join(cleanup) or 'nothing to clean', flush=True)
 
 
 def zcode_image_smoke():
@@ -156,12 +175,19 @@ def zcode_image_smoke():
         assert any(r.get('attachments') for r in snapshot['items'] if r['kind'] == 'userInput'), \
             'row projection lost the attachment metadata'
         print(f'PASS: ZCode real session read the image; reply = {reply.strip()[:80]!r}', flush=True)
+        # Stop any still-running execution so nothing keeps consuming after the smoke.
+        if snapshot.get('executionId'):
+            dispatch('session/stop', {'workspacePath': workspace, 'sessionId': session,
+                'commandId': f'{upload_id}-stop-00001', 'executionId': snapshot['executionId']})
+        # The session stays in the smoke workspace (the bridge exposes no deletion);
+        # its artifacts are session-scoped and reclaimed by the server's retention.
+        print(f'NOTE: ZCode test session {session} left in smoke workspace (no delete API)', flush=True)
     finally:
         try:
             proc.stdin.close()
             proc.wait(timeout=10)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'WARN bridge shutdown: {type(e).__name__}', flush=True)
 
 
 if __name__ == '__main__':

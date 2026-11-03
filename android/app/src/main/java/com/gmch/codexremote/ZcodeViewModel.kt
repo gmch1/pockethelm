@@ -557,8 +557,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", historyLoading = false,
             historyError = null, outgoing = emptyList(), sessionsFresh = it.connected && it.sessionsFresh,
             interactions = emptyList(), interactionsComplete = false, interactSubmitting = emptySet(),
-            interactionNotice = "", snoozeUnconfirmed = emptySet(), turn = null, diffText = null) }
+            interactionNotice = "", snoozeUnconfirmed = emptySet(), turn = null, diffText = null,
+            attachments = emptyList(), attachmentsBusy = false) }
         older = emptyList()
+        // Refs die with the session scope upstream; unsent attachment drafts are dropped.
+        attachmentRefs.clear()
         val epoch = generation
         viewModelScope.launch {
             actions.withLock {
@@ -683,6 +686,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val state = mutable.value; val session = state.selected ?: error("请先选择会话")
         val text = state.draft.trim()
         val attachments = state.attachments
+        check(!state.attachmentsBusy) { "图片处理中，请稍候再发送" }
         check(text.isNotBlank() || attachments.isNotEmpty()) { "请输入消息或添加图片" }
         val params = session.target()
         val selection = selectionParams()
@@ -733,7 +737,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 if (scope.appliesToSession(generation, mutable.value.selected?.id) && mutable.value.draft.trim() == text)
                     mutable.update { it.copy(draft = "") }
                 if (scope.appliesToSession(generation, mutable.value.selected?.id))
-                    mutable.update { it.copy(attachments = emptyList(), attachmentsBusy = false) }
+                    mutable.update { state -> state.copy(
+                        attachments = state.attachments.filterNot { a -> attachments.any { b -> b.id == a.id } },
+                        attachmentsBusy = false) }
                 // Refresh only while the sending session is still the current one on the
                 // current connection; a stale read must not report errors into a new session.
                 if (scope.appliesToSession(generation, mutable.value.selected?.id)) read(session)
@@ -775,6 +781,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     // ---- Image attachments (task 2026-11-03-image-attachments) ----
 
     private val imageProcessor by lazy { ImageProcessor(app) }
+    private val attachmentSerial = java.util.concurrent.atomic.AtomicLong(0)
     /** attachmentId -> committed upstream ref, valid for this connection scope only. */
     private val attachmentRefs = LinkedHashMap<String, String>()
     private val attachmentUploading = HashSet<String>()
@@ -783,16 +790,25 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     fun addAttachment(uri: Uri, displayName: String, mime: String?) {
         if (mutable.value.attachmentsBusy) return
         check(mutable.value.attachments.size < ImagePolicy.MESSAGE_MAX) { "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片" }
+        // Scope-bound pick: late results after a session switch or reconnect are dropped.
+        val generation = generation
+        val sessionId = mutable.value.selected?.id ?: return
+        val serial = attachmentSerial.incrementAndGet()
         mutable.update { it.copy(attachmentsBusy = true, error = null) }
         viewModelScope.launch(Dispatchers.IO) {
             val processed = imageProcessor.process(uri, displayName, mime)
+            if (attachmentSerial.get() != serial) return@launch
             mutable.update { state ->
-                val value = processed.getOrElse { e ->
-                    return@update state.copy(attachmentsBusy = false, error = e.message ?: "图片处理失败")
+                if (generation != this@ZcodeViewModel.generation || state.selected?.id != sessionId)
+                    state.copy(attachmentsBusy = false)
+                else {
+                    val value = processed.getOrElse { e ->
+                        return@update state.copy(attachmentsBusy = false, error = e.message ?: "图片处理失败")
+                    }
+                    if (state.attachments.size >= ImagePolicy.MESSAGE_MAX)
+                        state.copy(attachmentsBusy = false, error = "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片")
+                    else state.copy(attachments = state.attachments + value, attachmentsBusy = false)
                 }
-                if (state.attachments.size >= ImagePolicy.MESSAGE_MAX)
-                    state.copy(attachmentsBusy = false, error = "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片")
-                else state.copy(attachments = state.attachments + value, attachmentsBusy = false)
             }
         }
     }
@@ -806,35 +822,40 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     /** Uploads every attachment without a ref through the two-stage bridge transaction.
      *  Serial by design; any failure keeps the batch (uploaded refs stay reusable). */
     private suspend fun uploadAttachments(session: ZSession) {
+        val startGeneration = generation
+        val connection = client()
+        fun stillValid() = startGeneration == generation &&
+            mutable.value.selected?.id == session.id
         val pending = mutable.value.attachments.filter { it.id !in attachmentRefs }
         for (attachment in pending) {
-            val startGeneration = generation
             attachmentUploading.add(attachment.id)
-            mutable.update { it.copy(attachmentsBusy = true) }
             try {
-                check(startGeneration == generation) { "连接已切换，请重新上传图片" }
+                check(stillValid()) { "连接已切换，请重新上传图片" }
                 val uploadId = "upl-${attachment.id}"
-                val begin = call("session/attachment/begin", AttachmentUploadPlan.beginParams(session.target(), attachment))
+                val begin = connection.call("session/attachment/begin",
+                    AttachmentUploadPlan.beginParams(session.target(), attachment), timeout = 90_000)
+                check(stillValid()) { "连接已切换，请重新上传图片" }
                 if (begin.string("state") != "committed") {
                     var index = begin.optInt("nextChunkIndex", 0)
                     while (true) {
                         val chunk = AttachmentUploadPlan.chunkParams(uploadId, attachment, index) ?: break
-                        val ack = call("session/attachment/chunk", chunk)
+                        val ack = connection.call("session/attachment/chunk", chunk, timeout = 90_000)
+                        check(stillValid()) { "连接已切换，请重新上传图片" }
                         if (ack.optInt("nextChunkIndex", index) <= index) break
                         index = ack.optInt("nextChunkIndex")
                     }
                     check(index == AttachmentUploadPlan.totalChunks(attachment.bytes)) { "图片上传未完成，请重试" }
-                    val commit = call("session/attachment/commit", obj("uploadId" to uploadId))
+                    val commit = connection.call("session/attachment/commit", obj("uploadId" to uploadId), timeout = 90_000)
+                    check(stillValid()) { "连接已切换，请重新上传图片" }
                     check(commit.string("state") == "committed") { "图片提交未确认，请重试" }
-                    attachmentRefs[attachment.id] = commit.string("ref")
-                } else {
+                    if (stillValid()) attachmentRefs[attachment.id] = commit.string("ref")
+                } else if (stillValid()) {
                     attachmentRefs[attachment.id] = begin.string("ref")
                 }
             } finally {
-                attachmentUploading.remove(attachment.id)
+                if (startGeneration == generation) attachmentUploading.remove(attachment.id)
             }
         }
-        mutable.update { it.copy(attachmentsBusy = false) }
     }
     fun stop() = action {
         val state = mutable.value; val session = state.selected ?: return@action

@@ -120,7 +120,7 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
                         }
                     }
                     ChatComposer(state.draft, vm::draft, state.sending,
-                        state.connected && !state.busy && !state.pending && !state.sending && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.selection != null,
+                        state.connected && !state.busy && !state.pending && !state.sending && !state.attachmentsBusy && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.selection != null,
                         state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send,
                         attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
                         canAttach = state.attachmentsEnabled && !state.attachmentsBusy

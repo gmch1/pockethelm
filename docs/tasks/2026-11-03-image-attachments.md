@@ -1,6 +1,6 @@
 # 图片附件发送：Codex 与 ZCode 双端支持
 
-状态：实现与验证完成，待 review
+状态：review 未通过，待修复
 
 执行约定：当前 Codex 直接负责实现、测试、review 和交付。下文 ZCode 指目标引擎，不代表委派执行；未经用户明确要求不启动其他 AI。
 
@@ -185,7 +185,7 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 
 ## Review 由 Codex 维护问题和结论
 
-整体结论：实现与验证完成，待 review。IMG-R1…R7 均有实现与测试证据；协议待核验项处置：fs/remove 活体验证并实现精确清理；steer 带图保守禁用；ZCode 空文本附图已实测支持。
+整体结论：Codex 对 d66601d 的实现 review 未通过，见 IMG-C1…C8。前述实现者自查记录保留为历史陈述，不视为 review 已确认；方案项 IMG-R1…R7 尚不能全部关闭。
 
 | 编号 | 原方案问题 | 修订及后续验收 |
 | --- | --- | --- |
@@ -204,6 +204,21 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 - 无阻塞意见。两点建议：
   1. `project_rows` 附件投影上限「数量 ≤4」建议对齐官方每条消息上限 8（`MAX_CHAT_ATTACHMENTS`，服务端 schema 无上限），或在响应中加显式截断标记——桌面端创建的 8 图消息被静默少显示属有效数据丢失，与「跳过畸形项」性质不同。
   2. 手机块「除末块外必须满块」与 384KiB 聚合的整除关系（96×4=384）建议作为测试断言固定下来（含 totalBytes < 384KiB 的单部分块边界），防止后续调整块大小时静默破坏对齐。
+
+### Codex 实现 review（2026-11-03，d66601d）
+
+范围：5c98365..d66601d 完整改动与现有调用链。当前 Codex 直接审查，未委派。仅修改 review 记录，未改产品代码、未部署或发布。
+
+- **IMG-C1 / P1：附件选取及处理缺少会话隔离。** RemoteViewModel.kt:706、ZcodeViewModel.kt:783 的后台处理直接修改当前 state，没有捕获/核对目标、generation 或会话选择代次；Picker 回调同样未绑定发起选择的作用域。Codex openThread/back 也不清 attachments/writtenFiles。A 会话选图后进入 B，会携带 A 的图；处理未结束时切换/断开，旧结果仍可追加进当前会话。修复：选图发起、处理、移除、发送都绑定完整作用域，切换清态，迟到结果忽略；覆盖 A→B、A→B→A、断线重连和 Picker 迟到回调。
+- **IMG-C2 / P1：Codex 结果未知的图片可被删除。** RemoteViewModel.kt:811 仅在收到成功回执后登记 dispatchedFiles，而 removeAttachment（724–731）依据该集合执行 fs/remove。发送/排队已被服务端接受但回执超时后，附件仍在草稿，点击移除会删除服务端尚需读取的文件。修复：在真正 dispatch 前标记“可能已引用”，未知/排队/已接受均禁止清理；只有权威拒绝或确定未发送才能释放，删除失败保留清理记录。测试模拟 queue/start 已接受而响应丢失，再移除图片，断言不会 fs/remove 且 pending 不变。
+- **IMG-C3 / P1：上传等待后缺少作用域核验。** RemoteViewModel.kt:771–788 在 fs/writeFile 挂起后直接登记路径和 dispatch；ZcodeViewModel.kt:811–831 的 generation 检查发生在赋值后、首个挂起点前，等同无检查，后续 commit/ref 写入及 session/send 也不复核。call/client 每次重新读取当前连接。切换/重连时可将旧事务继续送到新连接，并污染当前 refs/busy 状态。修复：捕获 RPC 实例、目标和选择代次，所有挂起边界及最终 dispatch 前复核；切换后取消旧上传并尽力 abort，旧 finally 不修改新批次。测试让写文件/commit 阻塞，再切换或重连后释放回执，断言无旧发送及新作用域写入。
+- **IMG-C4 / P2：处理图片时仍可发送，可能静默漏图。** MainActivity.kt:174、ZcodeScreen.kt:123 的 canSend 未检查 attachmentsBusy，send 入口也未检查。已有文字时选大图，解码期间立即发送，实际快照不含正在处理的图，消息仍会发出；迟到处理还可能被成功回执清空。修复：UI 与 ViewModel 同时禁止批次准备中发送，清空只按已确认批次 ID 执行。用可阻塞处理器覆盖该时序。
+- **IMG-C5 / P2：上游块失败不形成背压，且不核对上游进度。** bridge.py:779–784 忽略 chunk 返回 nextChunkIndex，失败后重试不执行方案要求的 begin 进度核对；883–889 在旧缓冲未确认时仍接受新块。离线 Mock 探针：连续 6 个 96KiB 手机块、上游每次失败，buffer 达 589824 字节（上限应为 393216），next_index 已到 6。修复：未确认聚合块存在时拒绝新块，先核对官方进度再重发/确认；异常回执不得推进，无法确认明确终止。增加实际官方重复块语义证据及多轮丢回执/失败回归，不能只用始终成功的空 ack Mock。
+- **IMG-C6 / P2：committed begin 不再校验元数据。** bridge.py:834–839 只比较 uploadId/target，没有比较文件名、MIME、字节数、块数及 checksum；committed 映射未保存 checksum。离线探针提交 3 字节 photo.jpg 后，同 ID 改为 4 字节 different.jpg 和不同 checksum，仍返回旧 committed ref。修复：保存完整不可变元数据，对已提交重试执行与 open 事务相同的比较，变更拒绝；覆盖每个字段，确保不会返回错误内容。
+- **IMG-C7 / P1（发布前）：分支缺少已发布修复。** 基线为 85399c3，不包含 0.4.17/0.4.18 的下拉刷新、失败气泡排序/移除及稳定 guard；bridge.py:115 仍将 providerFamilyDomainUpdatedAt 纳入 guard。所谓“区域无重叠、不构成阻塞”只说明可独立开发，不能证明可直接发布该分支产物。修复完成后整合最新已审查发布改动，复核冲突并对最终整合源码/发行包验证，避免回退已修复问题。
+- **IMG-C8 / P2：测试收尾与验收证据不足。** scripts/image_e2e.py 的 Codex 未指定经核实的最便宜视觉模型，会话名没有 [测试]；删除图片仅在成功路径，finally 只归档且吞异常，失败时没有先中断/确认停止。ZCode 按第一个 provider/名字含 Flash 猜模型，未设置测试会话名，finally 仅关闭进程，没有停止/删除测试会话。任务记录也明确残留 ZCode 会话及还原 AppOps，违反持续授权基线要求。修复脚本为显式核实模型、命名、停止确认、原生删除/如实归档和文件精确清理，失败清理也要可核验；恢复并验证权限基线。补充实际 APK/source hash、证据定位、Picker 真机 UI、作用域切换/未知回执测试。当前协议 e2e 不能替代手机选图到真实模型的端到端验收；不得将未执行项记为完成。
+
+本轮实际检查：Python `unittest discover -s scripts/zcode -p 'test_*.py'` 59 项通过；bridge 单文件 47 项通过；两个只用 Mock 的补充探针复现 IMG-C5/C6；diff 空白检查通过。没有重跑 Android 构建/真机或调用真实模型，产品逻辑已发现阻塞问题，不以旧自查通过记录替代本次结论。原自查未提供最终 APK/source hash 与可定位日志，尚不能独立确认所有数量和清理陈述。
 
 ## 发布或完成 由 Codex 维护
 

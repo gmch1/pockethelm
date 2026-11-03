@@ -170,7 +170,7 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
             }
         }
         ChatComposer(state.draft, vm::draft, state.sending,
-            state.connected && !state.busy && !state.sending && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.uncertain == null,
+            state.connected && !state.busy && !state.sending && !state.attachmentsBusy && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.uncertain == null,
             steer, { steer = it }, { vm.send(steer && session.runtime == "active") },
             attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
             canAttach = !state.attachmentsBusy && state.attachments.size < ImagePolicy.MESSAGE_MAX && !state.sending,

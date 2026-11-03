@@ -543,6 +543,7 @@ class AttachmentTransaction:
         self.received = 0                       # unique accepted bytes
         self.buffer = bytearray()               # not-yet-flushed raw bytes (≤384KiB + tail)
         self.upstream_flushed = 0               # upstream-acked byte count (chunk-aligned)
+        self.pending_upstream = False           # a push failed; buffer holds unconfirmed data
         self.hasher = hashlib.sha256()
         self.committing = False                 # upstream commit sent, outcome unknown
 
@@ -783,13 +784,39 @@ class Bridge:
         del txn.buffer[:size]
         txn.upstream_flushed += size
 
+    def attachment_resync(self, txn):
+        """After any lost/failed upstream exchange, re-run the idempotent official begin
+        and adopt its progress: bytes the server already holds are dropped from the local
+        buffer; anything beyond is re-flushed. Never guesses."""
+        result = self.attachment_upstream_begin(txn)
+        if result.get('state') == 'committed':
+            return result
+        official_next = result.get('nextChunkIndex')
+        if type(official_next) is not int or official_next < 0:
+            raise RequestError('无法核对上传进度，请重试')
+        expected = min(official_next * ATTACHMENT_UPSTREAM_CHUNK, txn.total_bytes)
+        require(expected <= txn.received, '上游进度与已传数据不符，请重新上传')
+        if expected > txn.upstream_flushed:
+            del txn.buffer[:expected - txn.upstream_flushed]
+            txn.upstream_flushed = expected
+        elif expected < txn.upstream_flushed:
+            # The server acked less than we thought: rebuild from its truth.
+            raise RequestError('上游进度落后于本地记录，请重新上传')
+        return None
+
     def attachment_flush(self, txn, final=False):
         """Push complete 384KiB blocks (plus the tail when final). Progress is only
-        advanced after the official ack, so a failed call leaves the buffer retryable."""
-        while len(txn.buffer) >= ATTACHMENT_UPSTREAM_CHUNK:
-            self.attachment_push_upstream(txn, ATTACHMENT_UPSTREAM_CHUNK)
-        if final and txn.buffer:
-            self.attachment_push_upstream(txn, len(txn.buffer))
+        advanced after the official ack; a failed push marks the tail unconfirmed and
+        leaves it retryable."""
+        try:
+            while len(txn.buffer) >= ATTACHMENT_UPSTREAM_CHUNK:
+                self.attachment_push_upstream(txn, ATTACHMENT_UPSTREAM_CHUNK)
+            if final and txn.buffer:
+                self.attachment_push_upstream(txn, len(txn.buffer))
+        except WireError:
+            txn.pending_upstream = True
+            raise RequestError('上游暂不可用，请重传上一块')
+        txn.pending_upstream = False
 
     def attachment_trim_committed(self):
         # Bounded ref map; server-side artifacts outlive local entries by design.
@@ -799,7 +826,8 @@ class Bridge:
     def attachment_adopt_committed(self, txn, ref):
         self.attachments.pop(txn.upload_id, None)
         self.committed[ref] = {'target': txn.target, 'uploadId': txn.upload_id, 'fileName': txn.file_name,
-            'mime': txn.mime, 'bytes': txn.total_bytes, 'phoneChunks': txn.phone_chunks, 'lastUsed': time.time()}
+            'mime': txn.mime, 'bytes': txn.total_bytes, 'phoneChunks': txn.phone_chunks,
+            'checksum': txn.checksum, 'lastUsed': time.time()}
         self.attachment_trim_committed()
         return {'uploadId': txn.upload_id, 'state': 'committed', 'ref': ref,
             'fileName': txn.file_name, 'mime': txn.mime, 'bytes': txn.total_bytes,
@@ -832,11 +860,18 @@ class Bridge:
         checksum = string(params.get('checksum'), 128)
         require(re.fullmatch(r'sha256:[0-9a-f]{64}', checksum), '校验值无效')
         for ref, meta in self.committed.items():
-            if meta['uploadId'] == upload_id and meta['target'] == target:
-                meta['lastUsed'] = time.time()
-                return {'uploadId': upload_id, 'state': 'committed', 'ref': ref,
-                    'fileName': meta['fileName'], 'mime': meta['mime'], 'bytes': meta['bytes'],
-                    'nextChunkIndex': meta['phoneChunks']}
+            if meta['uploadId'] != upload_id or meta['target'] != target:
+                continue
+            # A committed retry must match EVERY begin field: a same-id upload with changed
+            # metadata must be refused, never silently answered with the old artifact.
+            require(meta['fileName'] == file_name and meta['mime'] == mime
+                and meta['bytes'] == total_bytes and meta['phoneChunks'] == phone_chunks
+                and meta['checksum'] == checksum,
+                '同名上传的参数与之前不一致，请重新开始上传')
+            meta['lastUsed'] = time.time()
+            return {'uploadId': upload_id, 'state': 'committed', 'ref': ref,
+                'fileName': meta['fileName'], 'mime': meta['mime'], 'bytes': meta['bytes'],
+                'nextChunkIndex': meta['phoneChunks']}
         txn = self.attachments.get(upload_id)
         if txn is not None:
             require(txn.same_metadata(target, file_name, mime, total_bytes, phone_chunks, checksum),
@@ -875,12 +910,19 @@ class Bridge:
         require(len(raw) == expected_size, '块大小不符')
         digest = hashlib.sha256(raw).hexdigest()
         if index < txn.next_index:
-            # Duplicate of an accepted chunk: must match exactly; a matching duplicate
-            # also retries any upstream flush that failed earlier.
+            # Duplicate of an accepted chunk: must match exactly. With unconfirmed data
+            # pending, first re-align with the server's own progress, then retry flushes.
             require(txn.digests.get(index) == digest, '重复块内容与已接受的不一致')
+            if txn.pending_upstream:
+                committed = self.attachment_resync(txn)
+                if committed:
+                    return committed
             self.attachment_flush(txn)
             return {'uploadId': txn.upload_id, 'nextChunkIndex': txn.next_index}
         require(index == txn.next_index, '块序号越序，请按顺序重传')
+        # Backpressure: never stack a new phone chunk behind unconfirmed upstream data —
+        # the client retransmits the previous chunk (duplicate path) to drive the retry.
+        require(not txn.pending_upstream, '上一块尚未确认，请重传上一块')
         txn.digests[index] = digest
         txn.next_index = index + 1
         txn.received += len(raw)
@@ -903,6 +945,12 @@ class Bridge:
         if txn.committing:
             return self.attachment_resolve_committing(txn)
         require(txn.next_index == txn.phone_chunks and txn.received == txn.total_bytes, '数据尚未传完，不能提交')
+        if txn.pending_upstream:
+            # A failed push at commit time: adopt the server's own progress (it may
+            # already hold everything, or even have committed) before flushing the rest.
+            committed = self.attachment_resync(txn)
+            if committed:
+                return committed
         if 'sha256:' + txn.hasher.hexdigest() != txn.checksum:
             # Checksum mismatch: the upload is cancelled outright, never committed.
             self.attachments.pop(upload_id, None)

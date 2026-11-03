@@ -480,6 +480,92 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(again['state'], 'staging')
         self.assertEqual([c.args[1] for c in client.call.call_args_list].count('attachmentAbortV4'), 1)
 
+    def test_attachment_backpressure_blocks_and_resyncs_after_upstream_failures(self):
+        import hashlib as h
+        from wire import WireError
+        bridge, client = self.attachment_bridge()
+        state = {'fail_push': True, 'official_next': 0}
+
+        def upstream(ch, method, args):
+            if method == 'attachmentBeginV4':
+                return {'state': 'staging', 'nextChunkIndex': state['official_next']}
+            if method == 'attachmentChunkV4':
+                if state['fail_push']:
+                    raise WireError('upstream down')
+                state['official_next'] = args[0].get('chunkIndex', 0) + 1
+                return {}
+            if method == 'attachmentCommitV4':
+                return {'ref': 'zcode-artifact://after-retry'}
+            return {}
+
+        client.call = Mock(side_effect=upstream)
+        data = b'z' * (5 * 96 * 1024)  # 5 phone chunks -> 2 upstream blocks (384K + 96K)
+        bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='bp',
+            fileName='p.jpg', mime='image/jpeg', totalBytes=len(data), totalChunks=5,
+            checksum='sha256:' + h.sha256(data).hexdigest()))
+        block = 96 * 1024
+        # Chunks 1-3 aggregate without a full block: all accepted, buffer grows.
+        for index in range(3):
+            ack = bridge.dispatch('session/attachment/chunk', {'uploadId': 'bp', 'chunkIndex': index,
+                'dataBase64': base64.b64encode(data[index * block:(index + 1) * block]).decode()})
+            self.assertEqual(ack['nextChunkIndex'], index + 1)
+        txn = bridge.attachments['bp']
+        # Chunk 4 completes the first 384KiB upstream block, whose push fails.
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/chunk', {'uploadId': 'bp', 'chunkIndex': 3,
+                'dataBase64': base64.b64encode(data[3 * block:4 * block]).decode()})
+        self.assertTrue(txn.pending_upstream)
+        # Backpressure: a NEW chunk is refused while the block is unconfirmed — the
+        # buffer never exceeds one upstream block plus nothing else.
+        self.assertLessEqual(len(txn.buffer), 384 * 1024)
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/chunk', {'uploadId': 'bp', 'chunkIndex': 4,
+                'dataBase64': base64.b64encode(data[4 * block:]).decode()})
+        self.assertEqual(txn.next_index, 4)
+        # Retransmitting chunk 4 (duplicate) retries the flush behind a progress resync;
+        # while the push keeps failing it still refuses without advancing.
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/chunk', {'uploadId': 'bp', 'chunkIndex': 3,
+                'dataBase64': base64.b64encode(data[3 * block:4 * block]).decode()})
+        # The upstream actually received the block earlier: resync adopts its progress,
+        # drops the confirmed bytes, and the transaction continues cleanly.
+        state['fail_push'] = False
+        state['official_next'] = 1
+        ack = bridge.dispatch('session/attachment/chunk', {'uploadId': 'bp', 'chunkIndex': 3,
+            'dataBase64': base64.b64encode(data[3 * block:4 * block]).decode()})
+        self.assertEqual(ack['nextChunkIndex'], 4)
+        self.assertFalse(txn.pending_upstream)
+        self.assertEqual(txn.upstream_flushed, 384 * 1024)
+        # Remaining chunk and commit finish the upload normally.
+        bridge.dispatch('session/attachment/chunk', {'uploadId': 'bp', 'chunkIndex': 4,
+            'dataBase64': base64.b64encode(data[4 * block:]).decode()})
+        result = bridge.dispatch('session/attachment/commit', {'uploadId': 'bp'})
+        self.assertEqual(result['ref'], 'zcode-artifact://after-retry')
+
+    def test_attachment_committed_retry_validates_every_metadata_field(self):
+        import hashlib as h
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r9'}
+            if m == 'attachmentCommitV4' else {}))
+        data = b'abc'
+        good = dict(self.UPLOAD_TARGET, uploadId='dup', fileName='photo.jpg', mime='image/jpeg',
+            totalBytes=3, totalChunks=1, checksum='sha256:' + h.sha256(data).hexdigest())
+        bridge.dispatch('session/attachment/begin', good)
+        bridge.dispatch('session/attachment/chunk', {'uploadId': 'dup', 'chunkIndex': 0,
+            'dataBase64': base64.b64encode(data).decode()})
+        committed = bridge.dispatch('session/attachment/commit', {'uploadId': 'dup'})
+        self.assertEqual(committed['ref'], 'zcode-artifact://r9')
+        # Same id with ANY changed begin field is refused instead of handing out the old ref.
+        for changed in ({**good, 'fileName': 'different.jpg'},
+                {**good, 'totalBytes': 4, 'totalChunks': 1,
+                 'checksum': 'sha256:' + h.sha256(b'abcd').hexdigest()},
+                {**good, 'totalChunks': 2}):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/attachment/begin', changed)
+        again = bridge.dispatch('session/attachment/begin', good)
+        self.assertEqual((again['state'], again['ref']), ('committed', 'zcode-artifact://r9'))
+
     def test_attachment_row_projection_is_bounded_and_marks_truncation(self):
         rows = [{'rowId': 1, 'kind': 'userInput', 'text': 'look', 'state': 'complete',
             'attachments': [{'ref': 'zcode-artifact://x', 'fileName': 'a.jpg', 'mime': 'image/jpeg', 'bytes': 10}]
