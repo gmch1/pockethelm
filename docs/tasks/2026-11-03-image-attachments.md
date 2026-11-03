@@ -1,6 +1,6 @@
 # 图片附件发送：Codex 与 ZCode 双端支持
 
-状态：最终 review 通过，未提交或发布
+状态：已发布 0.4.19 / 29
 
 执行约定：当前 Codex 直接负责实现、测试、review 和交付。下文 ZCode 指目标引擎，不代表委派执行；未经用户明确要求不启动其他 AI。
 
@@ -302,6 +302,11 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 
 ## 发布或完成 由 Codex 维护
 
-- 最终代码与测试产物一致性：（待定）
-- 发布版本、APK SHA-256 与商店验证：（待定）
-- 完成时间及说明：（待定）
+### 0.4.19 / 29 发布验证（2026-11-03，用户授权）
+
+- 发布序列：`image-attachments`（3dfa53b，review 通过）合并入 main（--no-ff）+ 版本提交递增 0.4.19/29；签名 release/AndroidTest 构建与 lintRelease 通过。
+- 发行包 SHA-256 `9f676cbbfdcdfe1ede1f138930f77f33b07eb346fae95e4fb3a78a8d00f60f1e`；129 实机安装哈希逐字节一致；JVM 114 项（113 通过、1 可选 SSH 跳过）；真机 106 项全过（双端附件、交互、队列、下拉刷新、Picker UI）；模型请求 0。两项 ReadingUi 用例以相同代码工作区包两次通过为准，最终包未单独重跑（仅 versionCode 差异），如实记录。
+- 上传：按 `ops-notes/runbooks/store-phone-129.md`，LAN API `http://192.168.31.129:8767`（healthz 200），`store/scripts/upload.py` 返回 `published`；早前对腾讯跳板 8765 的隧道猜测系错误入口，已撤销并在 unauthorized 后停止，未重复请求。
+- 公开验证：`https://store.901200.xyz/fdroid/repo` 索引达到 0.4.19/29，签名指纹与 0.4.18 一致（`54c2508d…`）；完整下载 APK 哈希/大小与待发布包一致。
+- 私有证据：`~/.local/state/pockethelm/release-0.4.19/`（build.log、instrument.txt、upload-out.json、index-v1.jar、download.apk、store-verified.json、verification.json、notes.txt、PocketHelm-0.4.19.apk）。
+- 产物提交：main 上的合并提交 + `release 0.4.19 (29)`；发布后推送 main。
