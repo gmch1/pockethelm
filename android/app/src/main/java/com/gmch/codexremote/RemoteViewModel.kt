@@ -345,7 +345,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (e: HostIdentityException) {
                     mutable.update { it.copy(challenge = e.challenge, connected = false, status = "核对 SSH 主机指纹") }
                 } catch (e: CancellationException) { throw e }
-                catch (t: Throwable) { mutable.update { it.copy(connected = false, status = "连接失败") }; fail(t) }
+                catch (t: Throwable) { mutable.update { it.copy(connected = false, status = "连接失败", error = connectionFailureMessage(t)) } }
                 finally {
                     if (!mutable.value.connected || generation != epoch) withContext(NonCancellable + Dispatchers.IO) { ssh.close() }
                     if (generation == epoch) mutable.update { it.copy(busy = false) }
@@ -486,7 +486,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 delay(20_000)
                 if (mutable.value.connected && mutable.value.foreground && !mutable.value.busy) {
                     actions.withLock {
-                        runCatching { loadSessions(false) }.onFailure { fail(it) }
+                        // Never surface CancellationException: cancelling this job (lock
+                        // screen, engine tab switch, reconnect rebuild) cancels the tick's
+                        // delay and used to leak "StandaloneCoroutine was cancelled" into
+                        // the error banner (task 2026-11-04-connection-error-leaks).
+                        try { loadSessions(false) }
+                        catch (e: CancellationException) { throw e }
+                        catch (t: Throwable) { fail(t) }
                     }
                 }
             }

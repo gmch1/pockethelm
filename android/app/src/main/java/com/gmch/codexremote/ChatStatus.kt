@@ -57,6 +57,18 @@ fun agentRunLabel(run: AgentRun, idleLabel: String) = when (run) {
     AgentRun.Idle -> idleLabel
 }
 
+/**
+ * User-facing text for a connection failure (task 2026-11-04-connection-error-leaks):
+ * DNS resolution right after unlock usually means the network is not ready yet, so
+ * the raw exception class name is replaced with an actionable message that keeps the
+ * failing host. Everything else keeps its original message.
+ */
+internal fun connectionFailureMessage(t: Throwable): String = when (t) {
+    is java.net.UnknownHostException ->
+        "无法解析跳板机地址 ${t.message?.take(200)}：设备网络可能尚未就绪，请稍后点击重连"
+    else -> t.message ?: t.javaClass.simpleName
+}
+
 /** Short Chinese label for a timeline item status; unknown values hide instead of leaking English. */
 fun timelineStatusLabel(status: String) = when (status) {
     "inProgress", "running" -> "执行中"

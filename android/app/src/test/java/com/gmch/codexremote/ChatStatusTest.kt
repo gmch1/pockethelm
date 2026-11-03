@@ -213,4 +213,23 @@ class ChatStatusTest {
         assertEquals("1 分 52 秒", turnDurationLabel(112_000))
         assertEquals("61 分 0 秒", turnDurationLabel(3_660_000))
     }
+
+    // ---- 2026-11-04-connection-error-leaks: connection failure messaging ----
+
+    @Test fun unknownHostBecomesActionableMessageKeepingHost() {
+        val message = connectionFailureMessage(java.net.UnknownHostException("jump.901200.xyz"))
+        assertTrue(message.contains("jump.901200.xyz"))
+        assertTrue(message.contains("网络可能尚未就绪"))
+        assertTrue(message.contains("重连"))
+        assertFalse(message.contains("UnknownHostException"))
+        // Host name is clipped to keep the banner single-line friendly.
+        val long = connectionFailureMessage(java.net.UnknownHostException("x".repeat(500)))
+        assertTrue(long.length < 300)
+    }
+
+    @Test fun otherConnectionFailuresKeepOriginalMessage() {
+        assertEquals("SSH 通道已关闭", connectionFailureMessage(java.io.IOException("SSH 通道已关闭")))
+        assertEquals("SomeFailure", connectionFailureMessage(object : Exception("SomeFailure") {}))
+        assertEquals("RuntimeException", connectionFailureMessage(RuntimeException()))
+    }
 }
