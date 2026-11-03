@@ -61,12 +61,26 @@ fun agentRunLabel(run: AgentRun, idleLabel: String) = when (run) {
  * User-facing text for a connection failure (task 2026-11-04-connection-error-leaks):
  * DNS resolution right after unlock usually means the network is not ready yet, so
  * the raw exception class name is replaced with an actionable message that keeps the
- * failing host. Everything else keeps its original message.
+ * failing host. JSch wraps UnknownHostException into JSchException
+ * ("Session.connect: java.net.UnknownHostException: host"), so the cause chain is
+ * walked with a bounded depth before falling back to the original message.
+ * [endpointLabel] names what failed to resolve (跳板机/开发机) so all DNS failures
+ * are not mislabelled as the jump host.
  */
-internal fun connectionFailureMessage(t: Throwable): String = when (t) {
-    is java.net.UnknownHostException ->
-        "无法解析跳板机地址 ${t.message?.take(200)}：设备网络可能尚未就绪，请稍后点击重连"
-    else -> t.message ?: t.javaClass.simpleName
+internal fun connectionFailureMessage(t: Throwable, endpointLabel: String = "连接"): String {
+    var cause: Throwable? = t
+    var depth = 0
+    while (cause != null && depth < 8) {
+        if (cause is java.net.UnknownHostException) {
+            val host = cause.message?.trim().orEmpty()
+            return if (host.isBlank() || host.length > 200)
+                "无法解析${endpointLabel}地址：设备网络可能尚未就绪，请稍后点击重连"
+            else "无法解析${endpointLabel}地址 $host：设备网络可能尚未就绪，请稍后点击重连"
+        }
+        cause = cause.cause
+        depth += 1
+    }
+    return t.message ?: t.javaClass.simpleName
 }
 
 /** Short Chinese label for a timeline item status; unknown values hide instead of leaking English. */

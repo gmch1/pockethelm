@@ -232,4 +232,36 @@ class ChatStatusTest {
         assertEquals("SomeFailure", connectionFailureMessage(object : Exception("SomeFailure") {}))
         assertEquals("RuntimeException", connectionFailureMessage(RuntimeException()))
     }
+
+    // ---- R10: JSch wraps UnknownHostException in JSchException ----
+
+    @Test fun jschWrappedDnsFailureIsUnwrappedWithJumpLabel() {
+        // JSch 2.28.8 wraps connect-time DNS failure as JSchException("Session.connect: "
+        // + e.message, cause = UnknownHostException) — format verified against the
+        // cached 2.28.8 jar by the implementation review.
+        val cause = java.net.UnknownHostException("dns-probe.invalid")
+        val thrown = com.jcraft.jsch.JSchException("Session.connect: " + cause.message, cause)
+        val message = connectionFailureMessage(thrown, "跳板机")
+        assertTrue(message.contains("dns-probe.invalid"))
+        assertTrue(message.contains("跳板机"))
+        assertTrue(message.contains("网络可能尚未就绪"))
+        assertFalse(message.contains("JSchException"))
+        assertFalse(message.contains("Session.connect"))
+        assertFalse(message.contains("UnknownHostException"))
+    }
+
+    @Test fun deeperWrappingStillFindsTheDnsCause() {
+        val inner = java.net.UnknownHostException("jump.901200.xyz")
+        val wrapped = java.io.IOException("outer", com.jcraft.jsch.JSchException("Session.connect: java.net.UnknownHostException: jump.901200.xyz", inner))
+        val message = connectionFailureMessage(wrapped, "开发机")
+        assertTrue(message.contains("jump.901200.xyz"))
+        assertTrue(message.contains("开发机"))
+        assertFalse(message.contains("IOException"))
+    }
+
+    @Test fun blankHostFallsBackWithoutNull() {
+        val message = connectionFailureMessage(java.net.UnknownHostException("  "), "跳板机")
+        assertTrue(message.contains("无法解析跳板机地址："))
+        assertFalse(message.contains("null"))
+    }
 }

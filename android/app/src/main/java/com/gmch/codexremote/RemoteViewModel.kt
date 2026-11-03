@@ -345,7 +345,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (e: HostIdentityException) {
                     mutable.update { it.copy(challenge = e.challenge, connected = false, status = "核对 SSH 主机指纹") }
                 } catch (e: CancellationException) { throw e }
-                catch (t: Throwable) { mutable.update { it.copy(connected = false, status = "连接失败", error = connectionFailureMessage(t)) } }
+                catch (t: Throwable) {
+                    val label = if (mutable.value.profile.useJump) "跳板机" else "开发机"
+                    mutable.update { it.copy(connected = false, status = "连接失败", error = connectionFailureMessage(t, label)) }
+                }
                 finally {
                     if (!mutable.value.connected || generation != epoch) withContext(NonCancellable + Dispatchers.IO) { ssh.close() }
                     if (generation == epoch) mutable.update { it.copy(busy = false) }
@@ -485,18 +488,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 delay(20_000)
                 if (mutable.value.connected && mutable.value.foreground && !mutable.value.busy) {
-                    actions.withLock {
-                        // Never surface CancellationException: cancelling this job (lock
-                        // screen, engine tab switch, reconnect rebuild) cancels the tick's
-                        // delay and used to leak "StandaloneCoroutine was cancelled" into
-                        // the error banner (task 2026-11-04-connection-error-leaks).
-                        try { loadSessions(false) }
-                        catch (e: CancellationException) { throw e }
-                        catch (t: Throwable) { fail(t) }
-                    }
+                    actions.withLock { refreshTick() }
                 }
             }
         }
+    }
+
+    /** One list-refresh pass. Cancellation (lock screen, tab switch, reconnect rebuild)
+     *  while the RPC is suspended is rethrown, never surfaced via fail() — this is the
+     *  exact path that leaked "StandaloneCoroutine was cancelled" (implementation
+     *  review R6/R10 rounds). */
+    internal suspend fun refreshTick() {
+        try { loadSessions(false) }
+        catch (e: CancellationException) { throw e }
+        catch (t: Throwable) { fail(t) }
     }
 
     private suspend fun loadSessions(more: Boolean) {
