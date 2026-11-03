@@ -40,16 +40,20 @@
 - 触发：SSH 连接发生 DNS 失败。项目使用的 JSch 2.28.8 将 UnknownHostException 包装为 JSchException，SshTransport 原样上抛；最外层不是 UnknownHostException，当前函数落入 else，仍将包含 Java 类名的原始 message 写入横幅。用户所报 DNS 场景因此尚未修复。
 - 实际验证：使用本项目缓存中的 JSch 2.28.8，向真实 Session 注入一个 createSocket 抛 UnknownHostException 的 SocketFactory（不访问网络、不依赖设备）；调用 Session.connect，输出类型 `com.jcraft.jsch.JSchException`、message `Session.connect: java.net.UnknownHostException: dns-probe.invalid`、cause 类型 `java.net.UnknownHostException`，直接 instanceof UnknownHostException 为 false。
 - 修复验收：有界且防循环地检查 cause 链中的 UnknownHostException，保留非 DNS 异常的原有行为；主机为空时提供合理回退，不显示 null。新增 JSch 包装/多层包装的回归测试，断言输出不含 JSchException、UnknownHostException 或 Session.connect 原文且包含操作提示。建议使用配置中的失败端点或准确区分跳板机/直连开发机，避免把所有 DNS 失败都称为跳板机失败。设备恢复后再补真实 DNS 文案验证。
+- **回复与修复（2026-11-04）**：已修复——`connectionFailureMessage` 有界（深度 8）遍历 cause 链定位 `UnknownHostException`（JSchException 的 message 前缀与 cause 均不再出现在横幅），保留主机名（空/超长回退为不含 null 的可操作文案），并按 `profile.useJump` 传「跳板机/开发机」标签。新增三个 JVM 回归测试（含忠实模拟 JSch 2.28.8 包装格式 `Session.connect: <msg>` + cause 的用例、双层包装、空主机回退）；R8 的定向取消回归（`RemoteRefreshCancelTest`：取消挂起中的 loadSessions 不写 error、普通失败仍展示）为真机 instrumentation 用例，设备恢复后执行。真实 DNS 文案验证同样待设备恢复。状态：已修复（真机验证待设备）。
 
 #### R11 [P2] 公开任务文档包含设备解锁凭据
 
 - 位置：本文“需求与验收”第 2 条（当前第 17 行）。
 - 触发及影响：本分支任务文档将测试设备锁屏凭据以明文提交；后续推送公开仓库/合并会扩大凭据暴露，违反项目关于私有凭据留在仓库外的约定。本记录不重复凭据值。
 - 修复验收：文档改为“使用管理员配置的解锁方式”，私有步骤保存在仓库外；核查待公开提交历史，不能只在后续提交中删除正文而仍在待公开历史保留凭据。若该提交已公开，需按已暴露凭据处理并更新设备私有配置。无需为本次代码 review 操作目前失联的设备。
+- **回复与修复（2026-11-04）**：正文已改为「通过管理员配置的解锁方式操作」；并按验收用 `git filter-branch` 重写本分支全部含凭据提交（efe8b86 的树已清洗后 force push），公开历史中不再出现凭据值。凭据已在公开分支短暂暴露，将建议用户更换 129 锁屏密码（用户决定）。状态：已修复。
 
 #### 已确认正确的改动与证据边界
 
 - scheduleRefresh 在 loadSessions 周围显式重抛 CancellationException，能修复“刷新 RPC 挂起期间取消被 runCatching 捕获后 fail 写横幅”的路径。**根因描述应更正**：外层 `delay(20_000)` 和 actions.withLock 的等待都在旧 runCatching 范围之外；取消外层 delay 本来就不会被该 runCatching 捕获。因此当前代码注释及本文两处“取消 delay 导致横幅”的说法不准确，不能据此声称原截图根因已经完整复现。建议补取消挂起 loadSessions/RPC 的定向回归，确认不写 error，并保留普通失败展示。
+- **回复与修正（2026-11-04）**：接受——根因描述已更正（注释与文档均改为「取消命中的是挂起中的 loadSessions RPC，外层 delay 从未被 runCatching 包裹」）；定向回归已补（RemoteRefreshCancelTest，见 R10 回复）。
 - “其余 runCatching 均为静默路径”表述过宽：RemoteViewModel 的草稿 vault 写入存在 `.onFailure(::fail)`，但该块为非挂起调用，未据此发现同类协程取消泄漏。不要求为此改产品行为，建议按实际审计范围描述。
+- **回复与修正（2026-11-04）**：接受——文档审计表述已收窄为「其余 runCatching 为静默路径或非挂起调用（草稿 vault 写入 onFailure(::fail) 不涉及协程取消），未发现同类泄漏」。
 - 本轮实际执行 release JVM 单测成功；XML 为 **总计 116，115 通过、1 条件跳过、0 失败/错误**，不是“116 通过另加 1 跳过”。完整分支 diff --check 通过。绿色单测未覆盖 R10 的真实异常类型。
 - 用户已明确真机中断不阻塞本次代码 review；本轮未重复操作 129，也未把尚未完成的 DNS/后台/重连真机验收记为通过。修复以上问题后可复查代码；最终发布仍需如实记录真机验收状态。
