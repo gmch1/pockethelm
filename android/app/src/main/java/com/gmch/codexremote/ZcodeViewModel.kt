@@ -269,7 +269,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnectManually() = disconnect()
     private fun disconnect() {
         generation++
-        quotaAutoSyncedAt = 0L
+        quotaFetchedFor = null
         attachmentSerial.incrementAndGet()
         supportsSessionIndex = false
         backgroundJob?.cancel(); backgroundJob = null
@@ -488,22 +488,25 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(quota = "正在读取…", quotaSummary = "额度 ▾") }
         try {
             val data = call("quota", selectionParams())
-            if (stillSelected()) mutable.update { it.copy(quota = zcodeQuota(data), quotaSummary = zcodeQuotaSummary(data, selected?.model.orEmpty())) }
+            if (stillSelected()) {
+                quotaFetchedFor = selected
+                mutable.update { it.copy(quota = zcodeQuota(data), quotaSummary = zcodeQuotaSummary(data, selected?.model.orEmpty())) }
+            }
         }
         catch (e: CancellationException) { throw e }
         catch (e: Exception) { if (stillSelected()) mutable.update { it.copy(quota = "额度暂不可用，请重试", quotaSummary = "额度 ▾") } }
     }
 
-    /** Automatic quota refresh on session entry: deduped within 30s, silently skipped
-     *  while no valid selection exists (the manual tap stays as the explicit fallback). */
-    private var quotaAutoSyncedAt = 0L
+    /** Automatic quota refresh on session entry: deduped per selection — same plan+model
+     *  keeps the cached display; a different plan or reconnect re-fetches. Silently
+     *  skipped while no valid selection exists (manual tap stays as the fallback). */
+    private var quotaFetchedFor: ZSelection? = null
     private fun autoRefreshQuota() {
-        val now = System.currentTimeMillis()
-        if (now - quotaAutoSyncedAt < 30_000) return
         val choice = mutable.value.selection ?: return
         val provider = mutable.value.providers.find { it.id == choice.provider } ?: return
         if (provider.guard != mutable.value.selectionGuard || provider.models.none { it.id == choice.model }) return
-        quotaAutoSyncedAt = now
+        if (choice == quotaFetchedFor && mutable.value.quotaSummary != "额度 ▾") return
+        quotaFetchedFor = choice
         quota()
     }
     fun create(project: ZProject) = action {
@@ -556,7 +559,6 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         attachmentRefs.clear()
         val outKey = outgoingKey(session.id)
         mutable.update { it.copy(selected = session, historyCached = false, items = emptyList(), queue = emptyList(), phase = "", executionId = "",
-            quota = "点击读取额度", quotaSummary = "额度 ▾",
             historyLoading = true, historyError = null, sending = false,
             outgoing = (outgoingBySession[outKey] ?: emptyList()).toList(),
             draft = vault.get(key("draft", session.id)).orEmpty(), beforeRow = null, notice = "", currentSelection = null, permission = "",
