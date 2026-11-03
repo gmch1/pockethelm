@@ -1,6 +1,8 @@
 package com.gmch.codexremote
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -109,9 +111,22 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
                     ZcodeTimeline(state, vm, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
                     ChatSettingsBar(zcodeSettingsSummary(state), state.quotaSummary,
                         { showSettings = true }, { showSettings = true; vm.quota() })
+                    val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as android.app.Application
+                    val processor = remember(app) { ImageProcessor(app) }
+                    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+                        if (uri != null) {
+                            val (name, mime) = processor.sourceInfo(uri)
+                            vm.addAttachment(uri, name, mime)
+                        }
+                    }
                     ChatComposer(state.draft, vm::draft, state.sending,
-                        state.connected && !state.busy && !state.pending && !state.sending && state.draft.isNotBlank() && state.selection != null,
-                        state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send)
+                        state.connected && !state.busy && !state.pending && !state.sending && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.selection != null,
+                        state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send,
+                        attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
+                        canAttach = state.attachmentsEnabled && !state.attachmentsBusy
+                            && state.attachments.size < ImagePolicy.MESSAGE_MAX && !state.sending && !state.busy,
+                        attach = { pickImage.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                        removeAttachment = vm::removeAttachment)
                     if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false },
                         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
                         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())

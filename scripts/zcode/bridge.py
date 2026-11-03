@@ -36,6 +36,21 @@ INTERACTION_DETAIL_BYTES = 32 * 1024
 INTERACTION_DETAILS_MAX = 4
 INTERACTION_CHECK_IDS_MAX = 16
 
+# Image attachments (task 2026-11-03-image-attachments). Two-stage chunking: the phone
+# sends 96KiB raw chunks that safely fit the 256KiB JSONL line cap after base64; the
+# bridge re-aggregates them on raw-byte boundaries into the official 384KiB chunks
+# (96*4=384, so phone blocks never straddle an upstream boundary). Phone chunk counts
+# and progress are never forwarded upstream — official begin sees upstream counts only.
+ATTACHMENT_MIME_ALLOWLIST = ('image/jpeg',)
+ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+ATTACHMENT_MESSAGE_MAX = 4
+ATTACHMENT_ROW_MAX = 8   # official per-message cap; rows beyond the bridge cap get a marker
+ATTACHMENT_PHONE_CHUNK = 96 * 1024
+ATTACHMENT_UPSTREAM_CHUNK = 384 * 1024
+ATTACHMENT_TRANSACTIONS_MAX = 4
+ATTACHMENT_COMMITTED_MAX = 32
+ATTACHMENT_TTL_SECONDS = 600
+
 
 class RequestError(Exception):
     pass
@@ -124,6 +139,9 @@ def project_rows(rows):
         if kind in ('userInput', 'assistantText', 'reasoning'):
             item['text'] = row.get('text', '')[:120000]
             item['commandId'] = row.get('sourceCommandId', '')
+            attachments = project_row_attachments(row.get('attachments'))
+            if attachments:
+                item['attachments'] = attachments
         elif kind == 'toolCall':
             # Omit arbitrary metadata and binary attachments. Detail remains opt-in in UI.
             output = row.get('output', {})
@@ -135,6 +153,39 @@ def project_rows(rows):
         else:
             item['text'] = str(row.get('displayName') or row.get('description') or row.get('text') or kind)[:2000]
         result.append(item)
+    return result
+
+
+def project_row_attachments(source):
+    """Bounded attachment metadata for userInput rows: index, display name, mime, size.
+    Malformed entries are skipped; valid entries beyond the cap set a truncation marker —
+    dropped attachments are real data (desktop clients may send up to 8), never 'invalid'.
+    ref/preview fields never leave the host."""
+    if not isinstance(source, list) or not source:
+        return []
+    result = []
+    truncated = False
+    for index, entry in enumerate(source):
+        if not isinstance(entry, dict):
+            truncated = True
+            continue
+        name = entry.get('fileName')
+        mime = entry.get('mime')
+        size = entry.get('bytes')
+        if not isinstance(name, str) or not 0 < len(name) <= 255 or not isinstance(mime, str) \
+                or not 0 < len(mime) <= 100 or type(size) is not int or size < 0:
+            truncated = True
+            continue
+        clean = re.sub(r'[\x00-\x1f\x7f]', '', name)
+        if not clean:
+            truncated = True
+            continue
+        if len(result) >= ATTACHMENT_ROW_MAX:
+            truncated = True
+            break
+        result.append({'index': index, 'fileName': clean, 'mime': mime, 'bytes': size})
+    if truncated:
+        result.append({'index': -1, 'fileName': '…', 'mime': '', 'bytes': 0, 'truncated': True})
     return result
 
 
@@ -470,6 +521,37 @@ class Assembler:
         return json.loads(raw)
 
 
+class AttachmentTransaction:
+    """One in-flight phone→bridge→upstream upload. Phone chunks (96KiB) are accepted
+    strictly in order and re-aggregated into official 384KiB chunks; a flush only counts
+    after the upstream ack, so a failed upstream call leaves the buffer retryable. The
+    whole-file digest is computed once per unique chunk and compared at commit."""
+
+    def __init__(self, target, upload_id, file_name, mime, total_bytes, phone_chunks, checksum, now):
+        self.target = target                    # trusted scope from begin, never re-supplied
+        self.upload_id = upload_id
+        self.file_name = file_name
+        self.mime = mime
+        self.total_bytes = total_bytes
+        self.phone_chunks = phone_chunks
+        self.checksum = checksum
+        self.created_at = now
+        self.last_used = now
+        self.begun = False                      # official begin acked
+        self.digests = {}                       # phone index -> sha256 hex
+        self.next_index = 0                     # next phone chunk expected
+        self.received = 0                       # unique accepted bytes
+        self.buffer = bytearray()               # not-yet-flushed raw bytes (≤384KiB + tail)
+        self.upstream_flushed = 0               # upstream-acked byte count (chunk-aligned)
+        self.hasher = hashlib.sha256()
+        self.committing = False                 # upstream commit sent, outcome unknown
+
+    def same_metadata(self, target, file_name, mime, total_bytes, phone_chunks, checksum):
+        return (self.target == target and self.file_name == file_name and self.mime == mime
+            and self.total_bytes == total_bytes and self.phone_chunks == phone_chunks
+            and self.checksum == checksum)
+
+
 class Bridge:
     def __init__(self, client):
         self.client = client
@@ -479,6 +561,8 @@ class Bridge:
         self.listener = None
         self.indexes = SessionIndexes(self, Assembler)
         self.client.event_handler = self.indexes.event
+        self.attachments = {}                   # uploadId -> AttachmentTransaction (open)
+        self.committed = {}                     # ref -> metadata of committed uploads
 
     def call(self, channel, method, *args):
         return self.client.call(channel, method, list(args))
@@ -628,8 +712,14 @@ class Bridge:
                     'mode': 'yolo', 'planEnabled': False, 'followupMode': 'queue'}}
             else:
                 require(params.get('delivery') in ('queue', 'guide'), '仅支持排队或插入')
-                payload = {'text': string(params.get('text'), 64000), 'modelSelection': chosen,
+                attachments = self.attachment_payload(params)
+                text = params.get('text', '')
+                require(isinstance(text, str) and len(text) <= 64000 and (text.strip() or attachments),
+                    '请输入文字或添加附件')
+                payload = {'text': text, 'modelSelection': chosen,
                     'mode': 'yolo', 'planEnabled': False, 'requestedDelivery': params['delivery'], 'inputOrigin': 'mobile'}
+                if attachments:
+                    payload['attachments'] = attachments
         elif kind == 'stop':
             payload = {'expectedForegroundExecutionId': string(params.get('executionId'))}
         elif kind == 'resolveInteraction':
@@ -656,6 +746,213 @@ class Bridge:
         # Project only stable status/code, not raw upstream diagnostic messages.
         return pick(ack, ['commandId', 'status', 'reasonCode', 'revisionAtDecision', 'result'])
 
+    # ---- Image attachments (task 2026-11-03-image-attachments) ----
+
+    def attachment_expire(self):
+        now = time.time()
+        for txn in [t for t in self.attachments.values() if now - t.last_used > ATTACHMENT_TTL_SECONDS]:
+            self.attachment_upstream_abort(txn)
+            self.attachments.pop(txn.upload_id, None)
+        for ref, meta in list(self.committed.items()):
+            if now - meta['lastUsed'] > ATTACHMENT_TTL_SECONDS:
+                self.committed.pop(ref, None)
+
+    def attachment_upstream_abort(self, txn):
+        # Best effort; a dead transaction is discarded locally regardless.
+        try:
+            self.agent('attachmentAbortV4', dict(self.attachment_upstream_target(txn), uploadId=txn.upload_id))
+        except Exception:
+            pass
+
+    def attachment_upstream_target(self, txn):
+        # Official attachment RPCs take the plain workspace/session pair; the workspace
+        # identity stays in the trusted local scope only.
+        return {'workspacePath': txn.target['workspacePath'], 'sessionId': txn.target['sessionId']}
+
+    def attachment_upstream_begin(self, txn):
+        result = self.agent('attachmentBeginV4', dict(self.attachment_upstream_target(txn),
+            uploadId=txn.upload_id, fileName=txn.file_name, mime=txn.mime, totalBytes=txn.total_bytes,
+            totalChunks=-(-txn.total_bytes // ATTACHMENT_UPSTREAM_CHUNK), checksum=txn.checksum))
+        txn.begun = True
+        return result
+
+    def attachment_push_upstream(self, txn, size):
+        index = txn.upstream_flushed // ATTACHMENT_UPSTREAM_CHUNK
+        self.agent('attachmentChunkV4', dict(self.attachment_upstream_target(txn), uploadId=txn.upload_id,
+            chunkIndex=index, dataBase64=base64.b64encode(bytes(txn.buffer[:size])).decode('ascii')))
+        del txn.buffer[:size]
+        txn.upstream_flushed += size
+
+    def attachment_flush(self, txn, final=False):
+        """Push complete 384KiB blocks (plus the tail when final). Progress is only
+        advanced after the official ack, so a failed call leaves the buffer retryable."""
+        while len(txn.buffer) >= ATTACHMENT_UPSTREAM_CHUNK:
+            self.attachment_push_upstream(txn, ATTACHMENT_UPSTREAM_CHUNK)
+        if final and txn.buffer:
+            self.attachment_push_upstream(txn, len(txn.buffer))
+
+    def attachment_trim_committed(self):
+        # Bounded ref map; server-side artifacts outlive local entries by design.
+        while len(self.committed) > ATTACHMENT_COMMITTED_MAX:
+            self.committed.pop(min(self.committed.items(), key=lambda kv: kv[1]['lastUsed'])[0])
+
+    def attachment_adopt_committed(self, txn, ref):
+        self.attachments.pop(txn.upload_id, None)
+        self.committed[ref] = {'target': txn.target, 'uploadId': txn.upload_id, 'fileName': txn.file_name,
+            'mime': txn.mime, 'bytes': txn.total_bytes, 'phoneChunks': txn.phone_chunks, 'lastUsed': time.time()}
+        self.attachment_trim_committed()
+        return {'uploadId': txn.upload_id, 'state': 'committed', 'ref': ref,
+            'fileName': txn.file_name, 'mime': txn.mime, 'bytes': txn.total_bytes,
+            'nextChunkIndex': txn.phone_chunks}
+
+    def attachment_resolve_committing(self, txn):
+        """A commit whose response was lost: re-run the idempotent official begin to learn
+        whether the upload already committed — never guess."""
+        txn.last_used = time.time()
+        result = self.attachment_upstream_begin(txn)
+        if result.get('state') == 'committed' and isinstance(result.get('ref'), str) and result['ref']:
+            return self.attachment_adopt_committed(txn, result['ref'])
+        txn.committing = False
+        return {'uploadId': txn.upload_id, 'state': 'staging', 'nextChunkIndex': txn.next_index}
+
+    def attachment_begin(self, params):
+        self.attachment_expire()
+        upload_id = string(params.get('uploadId'), 128)
+        require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]*', upload_id), '上传 ID 无效')
+        target = self.session_target(params)
+        file_name = string(params.get('fileName'), 255)
+        require('\r' not in file_name and '\n' not in file_name, '文件名无效')
+        mime = string(params.get('mime'), 100)
+        require(mime in ATTACHMENT_MIME_ALLOWLIST, '仅支持图片附件')
+        total_bytes = params.get('totalBytes')
+        require(type(total_bytes) is int and 0 < total_bytes <= ATTACHMENT_MAX_BYTES, '图片超出大小限制')
+        phone_chunks = params.get('totalChunks')
+        require(type(phone_chunks) is int and phone_chunks == -(-total_bytes // ATTACHMENT_PHONE_CHUNK),
+            '分块数量与大小不符')
+        checksum = string(params.get('checksum'), 128)
+        require(re.fullmatch(r'sha256:[0-9a-f]{64}', checksum), '校验值无效')
+        for ref, meta in self.committed.items():
+            if meta['uploadId'] == upload_id and meta['target'] == target:
+                meta['lastUsed'] = time.time()
+                return {'uploadId': upload_id, 'state': 'committed', 'ref': ref,
+                    'fileName': meta['fileName'], 'mime': meta['mime'], 'bytes': meta['bytes'],
+                    'nextChunkIndex': meta['phoneChunks']}
+        txn = self.attachments.get(upload_id)
+        if txn is not None:
+            require(txn.same_metadata(target, file_name, mime, total_bytes, phone_chunks, checksum),
+                '同名上传的参数与之前不一致，请重新开始上传')
+            txn.last_used = time.time()
+            if txn.committing:
+                return self.attachment_resolve_committing(txn)
+            if not txn.begun:
+                result = self.attachment_upstream_begin(txn)
+                if result.get('state') == 'committed':
+                    return self.attachment_adopt_committed(txn, result['ref'])
+            return {'uploadId': upload_id, 'state': 'staging', 'nextChunkIndex': txn.next_index}
+        require(len(self.attachments) < ATTACHMENT_TRANSACTIONS_MAX, '并发上传过多，请稍后重试')
+        txn = AttachmentTransaction(target, upload_id, file_name, mime, total_bytes, phone_chunks, checksum, time.time())
+        result = self.attachment_upstream_begin(txn)
+        self.attachments[upload_id] = txn
+        if result.get('state') == 'committed':
+            return self.attachment_adopt_committed(txn, result['ref'])
+        return {'uploadId': upload_id, 'state': 'staging', 'nextChunkIndex': 0}
+
+    def attachment_chunk(self, params):
+        self.attachment_expire()
+        txn = self.attachments.get(string(params.get('uploadId'), 128))
+        require(txn is not None, '上传事务不存在或已过期，请重新上传')
+        txn.last_used = time.time()
+        if txn.committing:
+            raise RequestError('上传正在确认，请稍后')
+        index = params.get('chunkIndex')
+        require(type(index) is int and 0 <= index < txn.phone_chunks, '块序号无效')
+        try:
+            raw = base64.b64decode(string(params.get('dataBase64'), 180 * 1024), validate=True)
+        except Exception:
+            raise RequestError('块数据无效')
+        expected_size = ATTACHMENT_PHONE_CHUNK if index < txn.phone_chunks - 1 \
+            else txn.total_bytes - (txn.phone_chunks - 1) * ATTACHMENT_PHONE_CHUNK
+        require(len(raw) == expected_size, '块大小不符')
+        digest = hashlib.sha256(raw).hexdigest()
+        if index < txn.next_index:
+            # Duplicate of an accepted chunk: must match exactly; a matching duplicate
+            # also retries any upstream flush that failed earlier.
+            require(txn.digests.get(index) == digest, '重复块内容与已接受的不一致')
+            self.attachment_flush(txn)
+            return {'uploadId': txn.upload_id, 'nextChunkIndex': txn.next_index}
+        require(index == txn.next_index, '块序号越序，请按顺序重传')
+        txn.digests[index] = digest
+        txn.next_index = index + 1
+        txn.received += len(raw)
+        txn.hasher.update(raw)
+        txn.buffer.extend(raw)
+        self.attachment_flush(txn)
+        return {'uploadId': txn.upload_id, 'nextChunkIndex': txn.next_index}
+
+    def attachment_commit(self, params):
+        self.attachment_expire()
+        upload_id = string(params.get('uploadId'), 128)
+        for ref, meta in self.committed.items():
+            if meta['uploadId'] == upload_id:
+                meta['lastUsed'] = time.time()
+                return {'uploadId': upload_id, 'state': 'committed', 'ref': ref,
+                    'fileName': meta['fileName'], 'mime': meta['mime'], 'bytes': meta['bytes']}
+        txn = self.attachments.get(upload_id)
+        require(txn is not None, '上传事务不存在或已过期，请重新上传')
+        txn.last_used = time.time()
+        if txn.committing:
+            return self.attachment_resolve_committing(txn)
+        require(txn.next_index == txn.phone_chunks and txn.received == txn.total_bytes, '数据尚未传完，不能提交')
+        if 'sha256:' + txn.hasher.hexdigest() != txn.checksum:
+            # Checksum mismatch: the upload is cancelled outright, never committed.
+            self.attachments.pop(upload_id, None)
+            self.attachment_upstream_abort(txn)
+            raise RequestError('图片校验不符，已取消上传')
+        self.attachment_flush(txn, final=True)
+        require(txn.upstream_flushed == txn.total_bytes, '上游数据不完整，请重试提交')
+        txn.committing = True
+        try:
+            result = self.agent('attachmentCommitV4', dict(self.attachment_upstream_target(txn), uploadId=upload_id))
+        except WireError:
+            raise RequestError('提交结果未知，请重试提交以确认')
+        txn.committing = False
+        ref = result.get('ref')
+        require(isinstance(ref, str) and 0 < len(ref) <= 1024, '上游未返回有效附件引用')
+        return self.attachment_adopt_committed(txn, ref)
+
+    def attachment_abort(self, params):
+        self.attachment_expire()
+        upload_id = string(params.get('uploadId'), 128)
+        txn = self.attachments.pop(upload_id, None)
+        if txn is not None:
+            self.attachment_upstream_abort(txn)
+            return {'uploadId': upload_id, 'state': 'aborted'}
+        if any(meta['uploadId'] == upload_id for meta in self.committed.values()):
+            # Already committed upstream and possibly referenced by the session.
+            return {'uploadId': upload_id, 'state': 'committed'}
+        return {'uploadId': upload_id, 'state': 'aborted'}
+
+    def attachment_payload(self, params):
+        """Validate sendText attachments against committed uploads of the SAME target.
+        Forged refs, cross-session refs, or metadata mismatches are rejected — a ref is
+        only an opaque token for something this connection actually uploaded."""
+        source = params.get('attachments')
+        if source is None:
+            return None
+        require(isinstance(source, list) and 0 < len(source) <= ATTACHMENT_MESSAGE_MAX, '附件数量无效')
+        target = self.session_target(params)
+        result = []
+        for entry in source:
+            require(isinstance(entry, dict) and set(entry) == {'ref', 'fileName', 'mime', 'bytes'}, '附件信息无效')
+            meta = self.committed.get(entry.get('ref'))
+            require(meta is not None, '附件尚未上传完成，请先上传')
+            require(meta['target'] == target and meta['fileName'] == entry['fileName']
+                and meta['mime'] == entry['mime'] and meta['bytes'] == entry['bytes'],
+                '附件信息与上传时不一致，请重新上传')
+            meta['lastUsed'] = time.time()
+            result.append(pick(entry, ['ref', 'fileName', 'mime', 'bytes']))
+        return result
+
     def dispatch(self, method, params):
         require(isinstance(params, dict), '请求参数无效')
         if method == 'initialize':
@@ -671,7 +968,7 @@ class Bridge:
             # New capabilities are negotiated additively; old clients ignore them.
             return {'engine': 'zcode', 'bridgeVersion': 1, 'permission': 'Full access', 'protocolVersion': 3,
                 'sessionsIndex': True, 'capabilities': {'interactions': True, 'queueOps': True,
-                    'turnSummary': True, 'fileChanges': True, 'indexMeta': True}}
+                    'turnSummary': True, 'fileChanges': True, 'indexMeta': True, 'attachments': True}}
         require(self.client_id is not None, '请先初始化连接')
         if method == 'sessions/status':
             return self.indexes.read()
@@ -755,6 +1052,14 @@ class Bridge:
             return self.command('resolveInteraction', params)
         if method == 'session/interact/snooze':
             return self.command('snoozeInteractionAutoResolution', params)
+        if method == 'session/attachment/begin':
+            return self.attachment_begin(params)
+        if method == 'session/attachment/chunk':
+            return self.attachment_chunk(params)
+        if method == 'session/attachment/commit':
+            return self.attachment_commit(params)
+        if method == 'session/attachment/abort':
+            return self.attachment_abort(params)
         if method == 'command/query':
             target = self.workspace(params)
             data = self.agent('queryConversationCommandsV4', dict(target, commands=[{

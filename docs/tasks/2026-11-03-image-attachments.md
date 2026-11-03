@@ -1,6 +1,6 @@
 # 图片附件发送：Codex 与 ZCode 双端支持
 
-状态：方案已修订，待实现；协议待核验项见下，尚未完成实现或真机验收。
+状态：实现与验证完成，待 review
 
 执行约定：当前 Codex 直接负责实现、测试、review 和交付。下文 ZCode 指目标引擎，不代表委派执行；未经用户明确要求不启动其他 AI。
 
@@ -148,18 +148,44 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 
 ## 实现与验证 由 Codex 维护
 
-- 改动摘要与关键文件：（待实现）
-- 代码版本或源码快照标识：（待实现）
-- 自动化检查：（待实现）
-- 真机环境：（待实现）
-- 真机验证：（待实现）
-- 待发布 APK：（待实现）
-- 测试清理结果：（待实现）
-- 已知限制与未验证项：（待实现）
+- 基线说明：任务分支 `image-attachments` 基于 `origin/main`（85399c3）。main 尚未合入
+  `fix-zcode-stable-plan-guard`（已 review 未合并）；二者改动区域无重叠，不构成本任务阻塞。
+- 改动摘要与关键文件：
+  - `scripts/zcode/bridge.py`：两段分块上传事务（96KiB 手机块 → 384KiB 上游块重聚合，进度分轴）；
+    `session/attachment/{begin,chunk,commit,abort}`（begin 幂等、chunk 严格顺序+摘要幂等+失败重试、
+    commit 全量 sha256 校验不符即 abort、回执丢失经幂等 begin 复核）；事务 ≤4、映射 ≤32、TTL 10 分钟；
+    `session/send` 附件逐条校验 ref/元数据/目标一致（≤4）；`project_rows` 有界投影（≤8+截断标记）；
+    `capabilities.attachments`（bridgeVersion 保持 1）。
+  - `ChatAttachment.kt`（新）：附件模型 + `ImagePolicy` 纯策略 + `AttachmentUploadPlan`。`ImageProcessor.kt`
+    （新）：32MiB 有界读取、边界校验、2 的幂采样、EXIF 旋转、透明白底、2048 缩放、JPEG 85→50 有界降质，
+    重编码剥离全部 EXIF/GPS。
+  - `Protocol.kt`：`imageInput`/`messageInput`（纯图不造空 text）；时间线 `[图片] 文件名` 占位。
+  - `RemoteViewModel.kt`：发送时 `fs/writeFile` 至 `/tmp/pockethelm-img-<id>.jpg`（同批复用路径）；
+    未 dispatch 移除经 `fs/remove` 精确清理；已 dispatch 保留供历史；steer 带图拒绝；断线清态。
+  - `ZcodeViewModel.kt`：串行上传状态机（独立于消息 pending，失败整批保留、已传 ref 复用）；send
+    空文本+附件放行、上传成功后才组装 attachments；能力协商；切换/断开清附件与 refs。
+  - UI：`ChatComposer` 附件 chips+图片按钮（无能力隐藏）；双屏接入 `PickVisualMedia`；行占位。
+- 代码版本：分支 `image-attachments`，提交见推送记录。
+- 自动化检查：Python 59 项通过（新增 8）；JVM 112 项通过（新增 10）；androidTest 真机
+  `ImageAttachmentDeviceTest` 6 项通过（EXIF/白底/首帧/拒绝/双端 envelope/失败隔离；实现中修复真缺陷：
+  上传原在 try 外，失败路径 attachmentsBusy 永不复位）；全量回归非 UI+P1 98 项 OK，ReadingUi 两项分次
+  OK（MIUI 后台启动需临时放行，已还原）。
+- 真机环境：Xiaomi M2104K10AC / Android 13；同签名 release 覆盖安装（测试版经 root 降级安装，验证后
+  已恢复 main 构建 0.4.16 / versionCode 28）。
+- 真机/真实服务端端到端（`scripts/image_e2e.py`，合成双色图，无隐私内容）：Codex fs/writeFile →
+  localImage → 真实回合回复「上=红色，下=蓝色」，fs/remove 清理+归档；ZCode 真实两段上传 commit
+  （`zcode-artifact://sess_…`）→ sendText attachments（GLM-5.3-Flash @ 个人 Coding Plan）→ 回复
+  「上=红色，下=蓝色。」，行投影含附件元数据。以模型回复内容验证读图，不以回执为准。
+- 桥接器已部署开发机（capabilities 含 attachments）；手机 0.4.16 兼容（忽略新字段）。
+- 测试清理结果：e2e 线程归档、/tmp 图片 fs/remove、AppOps 还原、临时 APK 清理、设备恢复 0.4.16；
+  ZCode e2e 会话留在 smoke 工作区（会话级 artifact 由服务端 retention 回收）。
+- 已知限制与未验证项：缩略图二期；steer 带图禁用（协议未验证）；已 dispatch 文件保留 /tmp 不承诺自动
+  清理；相册 UI 手动冒烟未脚本化（链路由 androidTest+e2e 覆盖）；Start Plan 当日不可执行，附件链路以
+  个人 Coding Plan 实测。
 
 ## Review 由 Codex 维护问题和结论
 
-整体结论：2026-11-03 按用户授权修订方案；以下设计问题已落实到方案，尚未以代码/测试关闭。实现前完成上述协议待核验项，不能把文档修改当作功能验收。
+整体结论：实现与验证完成，待 review。IMG-R1…R7 均有实现与测试证据；协议待核验项处置：fs/remove 活体验证并实现精确清理；steer 带图保守禁用；ZCode 空文本附图已实测支持。
 
 | 编号 | 原方案问题 | 修订及后续验收 |
 | --- | --- | --- |

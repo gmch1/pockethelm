@@ -10,7 +10,8 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from bridge import (Assembler, Bridge, RequestError, guard_for, project_rows, project_quota,
-    project_interactions, interaction_answer, project_turn, project_file_changes)
+    project_interactions, interaction_answer, project_turn, project_file_changes,
+    ATTACHMENT_ROW_MAX, ATTACHMENT_TRANSACTIONS_MAX)
 from wire import Client, WireError, decode, encode
 from install import dispatcher
 
@@ -259,6 +260,241 @@ class BridgeTests(unittest.TestCase):
             client.call.return_value = bad
             with self.assertRaises(RequestError):
                 bridge.dispatch('directory/read', {})
+
+    def test_forced_dispatch_never_evaluates_original_command(self):
+        script = dispatcher('/opt/codex', Path('/opt/bridge.py'))
+        self.assertIn('== "pockethelm-zcode-v1"', script)
+        self.assertNotIn('eval', script)
+        self.assertNotIn('bash -c', script)
+
+    # ---- Image attachments (task 2026-11-03-image-attachments) ----
+
+    UPLOAD_TARGET = {'workspacePath': '/w', 'sessionId': 's'}
+
+    def attachment_bridge(self):
+        client = Mock()
+        client.call = Mock(return_value={'state': 'staging', 'nextChunkIndex': 0})
+        bridge = Bridge(client)
+        bridge.client_id = 'pockethelm-test'
+        bridge.session_target = Mock(side_effect=lambda *a, **k: dict(self.UPLOAD_TARGET))
+        return bridge, client
+
+    def upstream_attachment_calls(self, client):
+        return [(c.args[1], c.args[2][0]) for c in client.call.call_args_list
+            if str(c.args[1]).startswith('attachment')]
+
+    def full_upload(self, bridge, data, upload_id='upload-1', name='photo.jpg'):
+        import hashlib as h
+        begin = bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET,
+            uploadId=upload_id, fileName=name, mime='image/jpeg', totalBytes=len(data),
+            totalChunks=-(-len(data) // (96 * 1024)),
+            checksum='sha256:' + h.sha256(data).hexdigest()))
+        step = 96 * 1024
+        chunks = [data[i:i + step] for i in range(0, len(data), step)]
+        for index, chunk in enumerate(chunks):
+            bridge.dispatch('session/attachment/chunk', {'uploadId': upload_id,
+                'chunkIndex': index, 'dataBase64': base64.b64encode(chunk).decode()})
+        return begin, bridge.dispatch('session/attachment/commit', {'uploadId': upload_id})
+
+    def test_attachment_two_stage_chunking_aligns_phone_blocks_to_upstream(self):
+        import hashlib as h
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://u1'} if m == 'attachmentCommitV4' else {}))
+        # 5 phone chunks = 480KiB: upstream must see one full 384KiB block plus a 96KiB tail,
+        # and official begin sees the UPSTREAM chunk count (2), never the phone count (5).
+        data = bytes(range(256)) * (480 * 1024 // 256)
+        begin, commit = self.full_upload(bridge, data)
+        self.assertEqual(begin['state'], 'staging')
+        calls = self.upstream_attachment_calls(client)
+        self.assertEqual(calls[0][0], 'attachmentBeginV4')
+        self.assertEqual(calls[0][1]['totalChunks'], 2)
+        upstream_chunks = [c for c in calls if c[0] == 'attachmentChunkV4']
+        self.assertEqual(len(upstream_chunks), 2)
+        self.assertEqual(upstream_chunks[0][1]['chunkIndex'], 0)
+        self.assertEqual(len(base64.b64decode(upstream_chunks[0][1]['dataBase64'])), 384 * 1024)
+        self.assertEqual(upstream_chunks[1][1]['chunkIndex'], 1)
+        self.assertEqual(len(base64.b64decode(upstream_chunks[1][1]['dataBase64'])), 96 * 1024)
+        self.assertEqual(commit['state'], 'committed')
+        self.assertEqual(commit['ref'], 'zcode-artifact://u1')
+        self.assertEqual(base64.b64decode(upstream_chunks[0][1]['dataBase64']) +
+            base64.b64decode(upstream_chunks[1][1]['dataBase64']), data)
+
+    def test_attachment_single_partial_phone_chunk_commits_without_upstream_block(self):
+        # totalBytes < 384KiB: nothing flushes until commit pushes one partial upstream chunk.
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r'} if m == 'attachmentCommitV4' else {}))
+        data = b'x' * 1000
+        begin, commit = self.full_upload(bridge, data)
+        self.assertEqual(begin['nextChunkIndex'], 0)
+        chunks = [c for c in self.upstream_attachment_calls(client) if c[0] == 'attachmentChunkV4']
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(len(base64.b64decode(chunks[0][1]['dataBase64'])), 1000)
+        self.assertEqual(commit['state'], 'committed')
+
+    def test_attachment_idempotent_retry_and_mismatch_rejection(self):
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r'} if m == 'attachmentCommitV4' else {}))
+        data = b'a' * (2 * 96 * 1024 + 10)  # 3 phone chunks
+        bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='u',
+            fileName='p.jpg', mime='image/jpeg', totalBytes=len(data), totalChunks=3,
+            checksum='sha256:' + __import__('hashlib').sha256(data).hexdigest()))
+        first = base64.b64encode(data[:96 * 1024]).decode()
+        ack1 = bridge.dispatch('session/attachment/chunk', {'uploadId': 'u', 'chunkIndex': 0, 'dataBase64': first})
+        self.assertEqual(ack1['nextChunkIndex'], 1)
+        # Duplicate with identical bytes: idempotent, no double counting, no extra upstream chunk.
+        ack2 = bridge.dispatch('session/attachment/chunk', {'uploadId': 'u', 'chunkIndex': 0, 'dataBase64': first})
+        self.assertEqual(ack2['nextChunkIndex'], 1)
+        # Duplicate with different bytes: rejected.
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/chunk', {'uploadId': 'u', 'chunkIndex': 0,
+                'dataBase64': base64.b64encode(b'b' * (96 * 1024)).decode()})
+        # Skipping ahead to the last chunk while chunk 1 is expected: out of order.
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/chunk', {'uploadId': 'u', 'chunkIndex': 2,
+                'dataBase64': base64.b64encode(data[-10:]).decode()})
+        # Re-begin with identical metadata returns progress; changed metadata is refused.
+        again = bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='u',
+            fileName='p.jpg', mime='image/jpeg', totalBytes=len(data), totalChunks=3,
+            checksum='sha256:' + __import__('hashlib').sha256(data).hexdigest()))
+        self.assertEqual((again['state'], again['nextChunkIndex']), ('staging', 1))
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='u',
+                fileName='other.jpg', mime='image/jpeg', totalBytes=len(data), totalChunks=3,
+                checksum='sha256:' + __import__('hashlib').sha256(data).hexdigest()))
+        # Wrong-size and base64-garbage chunks never touch upstream.
+        before = len(client.call.call_args_list)
+        for bad in ({'uploadId': 'u', 'chunkIndex': 1, 'dataBase64': base64.b64encode(b'short').decode()},
+                {'uploadId': 'u', 'chunkIndex': 1, 'dataBase64': '!!!not-base64!!!'}):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/attachment/chunk', bad)
+        self.assertEqual(len(client.call.call_args_list), before)
+
+    def test_attachment_checksum_and_scope_guards(self):
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(return_value={'state': 'staging', 'nextChunkIndex': 0})
+        data = b'c' * 5000
+        bad = dict(self.UPLOAD_TARGET, uploadId='u', fileName='p.jpg', mime='image/jpeg',
+            totalBytes=len(data), totalChunks=1, checksum='sha256:' + '0' * 64)
+        bridge.dispatch('session/attachment/begin', bad)
+        bridge.dispatch('session/attachment/chunk', {'uploadId': 'u', 'chunkIndex': 0,
+            'dataBase64': base64.b64encode(data).decode()})
+        # Whole-file digest mismatch at commit: refused, transaction aborted upstream.
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/commit', {'uploadId': 'u'})
+        self.assertNotIn('u', bridge.attachments)
+        # Non-allowlisted mime and oversized totals are rejected before any upstream call.
+        client.call.reset_mock()
+        for params in (dict(self.UPLOAD_TARGET, uploadId='v', fileName='p.png', mime='image/png',
+                totalBytes=100, totalChunks=1, checksum='sha256:' + '0' * 64),
+                dict(self.UPLOAD_TARGET, uploadId='v', fileName='p.jpg', mime='image/jpeg',
+                totalBytes=8 * 1024 * 1024 + 1, totalChunks=87, checksum='sha256:' + '0' * 64)):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/attachment/begin', params)
+        client.call.assert_not_called()
+
+    def test_attachment_send_validates_refs_against_committed_scope(self):
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r1'}
+            if m == 'attachmentCommitV4' else {'commandId': 'c', 'status': 'accepted'}))
+        data = b'd' * 300
+        self.full_upload(bridge, data)
+        bridge.check_selection = Mock(return_value={'providerId': 'p', 'modelId': 'm'})
+        attach = [{'ref': 'zcode-artifact://r1', 'fileName': 'photo.jpg', 'mime': 'image/jpeg', 'bytes': len(data)}]
+
+        def sent_envelope():
+            return [c for c in client.call.call_args_list
+                if c.args[1] == 'sendConversationCommandV4'][-1].args[2][0]['envelope']
+
+        # Empty text with an attachment is allowed and lands verbatim in the payload.
+        bridge.dispatch('session/send', dict(self.UPLOAD_TARGET, commandId='cmd-0123456789abcdef',
+            text='', delivery='queue', attachments=attach))
+        envelope = sent_envelope()
+        self.assertEqual(envelope['payload']['attachments'], attach)
+        self.assertEqual(envelope['payload']['text'], '')
+        # Forged ref, metadata mismatch, and too many attachments are all refused.
+        for bad in ([{'ref': 'zcode-artifact://forged', 'fileName': 'photo.jpg', 'mime': 'image/jpeg', 'bytes': 300}],
+                [{'ref': 'zcode-artifact://r1', 'fileName': 'renamed.jpg', 'mime': 'image/jpeg', 'bytes': 300}],
+                attach + attach + attach + attach + attach):
+            with self.assertRaises(RequestError):
+                bridge.dispatch('session/send', dict(self.UPLOAD_TARGET, commandId='cmd-0123456789abcdef',
+                    text='hi', delivery='queue', attachments=bad))
+        # Neither text nor attachments: refused.
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/send', dict(self.UPLOAD_TARGET, commandId='cmd-0123456789abcdef',
+                text='', delivery='queue'))
+
+    def test_attachment_commit_response_loss_resolves_via_idempotent_begin(self):
+        import hashlib as h
+        bridge, client = self.attachment_bridge()
+        state = {'commit_failed': False}
+        data = b'e' * 200
+
+        def upstream(ch, method, args):
+            if method == 'attachmentBeginV4':
+                if state['commit_failed']:
+                    return {'state': 'committed', 'ref': 'zcode-artifact://recovered'}
+                return {'state': 'staging', 'nextChunkIndex': 0}
+            if method == 'attachmentCommitV4':
+                if state['commit_failed']:
+                    return {'ref': 'zcode-artifact://recovered'}
+                state['commit_failed'] = True
+                from wire import WireError
+                raise WireError('lost')
+            return {}
+
+        client.call = Mock(side_effect=upstream)
+        bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='upload-1',
+            fileName='photo.jpg', mime='image/jpeg', totalBytes=len(data), totalChunks=1,
+            checksum='sha256:' + h.sha256(data).hexdigest()))
+        bridge.dispatch('session/attachment/chunk', {'uploadId': 'upload-1', 'chunkIndex': 0,
+            'dataBase64': base64.b64encode(data).decode()})
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/commit', {'uploadId': 'upload-1'})
+        # Retry after the lost response: idempotent begin reveals the committed ref.
+        retry = bridge.dispatch('session/attachment/commit', {'uploadId': 'upload-1'})
+        self.assertEqual(retry['state'], 'committed')
+        self.assertEqual(retry['ref'], 'zcode-artifact://recovered')
+
+    def test_attachment_abort_and_transaction_limits(self):
+        import hashlib as h
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(return_value={'state': 'staging', 'nextChunkIndex': 0})
+        data = b'f' * 100
+        params = {'fileName': 'p.jpg', 'mime': 'image/jpeg', 'totalBytes': len(data),
+            'totalChunks': 1, 'checksum': 'sha256:' + h.sha256(data).hexdigest()}
+        for index in range(ATTACHMENT_TRANSACTIONS_MAX):
+            self.assertEqual(bridge.dispatch('session/attachment/begin',
+                dict(self.UPLOAD_TARGET, uploadId=f'limited-{index}', **params))['state'], 'staging')
+        with self.assertRaises(RequestError):
+            bridge.dispatch('session/attachment/begin',
+                dict(self.UPLOAD_TARGET, uploadId='limited-overflow', **params))
+        # Abort is idempotent and frees the slot.
+        self.assertEqual(bridge.dispatch('session/attachment/abort', {'uploadId': 'limited-0'})['state'], 'aborted')
+        self.assertEqual(bridge.dispatch('session/attachment/abort', {'uploadId': 'limited-0'})['state'], 'aborted')
+        again = bridge.dispatch('session/attachment/begin',
+            dict(self.UPLOAD_TARGET, uploadId='limited-0', **params))
+        self.assertEqual(again['state'], 'staging')
+        self.assertEqual([c.args[1] for c in client.call.call_args_list].count('attachmentAbortV4'), 1)
+
+    def test_attachment_row_projection_is_bounded_and_marks_truncation(self):
+        rows = [{'rowId': 1, 'kind': 'userInput', 'text': 'look', 'state': 'complete',
+            'attachments': [{'ref': 'zcode-artifact://x', 'fileName': 'a.jpg', 'mime': 'image/jpeg', 'bytes': 10}]
+            + [{'ref': 'zcode-artifact://y', 'fileName': f'n{i}.jpg', 'mime': 'image/jpeg', 'bytes': i}
+               for i in range(ATTACHMENT_ROW_MAX + 2)]}]
+        projected = project_rows(rows)[0]
+        self.assertEqual(len(projected['attachments']), ATTACHMENT_ROW_MAX + 1)
+        self.assertTrue(projected['attachments'][-1].get('truncated'))
+        self.assertNotIn('ref', json.dumps(projected))
+        # Malformed entries are skipped, control characters stripped from names.
+        rows[0]['attachments'] = [{'fileName': 'bad\x1bname', 'mime': 'image/jpeg', 'bytes': 1},
+            {'fileName': '', 'mime': 'image/jpeg', 'bytes': 1}, 'junk',
+            {'fileName': 'ok.jpg', 'mime': 'image/jpeg', 'bytes': 2}]
+        projected = project_rows(rows)[0]
+        self.assertEqual([a['fileName'] for a in projected['attachments'][:2]], ['badname', 'ok.jpg'])
 
     def test_forced_dispatch_never_evaluates_original_command(self):
         script = dispatcher('/opt/codex', Path('/opt/bridge.py'))

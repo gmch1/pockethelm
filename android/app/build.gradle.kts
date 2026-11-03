@@ -45,6 +45,7 @@ android {
 }
 dependencies {
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation(platform("androidx.compose:compose-bom:2025.04.01"))
     implementation("androidx.activity:activity-compose:1.12.3")
     implementation("androidx.compose.material3:material3")

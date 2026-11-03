@@ -166,6 +166,7 @@ ZCode 通过原 App 更新提供，保留包名 `com.gmch.codexremote`、签名�
 - 查看当前已连接 Coding Plan 的额度；账号、计划或团队项目配置变化时拒绝使用旧选择发送，刷新后需重新选择。服务端若要把所选 provider 自动映射到其他 provider，也会拒绝发送。
 - 排队、请求插入、停止；显示服务端实际返回的 delivery。插入请求可能由 ZCode 暂时排队。停止携带所观察的 foreground execution ID，避免迟到请求停止后一轮。
 - 命令 ID 在发送前加密落盘；断连后查询原命令，结果未知时阻止自动重发。聊天草稿与 Codex 隔离保存。
+- **图片附件**：聊天输入区可选相册图片（PNG/JPEG/WebP/GIF，统一转静态 JPEG：EXIF 纠向、透明白底、最大边 2048、有界压缩 ≤8MiB，重编码剥离 EXIF/GPS；动画取首帧）。Codex 经 `fs/writeFile` 暂存 `/tmp/pockethelm-img-<id>.jpg` 后以 `localImage` 随消息发送（未发送即移除的文件经 `fs/remove` 精确清理，已发送文件保留供历史还原）；ZCode 经桥接器两段上传事务（96KiB 手机块聚合为官方 384KiB 块，SHA-256 全量校验、幂等重试、失败整批保留）拿 `zcode-artifact://` 引用随 `sendText.attachments` 发送。每条 ≤4 张；图片字节与待发列表仅存内存，不落 vault。时间线显示 `[图片] 文件名` 占位（缩略图二期）；旧桥接器（无 `capabilities.attachments`）自动隐藏入口。
 - **交互应答（AskUserQuestion / 提问类 userInput）**：紧凑待交互入口展开为答题表单（多题、多选、自定义回答，跳过/取消）；答案结构与官方客户端一致（`action + content`）。应答走独立于消息发送的确认通道：发送前先落盘 commandId 元数据（答案文本与敏感内容不落盘），`accepted/noop` 后仍等待权威快照确认才恢复按钮；断线结果未知只提示核对、绝不自动重发；`answerDrafts` 播种表单，自动结束倒计时在首次操作时请求 snooze（仅以服务端确认的 snoozed 为准）。旧桥接器（无 `capabilities.interactions`）自动回退为仅提示。
 - Codex 侧同样支持**命令执行/文件改动审批的查看与应答**：审批按线程展示（writeStdin 与命令执行区分、文件审批显示授权目录），决策按钮与服务端 `availableDecisions` 取交集；服务端声明 `cancel` 时提供独立的「取消本次执行」，不转换成拒绝；不支持的决策类型明确提示且不消费；应答原样回显请求 ID（区分数字与字符串），发送后进入「已发送，等待确认」，由 `serverRequest/resolved` 或回合结束撤卡；断线只清本地卡片，不向新连接重发。真实验证确认晚接入的客户端可以接手其他客户端留下的待审批请求。
 - 文字全文、工具一行折叠、顶部最近问题跳转、进入会话自动到底部。
@@ -176,7 +177,7 @@ ZCode 通过原 App 更新提供，保留包名 `com.gmch.codexremote`、签名�
 - ZCode 全局账号选择会影响后续 API 请求。桥接器在提交前校验配置，但上游没有原子地锁定整个会话计费来源的能力；不要在任务运行中从另一客户端更改账号/团队计划。这不是跨客户端的计费隔离保证。
 - 当前页面在前台每约 2.5 秒读取权威快照，退出前台断开，不做通知。初版使用短订阅读取完整快照，尚未实现移动端增量 reducer。历史分页按 log epoch 和 revision 校验。
 - 交互应答范围：permission 类交互仅在服务端给出明确 options 时支持简单应答（App 创建的会话固定 `yolo`，正常不会产生权限审批）；工作区 hook 信任确认（workspaceHookReview）、Codex 的 tool/requestUserInput / permissions / MCP elicitation 暂只提示不消费。会话内同时待处理交互超过 4 条时折叠显示余量；身份或内容超出协议限额的交互整条降级为「请在桌面端处理」，不变形应答。
-- 暂未接入附件、工作流专用界面、闲时计划、加速卡、多目录项目和完整任务中心。不能把这些能力视为已支持。
+- 附件范围：一期为相册静态图片（见上）；时间线缩略图、任意文件/视频附件、相机拍摄未接入。Codex 已发送图片文件保留在开发机 /tmp 供历史还原，不承诺自动清理。工作流专用界面、闲时计划、加速卡、多目录项目和完整任务中心仍未接入。
 - `Full access` 仍意味着任务拥有开发账号的文件和命令权限。RPC 白名单保护的是手机连接接口，不是对 agent 任务的文件沙箱。
 
 桥接器测试：`python3 -m unittest discover -s scripts/zcode -p 'test_*.py' -v`。新增测试覆盖二进制帧、分片校验、计划指纹变化、拒绝隐式 provider 映射、接口白名单和内容投影，以及交互投影（身份保真、超限整条降级、存在性核对、autoResolution）、`session/interact` 应答白名单（含官方 content 结构校验）、snooze 封装和 `capabilities` 兼容协商（`bridgeVersion` 保持 1）。实际验证包含默认 Full access、运行中断开/重连、按 command ID 查询、GLM 模型切换、原生队列、带执行身份的停止和交互应答。Android 实机通过原有跳板完成独立扫码配对、读取会话/额度、交互应答和重连；其他账号和版本需要另测。Codex 审批链路另有 `python3 scripts/probe.py --run-approval` 真实 app-server 冒烟：验证审批请求形态、晚接入客户端接手与应答生效。
