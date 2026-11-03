@@ -1229,6 +1229,26 @@ os.close(fd)
                 bridge.dispatch('catalog', {})
                 transport.call.assert_not_called()
 
+    def test_recovery_timeout_follows_remaining_budget_downward(self):
+        # With the per-step cap lifted above the work budget, successive timeouts must
+        # strictly decrease with the consumed budget (reviewer R6 follow-up: prove the
+        # remaining budget actually propagates to every step, including the refresh).
+        import bridge as bridge_module
+        client = Mock()
+        client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
+            self.old_data()['settings']]
+        transport = self.StatefulTransport(self.old_data(), self.fresh_data())
+        bridge = self.recovery_bridge(client, lambda: transport)
+        with patch.object(bridge_module, 'RECOVERY_STEP_CAP_SECONDS', 60.0):
+            bridge.dispatch('catalog', {})
+        timeouts = [c[3] for c in transport.calls]
+        self.assertEqual(len(timeouts), 4)
+        for earlier, later in zip(timeouts, timeouts[1:]):
+            self.assertGreater(earlier, later)
+            self.assertLessEqual(later, earlier)
+        self.assertLessEqual(timeouts[-1], 25.0)
+        self.assertGreater(timeouts[-1], 2.0)
+
     def test_recovery_deadline_boundaries_never_clamp_timeout(self):
         import bridge as bridge_module
         client = Mock()

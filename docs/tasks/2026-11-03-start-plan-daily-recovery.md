@@ -48,7 +48,7 @@
 - 改动摘要与关键文件：
   - `scripts/zcode/bridge.py`：`catalog()` 拆为 `_catalog_views/_assemble_catalog`；`stale_start_plans` 判定（settings 记录：start-plan + `executable !== true` + `availability ∈ {pending, unknown}` 或 `unavailable` 且 reason ∈ {not-entitled, credential-failed}——**协议值为连字符形式**（shared/src/account-provider-state.ts，方案文稿中下划线写法已按真实枚举修正）+ `current === true` + `enabled === true`）；`recovery_gate`（flock 互斥，**冷却重读与记账在锁内原子完成**（R7），任何存储失败 fail-closed 跳过）；`attempt_start_plan_recovery`（隔离临时 `wire.Client`，**第一调用即 `provider-settings.refresh`（单元素 reason 数组）**，随后读三视图；工作预算 25s、每步前预检剩余 ≥2s 否则终止、timeout=min(剩余, 10s)、任何一步失败返回整套旧视图、清理预算 3s、成功失败均 `log_recovery`）；`log_recovery` 脱敏前后取证（availability/reason/模型数/providerId，不含凭据，日志有界 100 行）。
   - `scripts/zcode/wire.py`：`close(cleanup_budget=3.0)` 预算化清理——terminate 等待与 kill 后回收共享预算，kill 后 `wait` 补 `timeout`（消除无界等待），管道显式关闭，预算内未回收由 init 在连接结束时代管。
-  - App（R1/R8）：`ZcodeViewModel` 额度缓存 TTL——`quotaTtlMs`（10 分钟，internal 可注入）；`quota()` **成功分支（含手动刷新）经 `markQuotaCache` 记录来源与 `SystemClock.elapsedRealtime()` 水位**，`autoRefreshQuota` 只按单调时钟判定 TTL；失败保持占位符、下次进入会话即重试。版本 0.4.22 / versionCode 32（基于 main `daaef8d`）。
+  - App（R1/R8）：`ZcodeViewModel` 额度缓存 TTL——`quotaTtlMs`（10 分钟，internal 可注入）；`quota()` **成功分支（含手动刷新）经 `markQuotaCache` 记录来源与 `SystemClock.elapsedRealtime()` 水位**，`autoRefreshQuota` 只按单调时钟判定 TTL；失败保持占位符、下次进入会话即重试。版本 0.4.22 / versionCode 32（继承自基线 `daaef8d`，本任务未改动 build.gradle.kts；实现 review 已核实）。
   - `bridgeVersion` 保持 1，无新增 capability；`install.py` 已部署开发机。
 - 代码版本或源码快照标识：分支 `start-plan-daily-recovery`（自 main `daaef8d`）；源码 SHA-256 以提交时点为准（R6–R8 修复后见提交信息；124 文件口径，排序 path + NUL + bytes + NUL，含未忽略新增文件）。
 - 自动化检查：
@@ -364,6 +364,27 @@
 - Python 72 项已在本次连续 review 中实际复跑通过；状态式模拟与双进程探针仍复现 R6/R7，绿色套件不能替代缺失断言。wire close 测试目前通过立即抛异常的 Mock 检查控制流，并未模拟实际耗时推进；建议补剩余预算递减断言以支撑时间保证。
 - 已读取 `~/.local/state/pockethelm/start-plan-recovery/device.txt`，确有 `OK (36 tests)`；这是提交者留下的设备记录，不是本轮重新执行。JVM 114/真机 36 的交付声明不作为 R6/R7 已验证的依据，本轮未重跑 Android 构建或真机测试。
 - 跨天实测及 H1/H2 取证不在本轮阻塞范围。此次只追加 Review，未改产品/测试代码、部署、提交或 push。
+
+
+### 实现复查：8d4fb9f（2026-11-04）
+
+**结论：待修复，新增 R9；R6、R7、R8 的原代码缺陷关闭。** 评审范围 `git diff 2d8b3fa..8d4fb9f`，HEAD 为 `8d4fb9f414d73135510028db54b1424cb460e128`，共四文件。跨天取证和 H1/H2 不纳入本次阻塞。
+
+- **R6：关闭。** 恢复首调用已为 provider-settings.refresh，单元素 reason 参数正确，与三视图读取共用临时连接和预算检查。状态式模拟服务、准确顺序/参数、refresh 拒绝和超时、后续 check_selection 已覆盖。
+- **R7：原锁外检查竞争关闭。** 现在获得 flock 后才读取冷却并记账，原交错漏洞已消除。新增双进程用例覆盖持锁期间和释放后冷却，但未重现“读取旧时间后暂停、另一进程完整尝试后再继续”的原始竞争；修复前版本也能通过这种顺序测试。建议后续用能区分原实现的交错探针加强回归，当前代码检查已确认锁区间正确。锁内解析异常的新回归见 R9。
+- **R8：代码缺陷关闭。** markQuotaCache 在 quota 成功且 stillSelected 时记录来源和 elapsedRealtime，手动与自动共用成功路径；自动入口不再提前打点，墙钟回拨不再影响 TTL。**证据更正**：本提交未修改 QuotaAutoRefreshTest.kt；当前仍只有四个既有用例，没有文档所称新增的“手动刷新更新水位”测试。4/4 不能当作该新增场景的验证，应补相应测试并更新记录，或明确目前该场景仅由代码审查确认，不声称已测。
+
+#### R9 [P2] 冷却解析异常逃逸并泄漏 flock，非法非有限值也未拒绝
+
+- 状态：待修复。
+- 位置：scripts/zcode/bridge.py:681-697（尤其 :688 float 解析与 :695 仅捕获 OSError）；attempt_start_plan_recovery:706 在其 try/finally 之前调用 gate。
+- 回归原因：旧实现锁外读取捕获 `(OSError, ValueError)`；此次迁入锁内后只剩 OSError。时间戳为空、非法文本时 float 抛 ValueError，既不返回 None，也不关闭 fd。gate 调用处位于上层 try/finally 外，异常最终破坏 catalog，而锁持续保留到桥接进程结束；即使修好状态文件，其他连接仍可能因锁被占而无法自愈。UTF-8 解码失败也有相同异常清理问题。
+- 触发并非只能手工损坏：write_text 会先截断文件，进程在写入完成前中断可留下空文件。方案本就要求冷却读数异常 fail-closed 跳过。
+- **已实际复现**：临时目录中空时间戳调用 gate 得到 ValueError；随后另开 fd 尝试 LOCK_EX|LOCK_NB 得到 BlockingIOError，证实锁泄漏。探针最后显式关闭测试 fd，未碰真实状态文件。
+- **同一校验缺口**：`float('NaN')` 不抛异常，但 `now - last < 90` 为 false，非法冷却值仍获准刷新。本地探针确认 NaN 返回有效锁 fd，与“不可判定则跳过”不符。
+- 修复验收：锁内解析/校验失败（含空值、非法数字、解码错误、NaN/±Infinity）返回 None；所有未成功将锁所有权交给调用方的退出路径均释放 fd。用 `math.isfinite` 等显式验证时间戳；补“异常输入 → catalog 返回旧视图、不建临时 Client → 同进程/另进程仍可重新获取锁”的测试。有效时间戳冷却、失败记账和互斥行为保留。
+
+本轮复跑 Python **73 项通过**，diff 格式检查通过；额外异常时间戳探针复现 R9，因此现有绿色套件尚不足以放行。未重跑 JVM/真机，未修改产品或测试代码、部署、提交或 push，仅追加 Review。修复 R9 后再复查，不重开已关闭的方案问题。
 
 ## 发布或完成
 
