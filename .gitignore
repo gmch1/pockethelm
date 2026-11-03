@@ -22,3 +22,4 @@ artifacts/
 config/deployment.json
 config/signing.properties
 security_best_practices_report.md
+.zcode/
