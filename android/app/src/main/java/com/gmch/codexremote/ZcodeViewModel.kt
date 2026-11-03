@@ -164,6 +164,13 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (index >= 0) { list[index] = transform(list[index]); publishOutgoing(key) }
     }
 
+    fun dismissFailed(message: OutgoingMessage) {
+        if (mutable.value.selected?.id != message.sessionId) return
+        val key = outgoingKey(message.sessionId)
+        val current = outgoingBySession[key]?.find { it.clientId == message.clientId } ?: return
+        if (current.state == OutgoingState.FAILED) removeOutgoing(key, current.clientId)
+    }
+
     private fun removeOutgoing(key: OutgoingKey, clientId: String?) {
         if (clientId.isNullOrBlank()) return
         val list = outgoingBySession[key] ?: return
@@ -701,7 +708,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         // all happen after the user already sees the message with 发送中.
         addOutgoing(key, OutgoingMessage(session.id, commandId,
             listOf(text, attachments.joinToString(" ") { "[图片]" }).filter { it.isNotBlank() }.joinToString(" "),
-            OutgoingState.SENDING))
+            OutgoingState.SENDING, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
         mutable.update { it.copy(sending = true, attachmentsBusy = true) }
         var dispatched = false
         var ackAccepted = false

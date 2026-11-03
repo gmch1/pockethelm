@@ -792,7 +792,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // streamed output all happen after the user already sees the message with 发送中.
         addOutgoing(key, OutgoingMessage(selected.id, clientId,
             listOf(text, attachments.joinToString(" ") { "[图片]" }).filter { it.isNotBlank() }.joinToString(" "),
-            OutgoingState.SENDING))
+            OutgoingState.SENDING, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
         mutable.update { it.copy(sending = true, attachmentsBusy = attachments.isNotEmpty()) }
         var dispatched = false
         var ackAccepted = false
@@ -922,6 +922,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val list = outgoingBySession[key] ?: return
         val index = list.indexOfFirst { it.clientId == clientId }
         if (index >= 0) { list[index] = transform(list[index]); publishOutgoing(key) }
+    }
+
+    fun dismissFailed(message: OutgoingMessage) {
+        if (mutable.value.selected?.id != message.sessionId) return
+        val key = OutgoingKey(mutable.value.profile.identity, message.sessionId)
+        val current = outgoingBySession[key]?.find { it.clientId == message.clientId } ?: return
+        if (current.state == OutgoingState.FAILED) removeOutgoing(key, current.clientId)
     }
 
     private fun removeOutgoing(key: OutgoingKey, clientId: String) {

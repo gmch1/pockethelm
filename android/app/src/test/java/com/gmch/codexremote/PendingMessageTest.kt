@@ -103,4 +103,22 @@ class PendingMessageTest {
         assertTrue(rows.any { it.outgoing == failed })
         assertFalse(outgoingStatusLabel(failed).contains("待确认"))
     }
+    @Test fun `failed attempts stay before later successful messages and replies`() {
+        val old = userItem("old", "old-command", "earlier")
+        val failed = outgoing("failed", "same", OutgoingState.FAILED).copy(precedingItemIds = listOf("old"))
+        val success = userItem("new", "new-command", "same")
+        val reply = TimelineItem("reply", "agentMessage", "answer")
+        assertEquals(listOf("old", "outgoing-failed", "new", "reply"),
+            buildChatRows(listOf(old, success, reply), listOf(failed)).map { it.key })
+        assertEquals(listOf("outgoing-failed", "new", "reply"),
+            buildChatRows(listOf(success, reply), listOf(failed)).map { it.key })
+    }
+    @Test fun `empty history failures retain order and uncertain stays protected`() {
+        val a = outgoing("a", "same", OutgoingState.FAILED).copy(precedingItemIds = emptyList())
+        val b = a.copy(clientId = "b")
+        val uncertain = a.copy(clientId = "unknown", state = OutgoingState.UNCERTAIN)
+        val items = listOf(userItem("success", "accepted", "same"))
+        assertEquals(listOf("outgoing-a", "outgoing-b", "success", "outgoing-unknown"),
+            buildChatRows(items, listOf(a,b,uncertain)).map { it.key })
+    }
 }

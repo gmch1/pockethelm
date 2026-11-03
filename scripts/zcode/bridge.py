@@ -110,9 +110,10 @@ def selection(source):
 
 def guard_for(provider, settings):
     # Includes account identity and exact team/project selection, not just provider ID.
+    # Refresh timestamps are not identity: unchanged settings must keep the same guard.
     # No account identifier or credential is returned to the phone.
     data = [provider['providerId'], provider.get('accountState'), provider.get('effectiveConfig'),
-        pick(settings, ['providerFamilyDomain', 'providerFamilyConnectionSelections', 'providerFamilyDomainUpdatedAt'])]
+        pick(settings, ['providerFamilyDomain', 'providerFamilyConnectionSelections'])]
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 

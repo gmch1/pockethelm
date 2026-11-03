@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -234,30 +235,33 @@ internal fun WorkspaceListPage(engine: String, onEngine: (String) -> Unit,
             if (!connected) OfflineBanner(busy, reconnect)
             WorkspaceError(error, dismissError, detail)
             topExtra()
-            LazyColumn(Modifier.weight(1f), state = list) {
-                if (filtered.isEmpty()) item(key = "empty") {
-                    Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 72.dp), horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(when {
-                            filtersActive -> "没有匹配的会话"
-                            sessions.isNotEmpty() -> "没有匹配的会话"
-                            busy -> "正在加载会话…"
-                            !connected -> "连接后加载会话"
-                            error != null -> "会话加载失败"
-                            else -> "暂无会话"
-                        }, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (filtersActive) TextButton({ search = ""; projectPath = ""; onlyRunning = false }) { Text("清除筛选") }
-                        if (error != null && !busy) TextButton(refresh, enabled = connected) { Text("重试") }
+            PullToRefreshBox(isRefreshing = busy, onRefresh = { if (connected && !busy) refresh() },
+                modifier = Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(Modifier.fillMaxSize(), state = list) {
+                    if (filtered.isEmpty()) item(key = "empty") {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 72.dp), horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(when {
+                                filtersActive -> "没有匹配的会话"
+                                sessions.isNotEmpty() -> "没有匹配的会话"
+                                busy -> "正在加载会话…"
+                                !connected -> "连接后加载会话"
+                                error != null -> "会话加载失败"
+                                else -> "暂无会话"
+                            }, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (filtersActive) TextButton({ search = ""; projectPath = ""; onlyRunning = false }) { Text("清除筛选") }
+                            if (error != null && !busy) TextButton(refresh, enabled = connected) { Text("重试") }
+                        }
                     }
+                    items(filtered, key = { it.id }) { row ->
+                        SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
+                            preview = row.preview, pending = row.pendingInteractions,
+                            unread = row.unread, background = row.backgroundWork) { open(row.id) }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
+                    }
+                    if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
+                    item { Spacer(Modifier.height(8.dp)) }
                 }
-                items(filtered, key = { it.id }) { row ->
-                    SessionRow(row.title, row.project, row.status, row.updatedAt, enabled = canOpen,
-                        preview = row.preview, pending = row.pendingInteractions,
-                        unread = row.unread, background = row.backgroundWork) { open(row.id) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant, thickness = 0.5.dp)
-                }
-                if (more != null) item { TextButton(more, Modifier.fillMaxWidth(), enabled = connected && !busy) { Text("加载更多会话") } }
-                item { Spacer(Modifier.height(8.dp)) }
             }
         }
     }
@@ -471,7 +475,8 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
     modifier: Modifier, history: () -> Unit, retry: () -> Unit, detail: (String, String) -> Unit,
     diff: String = "", removeQueued: ((QueuedMessage) -> Unit)? = null,
     turnSummary: TurnDiffSummary? = null, onTurnDiff: (() -> Unit)? = null,
-    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null) {
+    editQueued: ((QueuedMessage, String) -> Unit)? = null, promoteQueued: ((QueuedMessage) -> Unit)? = null,
+    dismissFailed: ((OutgoingMessage) -> Unit)? = null) {
     val list = rememberLazyListState()
     var follow by rememberSaveable { mutableStateOf(true) }
     var jump by remember { mutableStateOf<String?>(null) }
@@ -517,7 +522,11 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
             items(rows, key = { it.key }) { row -> when {
                 row.activity.isNotEmpty() -> ActivitySummary(row.activity, detail)
                 row.item != null -> TimelineCard(row.item, agentName = agent, detail = detail)
-                row.outgoing != null -> OutgoingCard(row.outgoing, detail)
+                row.outgoing != null -> Column {
+                    OutgoingCard(row.outgoing, detail)
+                    if (row.outgoing.state == OutgoingState.FAILED && dismissFailed != null)
+                        TextButton({ dismissFailed(row.outgoing) }) { Text("移除失败记录") }
+                }
                 row.queued != null -> Column {
                     OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队"), detail)
                     QueuedItemActions(row.queued, connected && !busy, removeQueued, promoteQueued,
