@@ -3,6 +3,7 @@ import base64
 import fcntl
 import io
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -15,7 +16,8 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 from bridge import (Assembler, Bridge, RequestError, guard_for, project_rows, project_quota,
     project_interactions, interaction_answer, project_turn, project_file_changes,
-    ATTACHMENT_ROW_MAX, ATTACHMENT_TRANSACTIONS_MAX, recovery_paths)
+    ATTACHMENT_ROW_MAX, ATTACHMENT_TRANSACTIONS_MAX, recovery_paths,
+    RECOVERY_COOLDOWN_SECONDS)
 from wire import Client, WireError, decode, encode
 from install import dispatcher
 
@@ -1166,6 +1168,32 @@ class StartPlanRecoveryTests(unittest.TestCase):
             transport.call.assert_not_called()
         finally:
             self.paths['lock'].rmdir()
+
+    def test_recovery_gate_fail_closed_on_unparseable_cooldown(self):
+        # R9: an empty/NaN/negative marker must skip recovery (fail-closed), never
+        # leak the lock fd or bypass the window, and never crash the catalog.
+        import tempfile
+        client = Mock()
+        def business(channel, method, args=None, timeout=None):
+            d = self.old_data()
+            return {'model-selection': d['view'],
+                'provider-settings': d['settings_view'], 'setting': d['settings']}[channel]
+        client.call.side_effect = business
+        transport = self.StatefulTransport(self.old_data(), self.fresh_data())
+        bridge = self.recovery_bridge(client, lambda: transport)
+        self.paths['lock'].parent.mkdir(parents=True, exist_ok=True)
+        for marker in ('', 'not-a-number', 'nan', '-5', 'NaN'):
+            with self.subTest(marker=marker):
+                self.paths['cooldown'].write_text(marker)
+                result = bridge.dispatch('catalog', {})
+                self.assertFalse(any(p['id'] == 'account:bigmodel-start-plan'
+                    for p in result['providers']))
+                transport.calls.clear()
+        # A valid stale marker still allows recovery afterwards (no leaked fd, no
+        # permanently wedged gate).
+        self.paths['cooldown'].write_text(str(time.time() - 10 * RECOVERY_COOLDOWN_SECONDS))
+        result = bridge.dispatch('catalog', {})
+        self.assertTrue(any(p['id'] == 'account:bigmodel-start-plan' for p in result['providers']))
 
     def test_recovery_gate_rechecks_cooldown_inside_lock_across_processes(self):
         # Real two-process probe for the R7 race: a child holds the lock and writes

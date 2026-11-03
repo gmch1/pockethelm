@@ -683,14 +683,26 @@ class Bridge:
             # racers that both passed an outer check would otherwise bypass the 90s
             # window (reviewer-reproduced with real interleaved processes) — the
             # second one re-reads the marker the first one wrote here. Failures
-            # count too: the record IS the start of the attempt.
+            # count too: the record IS the start of the attempt. Any unreadable or
+            # unparseable marker (empty, NaN, negative) is fail-closed (R9): the fd
+            # is released and recovery is skipped, never allowed.
+            last = None
             try:
                 last = float(paths['cooldown'].read_text().strip())
+            except FileNotFoundError:
+                pass
+            except (ValueError, OSError):
+                # Unreadable/unparseable marker: fail-closed (R9) — release the lock
+                # and skip instead of leaking the fd or bypassing the window.
+                os.close(fd)
+                return None
+            if last is not None:
+                if not math.isfinite(last) or last < 0:
+                    os.close(fd)
+                    return None
                 if time.time() - last < RECOVERY_COOLDOWN_SECONDS:
                     os.close(fd)
                     return None
-            except FileNotFoundError:
-                pass
             paths['cooldown'].write_text(str(time.time()))
         except OSError:
             os.close(fd)

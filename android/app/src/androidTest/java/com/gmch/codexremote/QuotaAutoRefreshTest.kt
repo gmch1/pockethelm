@@ -121,6 +121,33 @@ class QuotaAutoRefreshTest {
         bridge.close()
     }
 
+    @Test fun manualRefreshUpdatesTtlWatermark() = runBlocking {
+        fresh()
+        val quotaCalls = ConcurrentLinkedQueue<JSONObject>()
+        bridge.scripted["session/read"] = { readResult() }
+        bridge.scripted["quota"] = { req ->
+            quotaCalls.add(req.optJSONObject("params")!!)
+            obj("planKind" to "individual-coding-plan", "limits" to JSONArray().put(
+                obj("unit" to 3, "number" to 5, "percentage" to 15.0, "currentValue" to 4.25))) }
+        bridge.install()
+        instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
+        withTimeout(15_000) { while (quotaCalls.isEmpty()) delay(20) }
+        withTimeout(10_000) { while (vm.state.value.quotaSummary == "额度 ▾") delay(20) }
+        // A manual refresh stamps the TTL watermark too (R8): the next entry inside
+        // the TTL must not auto-fetch again, judging freshness from the latest
+        // successful read rather than the first one.
+        val afterAuto = quotaCalls.size
+        instrumentation.runOnMainSync { vm.quota() }
+        withTimeout(15_000) { while (quotaCalls.size <= afterAuto) delay(20) }
+        withTimeout(10_000) { while (vm.state.value.quotaSummary == "额度 ▾") delay(20) }
+        val afterManual = quotaCalls.size
+        instrumentation.runOnMainSync { vm.open(ZSession("s1", "集成", "/w", "idw")) }
+        delay(1_500)
+        assertEquals("手动刷新后 TTL 内不再自动拉取", afterManual, quotaCalls.size)
+        instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
+        bridge.close()
+    }
+
     @Test fun openWithoutValidSelectionSkipsQuotaSilently() = runBlocking {
         fresh()
         val state = ZcodeViewModel::class.java.getDeclaredField("mutable").let {
