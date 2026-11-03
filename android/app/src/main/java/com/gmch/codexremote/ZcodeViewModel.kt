@@ -489,8 +489,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         try {
             val data = call("quota", selectionParams())
             if (stillSelected()) {
-                quotaFetchedFor = selected
                 mutable.update { it.copy(quota = zcodeQuota(data), quotaSummary = zcodeQuotaSummary(data, selected?.model.orEmpty())) }
+                // Success stamps the TTL watermark — including manual refreshes, so the
+                // auto path judges freshness from the latest successful read (R8).
+                selected?.let { markQuotaCache(it) }
             }
         }
         catch (e: CancellationException) { throw e }
@@ -502,21 +504,25 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
      *  skipped while no valid selection exists (manual tap stays as the fallback). */
     private var quotaFetchedFor: ZSelection? = null
     private var quotaFetchedAt: Long = 0
-    /** Successful-quota display TTL (task 2026-11-03-start-plan-daily-recovery R1): a
-     *  cached summary older than this re-fetches on the next session entry, so plan
+    /** Successful-quota display TTL (task 2026-11-03-start-plan-daily-recovery R1/R8):
+     *  a cached summary older than this re-fetches on the next session entry, so plan
      *  consumption and period resets surface without a manual tap. A failed fetch
-     *  keeps the placeholder, which bypasses the cache and retries anyway. The cache
-     *  source is the selection it was fetched for (plan + model + guard). */
+     *  keeps the placeholder, which bypasses the cache and retries anyway. The stamp
+     *  is taken on SUCCESS (including a manual refresh) and uses elapsedRealtime so a
+     *  wall-clock rollback cannot extend the cache. */
     internal var quotaTtlMs: Long = 10 * 60_000L
+
+    private fun markQuotaCache(choice: ZSelection) {
+        quotaFetchedFor = choice
+        quotaFetchedAt = android.os.SystemClock.elapsedRealtime()
+    }
 
     private fun autoRefreshQuota() {
         val choice = mutable.value.selection ?: return
         val provider = mutable.value.providers.find { it.id == choice.provider } ?: return
         if (provider.guard != mutable.value.selectionGuard || provider.models.none { it.id == choice.model }) return
         val cached = choice == quotaFetchedFor && mutable.value.quotaSummary != "额度 ▾"
-        if (cached && System.currentTimeMillis() - quotaFetchedAt < quotaTtlMs) return
-        quotaFetchedFor = choice
-        quotaFetchedAt = System.currentTimeMillis()
+        if (cached && android.os.SystemClock.elapsedRealtime() - quotaFetchedAt < quotaTtlMs) return
         quota()
     }
     fun create(project: ZProject) = action {

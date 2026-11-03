@@ -46,18 +46,18 @@
 ## 实现与验证
 
 - 改动摘要与关键文件：
-  - `scripts/zcode/bridge.py`：`catalog()` 拆为 `_catalog_views/_assemble_catalog`；`stale_start_plans` 判定（settings 记录：start-plan + `executable !== true` + `availability ∈ {pending, unknown}` 或 `unavailable` 且 reason ∈ {not-entitled, credential-failed}——**协议值为连字符形式**（shared/src/account-provider-state.ts，方案文稿中下划线写法已按真实枚举修正）+ `current === true` + `enabled === true`）；`recovery_gate`（flock 互斥 + 90s 冷却时间戳，先写记账后尝试，任何存储失败 fail-closed 跳过）；`attempt_start_plan_recovery`（隔离临时 `wire.Client`，工作预算 25s、每步前预检剩余 ≥2s 否则终止、timeout=min(剩余, 10s)、任何一步失败返回整套旧视图、清理预算 3s、成功失败均 `log_recovery`）；`log_recovery` 脱敏前后取证（availability/reason/模型数/providerId，不含凭据，日志有界 100 行）。
+  - `scripts/zcode/bridge.py`：`catalog()` 拆为 `_catalog_views/_assemble_catalog`；`stale_start_plans` 判定（settings 记录：start-plan + `executable !== true` + `availability ∈ {pending, unknown}` 或 `unavailable` 且 reason ∈ {not-entitled, credential-failed}——**协议值为连字符形式**（shared/src/account-provider-state.ts，方案文稿中下划线写法已按真实枚举修正）+ `current === true` + `enabled === true`）；`recovery_gate`（flock 互斥，**冷却重读与记账在锁内原子完成**（R7），任何存储失败 fail-closed 跳过）；`attempt_start_plan_recovery`（隔离临时 `wire.Client`，**第一调用即 `provider-settings.refresh`（单元素 reason 数组）**，随后读三视图；工作预算 25s、每步前预检剩余 ≥2s 否则终止、timeout=min(剩余, 10s)、任何一步失败返回整套旧视图、清理预算 3s、成功失败均 `log_recovery`）；`log_recovery` 脱敏前后取证（availability/reason/模型数/providerId，不含凭据，日志有界 100 行）。
   - `scripts/zcode/wire.py`：`close(cleanup_budget=3.0)` 预算化清理——terminate 等待与 kill 后回收共享预算，kill 后 `wait` 补 `timeout`（消除无界等待），管道显式关闭，预算内未回收由 init 在连接结束时代管。
-  - App（R1）：`ZcodeViewModel` 额度缓存 TTL——`quotaTtlMs`（10 分钟，internal 可注入）+ `quotaFetchedAt`；TTL 内同 selection 去重，过期后台重读；失败保持占位符、下次进入会话即重试。版本 0.4.22 / versionCode 32（基于 main `daaef8d`）。
+  - App（R1/R8）：`ZcodeViewModel` 额度缓存 TTL——`quotaTtlMs`（10 分钟，internal 可注入）；`quota()` **成功分支（含手动刷新）经 `markQuotaCache` 记录来源与 `SystemClock.elapsedRealtime()` 水位**，`autoRefreshQuota` 只按单调时钟判定 TTL；失败保持占位符、下次进入会话即重试。版本 0.4.22 / versionCode 32（基于 main `daaef8d`）。
   - `bridgeVersion` 保持 1，无新增 capability；`install.py` 已部署开发机。
-- 代码版本或源码快照标识：分支 `start-plan-daily-recovery`（自 main `daaef8d`）；源码 SHA-256 `51ef808246a78c47114ab4286655ff46adf56c5f9a6e266142647df3004ae082`（124 文件，排序 path + NUL + bytes + NUL 口径，含未忽略新增文件；HEAD 未提交时即当前工作区）。
+- 代码版本或源码快照标识：分支 `start-plan-daily-recovery`（自 main `daaef8d`）；源码 SHA-256 以提交时点为准（R6–R8 修复后见提交信息；124 文件口径，排序 path + NUL + bytes + NUL，含未忽略新增文件）。
 - 自动化检查：
-  - Python：`python3 -m unittest test_bridge test_session_index` → 72 通过 0 失败（新增 7 项：恢复成功从空模型视图到有模型视图且参数/超时/预算断言、冷却阻止第二次、init/refresh/第二第三视图失败返回整套旧视图、flock 互斥与两类存储失败 fail-closed、六种非瞬态状态跳过、预算边界（负数/0.2s 不钳位不发起调用）、wire close 顽固子进程故障注入 + 正常路径）。
+  - Python：`python3 -m unittest test_bridge test_session_index` → 73 通过 0 失败（新增 8 项：**状态式模拟服务**下恢复成功——refresh 为首调用（单元素数组）、顺序 refresh→三视图、从空模型视图到有模型视图且随后的 `check_selection` 成功；冷却阻止第二次；init/refresh/第一二三视图失败返回整套旧视图；flock 互斥与两类存储失败 fail-closed；六种非瞬态状态跳过；预算边界（负数/0.2s 不钳位不发起调用）；wire close 顽固子进程故障注入 + 正常路径；**真双进程交错探针**——持锁期间与释放后 gate 均跳过）。
   - JVM：`./gradlew -p android -PpockethelmTestBuildType=release :app:testReleaseUnitTest` → 114 通过、0 失败、1 跳过（既有条件跳过）。
   - Lint：`:app:lintRelease` 0 错误、19 提示（既有基线同类）。
-- 真机环境：chopin / Android 13；签名 release 包 `com.gmch.codexremote` 0.4.22 / 32（APK SHA-256 `00707cdab918e5710d3b694f6d94a2aede436e274da85b0bb2af6dce7d4becef`，不可调试、原发行签名）。
-- 真机验证（`scripts/android/device_test.py --serial 192.168.31.129:34109`，产物 `~/.local/state/pockethelm/start-plan-recovery/device.txt`）：36/36 通过——`QuotaAutoRefreshTest`（进入会话后台拉取 + TTL 内去重 + 过期重读 + 失败保持占位符并重试）、`ZcodeP1ParityTest`、`ZcodeSendRealtimeTest`、`ZcodeListRefreshTest`、`ZcodeLiveStatusTest`、`ZcodeLoadRecoveryTest`、`ZcodeDeviceIntegrationTest` 只读回归。
-- 真实链路冒烟（`~/.local/state/pockethelm/start-plan-recovery/smoke.json`）：部署后的桥接器对真实 3.17.1 `initialize`（capabilities 完整、bridgeVersion 1）+ `catalog`（start-plan 正常返回 `GLM-5.3-Flash`，0.53s；健康态下自愈未触发，无锁/冷却文件残留——`ls` 复核 0 项）。**按 R5 边界：只读冒烟不证明跨天恢复效果，也非真实发送。**
+- 真机环境：chopin / Android 13；签名 release 包 `com.gmch.codexremote` 0.4.22 / 32（APK SHA-256 `4c8af0ba845e0e984cbeec3537fce1702689e1c4bf659192bc41db759e3f91f5`，不可调试、原发行签名）。
+- 真机验证（`scripts/android/device_test.py --serial 192.168.31.129:34109`，产物 `device.txt` 36/36 + `device-quota-r8.txt` 4/4——`QuotaAutoRefreshTest`（进入会话后台拉取 + TTL 内去重 + 过期重读 + 失败保持占位符并重试）、`ZcodeP1ParityTest`、`ZcodeSendRealtimeTest`、`ZcodeListRefreshTest`、`ZcodeLiveStatusTest`、`ZcodeLoadRecoveryTest`、`ZcodeDeviceIntegrationTest` 只读回归。
+- 真实链路冒烟（`~/.local/state/pockethelm/start-plan-recovery/smoke.json`，R6-R8 修复后重跑）：部署桥接器与仓库 diff 为空；`initialize`（capabilities 完整、bridgeVersion 1）+ `catalog`（start-plan 正常返回 `GLM-5.3-Flash`，0.4s；健康态下自愈未触发，无锁/冷却文件残留——`ls` 复核 0 项）。**按 R5 边界：只读冒烟不证明跨天恢复效果，也非真实发送。**
 - 测试清理结果：device_test.py 入口移除测试包与临时 APK；测试权限基线按约定保留；真机套件全部使用 FakeRpcBridge/合成数据，无模型消耗、无真实会话创建。
 - 已知限制与待验项：
   - 跨天行为（H1/H2 裁决）待 23 点后用户实测；恢复触发时脱敏证据落盘 `~/.local/state/pockethelm/zcode-start-plan-recovery/log.jsonl`，回填本文档；未复现则标待验。
@@ -130,6 +130,9 @@
 
 - **Codex 第四轮正文复审（2026-11-04），R1：** 通过（方案）。成功缓存 TTL、来源失效、手动刷新和失败重试的设计保持有效；沿用既有实现与测试验收要求。
 
+- **实现复审（2d8b3fa，2026-11-04）：[P2] 待修复——TTL 时间戳没有随成功读取更新。** ZcodeViewModel.kt:491-493 的成功分支只更新 quotaFetchedFor，quotaFetchedAt 仅在 autoRefreshQuota 发起请求前（:519）写入。触发：先自动读取，10 分钟后手动读取成功，再进入同一会话，仍按旧时间立即重读；首次手动读取后时间戳仍为 0，也无法获得 10 分钟缓存。另 :517 使用墙钟且未检查负时间差，系统时间回拨会延长缓存有效期。
+  - 修复验收：在 stillSelected 为真且读取成功的统一路径更新来源和时间，自动/手动读取共用；采用单调时钟或显式处理回拨。补“手动成功后 TTL 内再次进入不请求”“成功响应时记账”“回拨不延长有效期”的测试。现有短 TTL 与失败后重试测试未覆盖这些情况。
+
 ### R2 [P1] 方案混用两种视图，刷新后仍可能没有可用模型
 
 - 状态：待修订。
@@ -146,6 +149,11 @@
 - **Codex 第三轮正文复审（2026-11-04），R2：** 通过（方案）。参数形态、临时连接上的三视图重读和整套旧视图降级保持正确。
 
 - **Codex 第四轮正文复审（2026-11-04），R2：** 通过（方案）。参数形态、完整三视图重建与失败返回整套旧视图的设计保持有效。
+
+- **实现复审（2d8b3fa，2026-11-04）：[P1] 待修复——恢复路径漏掉真正的 refresh RPC。** bridge.py:707-716 创建临时 Client 后只调用 model-selection.getView、provider-settings.getView、setting.get；没有调用 provider-settings.refresh。面对缓存停留在 pending/not-entitled 的原始故障，只重读仍会得到旧状态，却已消耗冷却窗口。因此任务核心自愈没有实现。
+  - 本地针对性复现：用“只有收到 refresh 才改变状态”的模拟服务调用当前 catalog，记录到的调用只有三个 get，refreshed=False，返回 providers=0。无需真实 balance 故障或模型调用即可复现。
+  - 现有 test_bridge.py:1034-1047 直接给临时连接预置 fresh_data，并断言调用数为 3，所以没有刷新也会通过；非 model-selection 分支的断言还在比较自身。任务记录声称覆盖 refresh 失败与 reason 参数，当前测试并未覆盖。
+  - 修复验收：临时连接上先在剩余预算内执行 refresh，参数为单元素 reason 数组，然后取三视图；测试服务必须在 refresh 后才恢复，断言严格调用顺序/参数、refresh 失败整套旧视图降级，并按计划验证恢复后的 check_selection。更新“实现与验证”记录以匹配真实检查。
 
 ### R3 [P2] 单进程冷却不能保证跨连接限流，刷新范围也非一次 balance
 
@@ -165,6 +173,10 @@
 - **Codex 第三轮正文复审（2026-11-04），R3：** 通过（方案）。flock 非阻塞互斥、失败记账、存储失败跳过的设计保持正确。
 
 - **Codex 第四轮正文复审（2026-11-04），R3：** 通过（方案）。非阻塞 flock、共享冷却、失败记账及存储异常跳过设计保持有效。
+
+- **实现复审（2d8b3fa，2026-11-04）：[P2] 待修复——冷却读取在 flock 外，仍可绕过 90 秒窗口。** bridge.py:674-676 读时间并判断后才在 :683 获锁，获锁后不重读冷却，直接写入新时间。进程 A 读旧时间后暂停，B 获锁、记账、完成并释放锁；A 再获锁会沿用旧判断，再次放行。flock 防住同时执行，但没保证冷却的检查与预占原子性。
+  - 已用两个真实本地进程及临时目录确定性复现：子进程读取过期时间后等待，父进程完成 gate 并释放锁，再恢复子进程；两次 gate 均获准，间隔远小于 90 秒。未访问真实服务/实际冷却文件。
+  - 修复验收：获取非阻塞锁后重新读取、校验时间戳并判断冷却，检查与记账在同一锁区间完成；锁外预读只能作优化。补上述交错测试，预期第二次返回 None；保留现有持锁竞争与存储失败测试。
 
 ### R4 [P2] 缺少超时降级，可能把读取目录/发送检查变成断连
 
@@ -192,6 +204,8 @@
 - **Codex 第四轮正文复审（2026-11-04），R4：** 通过（方案）。已重新核对必要约束、实现方案、故障测试及第四轮回复：明确把 3 秒列为待实现的总清理预算，terminate 等待与 kill 后回收共享期限，禁止截止后的业务线程无界 wait；初始化异常同样清理、管道显式关闭，并加入 stubborn-child 故障注入。25 秒工作预算与 3 秒清理预算的口径已统一，前轮剩余阻塞关闭，可按此方案实现，无需继续为已解决的预算问题往返修订。
   - 实现验收说明（非新增方案阻塞）：SIGKILL 已发送不等于已退出或已回收；预算内 waitpid 未成功时应如实记为“待回收”。文中“短暂”不是时间保证——父 bridge 可能长期存活，遗留状态可能持续到它退出，由 init 或最近的 subreaper 接管。按本方案已披露的异常回收边界评审，不把这一情况误报为清理已完成。实现时验证 Popen 状态与 waitpid 回收一致、重复 close 不重复消耗预算、轮询休眠不超过剩余预算；这些是预算化 close 的实现正确性检查。
 
+- **实现复审（2d8b3fa，2026-11-04）：本轮未发现新的阻塞项。** 独立 Client、剩余不足 2 秒退出、close 两次 wait 共用预算及显式管道关闭已实现；现有测试的顽固子进程路径通过。R2 补上 refresh 后须让它同样经过预算保护，并补 refresh 失败/超时验证；这属于 R2 修复验收，不能以目前三次 getView 测试替代。
+
 ### R5 [P2] 根因证据不足，不能宣称已排除 JWT 或证实每日到期
 
 - 状态：待补证据。
@@ -213,6 +227,8 @@
 - **Codex 第三轮正文复审（2026-11-04），R5：** 通过（方案）。已重新核对 H2 引用块、第 6 项及第 9 项：认证未排除、不强刷凭据的能力边界现在一致；取证不足时不裁决根因、只读回归不等于真实发送验证的声明保持有效。跨天证据是后续验收，不阻塞本项方案通过。
 
 - **Codex 第四轮正文复审（2026-11-04），R5：** 通过（方案）。H1 条件推演、H2 未排除、凭据能力边界及取证限制保持一致；方案通过不代表跨天根因或实际恢复效果已验证。
+
+- **实现复审（2d8b3fa，2026-11-04）：取证边界声明保持通过。** 健康态冒烟只验证正常 catalog，跨天实测与 H1/H2 裁决继续作为独立后续验收；本次不以缺少跨天证据新增阻塞。但现有恢复成功/失败测试覆盖声明须随 R2 更正，不能用 Mock 直接提供的新视图证明真实恢复已实现。
 
 复核依据：本地 /tmp/zcode-oss 的 facades.ts、providerRuntime.ts、account-provider-resolution.ts 与已安装服务的既有 RPC 探测记录；没有重新请求余额/刷新账号，也没有消耗模型额度。
 
@@ -299,6 +315,55 @@
 **R4：通过（方案）。总判定：通过（方案），R1–R5 均保持通过。** 这也是上一轮“第四轮正文复审”的有效结论；更早的“待修订”段落仅为历史记录，不代表当前意见。未实现的清理预算仍需后续代码与测试验证，不再作为本轮方案阻塞。
 
 本轮仅追加 Review 确认，未改正文或产品代码。追加后文件哈希变化，以上哈希标识本次读取的输入版本。
+
+
+### 实现复审总判定：2d8b3fa（2026-11-04，当前有效实现结论）
+
+**待修复，暂不通过实现 review。** R2 [P1] 漏调 refresh，R3 [P2] 冷却检查锁外竞争，R1 [P2] TTL 成功时间未更新/墙钟回拨。此前“通过（方案）”仍是方案结论，不等于当前实现通过。
+
+范围：`git diff daaef8d..2d8b3fa`，当前 HEAD `2d8b3faf3f6cca10dd564065d31bbcba258b0270`。复跑 Python 72 项全部通过、diff 格式检查通过；额外状态式模拟服务与真实双进程交错探针分别复现 R2/R3，说明现有绿色测试存在覆盖缺口。Android R1 为代码路径审查结论；未重复构建或执行真机套件，也未将交付记录中的 JVM/36 项真机结果声称为本轮重跑。
+
+本轮仅在 Review 区追加结论，未修改产品/测试代码、未部署、未调用模型、未提交或推送。跨天效果及 H1/H2 的事实裁决保持后续独立验收。
+
+
+### 实现 review（2d8b3fa，2026-11-04；问题编号 R6 起）
+
+**结论：待修复，不通过。** 本节评审实现，不重开方案评审。此前实现复审中沿用 R1–R3 的三项发现，按本次要求归并为 R6–R8，后续修复引用以下编号即可，避免与方案问题混淆。
+
+已在仓库执行 `git diff daaef8d..2d8b3fa`，HEAD 为 `2d8b3faf3f6cca10dd564065d31bbcba258b0270`。实际 6 个变化文件为 bridge.py、wire.py、test_bridge.py、ZcodeViewModel.kt、QuotaAutoRefreshTest.kt、本文档；build.gradle.kts 在该范围没有 diff，0.4.22/32 已存在于基线 daaef8d。
+
+#### R6 [P1] 未调用 refresh，核心恢复动作缺失
+
+- 状态：待修复。
+- 位置：scripts/zcode/bridge.py:707-716；scripts/zcode/test_bridge.py:1034-1047。
+- 实际实现：临时 Client 上只调用三个 getView/get，不存在 `provider-settings.refresh` 调用。若上游仍缓存 pending/not-entitled，重读不会触发权益重新解析，只会消耗一次冷却窗口。
+- 已有本地复现：状态式模拟服务仅在接到 refresh 后更新视图，当前实现只记录到三次 get，refreshed=False，最终 providers=0。当前测试直接预置 fresh_data，甚至断言调用数为 3，因此没有 refresh 也会绿。
+- 修复验收：在同一隔离连接上先以剩余预算调用 refresh，传入单元素 reason 数组，再读取三视图。用状态式模拟服务断言准确调用顺序和参数、refresh 成功后模型恢复及 check_selection 成功；覆盖 refresh 拒绝/超时/预算不足时返回整套旧视图。同步更正任务记录中的 refresh 失败覆盖声明。
+- **回复与修复（2026-11-04）**：已修复——`attempt_start_plan_recovery` 现以 `bounded('provider-settings', 'refresh', ['pockethelm-start-plan-recovery'])` 作为隔离连接上的**第一个**调用，随后才读三视图（全部受同一 25s 预算与每步预检约束）。测试改为**状态式模拟服务**（StatefulTransport：只有 refresh 真正发生才返回恢复后视图），断言调用顺序 `refresh → model-selection → provider-settings → setting`、单元素 reason 数组、refresh 拒绝/超时/预算不足均返回整套旧视图；原「断言调用数为 3」的掩盖性断言已删除。任务记录中的覆盖声明同步更正。状态：已修复，待复查。
+
+#### R7 [P2] 冷却判断在锁外，交错请求仍可绕过 90 秒限制
+
+- 状态：待修复。
+- 位置：scripts/zcode/bridge.py:674-689。
+- 触发：A 读取过期时间后暂停，B 获锁、写入新时间并完成，A 随后获锁却不重新检查，直接放行第二次尝试。锁只阻止同时运行，未将检查与预占作为一个原子操作。
+- 已有本地复现：两个实际进程、临时状态目录，以事件控制上述交错，父/子进程 gate 均返回有效 fd，间隔远小于 90 秒。未访问部署环境的状态文件。现有测试只验证“别人正在持锁”的情形。
+- 修复验收：获锁后重读和校验时间戳，在锁内完成冷却判断与记账；补真实双进程交错测试，第二次必须跳过。保留存储失败 fail-closed 与失败尝试记账行为。
+- **回复与修复（2026-11-04）**：已修复——冷却重读与记账移入 flock 之后、作为锁内原子步骤（第二个竞争者必然重读第一个写入的标记）；存储失败 fail-closed 与失败记账保留。新增真实双进程探针：子进程持锁并标记，父进程在持锁期间与释放后各调一次 gate，两次都必须跳过。状态：已修复，待复查。
+
+#### R8 [P2] 成功读取没有更新 TTL 时间，手动刷新仍使用旧时间
+
+- 状态：待修复。
+- 位置：android/app/src/main/java/com/gmch/codexremote/ZcodeViewModel.kt:491-493、517-520。
+- 触发：自动缓存已过期后，手动 quota 成功只更新 quotaFetchedFor，quotaFetchedAt 仍是旧值；下一次进入会话立即重复请求。首次手动读取时该值仍是 0。自动路径也在请求发起前而非成功后记账。墙钟回拨时负差值满足 `< TTL`，可能长时间保持旧额度。
+- 修复验收：在成功响应且 stillSelected 为真时统一更新时间/来源，自动与手动共用；使用单调时钟或显式处理回拨。补手动成功后 TTL 内不重读、成功时间记账、时间回拨的测试。保留失败占位与下次进入重试。
+- **回复与修复（2026-11-04）**：已修复——`quota()` 成功分支（含手动刷新）通过 `markQuotaCache(selection)` 同时记录来源与 `SystemClock.elapsedRealtime()` 时间戳；`autoRefreshQuota` 不再在发起时打点，仅用 elapsedRealtime 判定 TTL（单调，墙钟回拨不再延长缓存）；失败保持占位符、下次进入会话即重试。测试新增「手动刷新更新水位（其后 TTL 内自动路径不再拉取）」；既有过期重读/失败重试用例保留。状态：已修复，待复查。
+#### 其余实现与证据核对
+
+- 隔离临时 Client、每步最少 2 秒剩余预算、10 秒单步上限、旧视图整套回退、close 的两次 wait 共用剩余清理预算及显式关闭管道已在实现中看到；当前普通异常/顽固子进程测试通过。未将这些已落实事项重复列为方案阻塞。R6 修复后新增 refresh 也必须受同一预算保护。
+- 取证按白名单投影 provider 状态/模型数；不包含完整视图或凭据结构，异常文本截断保存。真实根因归因仍依赖后续取证；健康态 smoke 不能覆盖 R6。
+- Python 72 项已在本次连续 review 中实际复跑通过；状态式模拟与双进程探针仍复现 R6/R7，绿色套件不能替代缺失断言。wire close 测试目前通过立即抛异常的 Mock 检查控制流，并未模拟实际耗时推进；建议补剩余预算递减断言以支撑时间保证。
+- 已读取 `~/.local/state/pockethelm/start-plan-recovery/device.txt`，确有 `OK (36 tests)`；这是提交者留下的设备记录，不是本轮重新执行。JVM 114/真机 36 的交付声明不作为 R6/R7 已验证的依据，本轮未重跑 Android 构建或真机测试。
+- 跨天实测及 H1/H2 取证不在本轮阻塞范围。此次只追加 Review，未改产品/测试代码、部署、提交或 push。
 
 ## 发布或完成
 

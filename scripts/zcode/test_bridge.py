@@ -1027,27 +1027,56 @@ class StartPlanRecoveryTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return bridge
 
+    class StatefulTransport:
+        """Mimics the upstream: only a real refresh flips the availability state, so a
+        recovery that forgets to call refresh can never see the recovered views."""
+        def __init__(self, old, fresh):
+            self.old, self.fresh = old, fresh
+            self.refreshed = False
+            self.calls = []
+            self.closed = []
+        def call(self, channel, method, args=None, timeout=None):
+            self.calls.append((channel, method, args, timeout))
+            if method == 'refresh':
+                self.refreshed = True
+                return {'ok': True}
+            source = self.fresh if self.refreshed else self.old
+            if channel == 'model-selection':
+                return source['view']
+            if channel == 'provider-settings':
+                return source['settings_view']
+            return source['settings']
+        def close(self, cleanup_budget=3.0):
+            self.closed.append(cleanup_budget)
+
     def test_catalog_recovers_pending_start_plan_via_settings_refresh(self):
         client = Mock()
+        chosen = {'providerId': 'account:bigmodel-start-plan', 'modelId': 'GLM-5.3-Flash',
+            'options': {'reasoningLevel': 'low'}}
         client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
-            self.old_data()['settings']]
-        transport = Mock()
-        transport.call.side_effect = [self.fresh_data()['view'], self.fresh_data()['settings_view'],
-            self.fresh_data()['settings']]
+            self.old_data()['settings'],
+            self.fresh_data()['view'], self.fresh_data()['settings_view'],
+            self.fresh_data()['settings'],
+            {'effectiveSelection': chosen}]
+        transport = self.StatefulTransport(self.old_data(), self.fresh_data())
         bridge = self.recovery_bridge(client, lambda: transport)
         result = bridge.dispatch('catalog', {})
-        # Recovered from the empty-model pending view to a model-bearing view.
+        # Recovered from the empty-model pending view to a model-bearing view — only
+        # because refresh ran first: without it the stateful transport stays stale.
         provider = next(p for p in result['providers'] if p['id'] == 'account:bigmodel-start-plan')
         self.assertEqual(provider['models'], [{'id': 'GLM-5.3-Flash', 'levels': ['low']}])
         self.assertEqual(provider['planKind'], 'start-plan')
-        # Isolated transport only: three bounded calls, budget never exceeded.
-        self.assertEqual(transport.call.call_count, 3)
-        for call in transport.call.call_args_list:
-            self.assertEqual(call.args[:2], ('model-selection', 'getView') if
-                call.args[0] == 'model-selection' else call.args[:2])
-            self.assertLessEqual(call.kwargs['timeout'], 10.0)
-            self.assertGreater(call.kwargs['timeout'], 0.0)
-        transport.close.assert_called_once_with(cleanup_budget=3.0)
+        # Isolated transport only: refresh first with a single-element reason array,
+        # then the three views; every step within budget, never clamped upward.
+        self.assertEqual(transport.calls[0][:3], ('provider-settings', 'refresh',
+            ['pockethelm-start-plan-recovery']))
+        self.assertEqual([c[:2] for c in transport.calls],
+            [('provider-settings', 'refresh'), ('model-selection', 'getView'),
+             ('provider-settings', 'getView'), ('setting', 'get')])
+        for call in transport.calls:
+            self.assertLessEqual(call[3], 10.0)
+            self.assertGreater(call[3], 0.0)
+        self.assertEqual(transport.closed, [3.0])
         # Attempt recorded (cooldown) and desensitized evidence logged.
         self.assertLessEqual(time.time() - float(self.paths['cooldown'].read_text()), 90.0)
         entry = json.loads(self.paths['log'].read_text().splitlines()[-1])
@@ -1055,30 +1084,34 @@ class StartPlanRecoveryTests(unittest.TestCase):
         self.assertEqual(entry['after'][0]['executable'], True)
         self.assertEqual(entry['before'][0]['modelCount'], 0)
         self.assertNotIn('token', json.dumps(entry))
+        # The follow-up send-path check_selection succeeds against the recovered state.
+        fresh_record = self.fresh_data()['settings_view']['providers'][0]
+        result = bridge.check_selection({'selection': chosen, 'guard': guard_for(fresh_record, {})})
+        self.assertEqual(result, chosen)
 
     def test_recovery_cooldown_blocks_second_attempt(self):
         client = Mock()
         client.call.side_effect = [self.old_data()['view'], self.old_data()['settings_view'],
             self.old_data()['settings'], self.old_data()['view'],
             self.old_data()['settings_view'], self.old_data()['settings']]
-        transport = Mock()
-        transport.call.side_effect = [self.fresh_data()['view'], self.fresh_data()['settings_view'],
-            self.fresh_data()['settings']]
+        transport = self.StatefulTransport(self.old_data(), self.fresh_data())
         bridge = self.recovery_bridge(client, lambda: transport)
         first = bridge.dispatch('catalog', {})
         self.assertTrue(any(p['id'] == 'account:bigmodel-start-plan' for p in first['providers']))
         second = bridge.dispatch('catalog', {})
         # Cooldown active: no second transport, stale provider filtered from the list.
-        self.assertEqual(transport.call.call_count, 3)
+        self.assertEqual(len(transport.calls), 4)
         self.assertFalse(any(p['id'] == 'account:bigmodel-start-plan' for p in second['providers']))
 
     def test_recovery_failures_return_complete_old_views(self):
         from wire import WireError
         cases = {
             'init': None,
-            'first_view': [WireError('boom'), ],
-            'second_view': [Mock(), WireError('boom')],
-            'third_view': [Mock(), Mock(), WireError('boom')],
+            'refresh': [WireError('boom')],
+            'refresh_timeout': [TimeoutError('预算耗尽')],
+            'first_view': [Mock(), WireError('boom')],
+            'second_view': [Mock(), Mock(), WireError('boom')],
+            'third_view': [Mock(), Mock(), Mock(), WireError('boom')],
         }
         for name, effects in cases.items():
             with self.subTest(case=name):
@@ -1133,6 +1166,45 @@ class StartPlanRecoveryTests(unittest.TestCase):
             transport.call.assert_not_called()
         finally:
             self.paths['lock'].rmdir()
+
+    def test_recovery_gate_rechecks_cooldown_inside_lock_across_processes(self):
+        # Real two-process probe for the R7 race: a child holds the lock and writes
+        # the cooldown marker at release; the parent's gate must be blocked while the
+        # lock is held AND skip afterwards — the cooldown re-check happens inside the
+        # lock, so two racers can no longer both fire within the window.
+        import subprocess
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(root, ignore_errors=True))
+        paths = recovery_paths(root)
+        locked = Path(root) / 'locked'
+        release = Path(root) / 'release'
+        child = subprocess.Popen([sys.executable, '-c', f"""
+import fcntl, os, sys, time
+sys.path.insert(0, {str(Path(__file__).parent.resolve())!r})
+from bridge import recovery_paths
+paths = recovery_paths({root!r})
+fd = os.open(str(paths['lock']), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open({str(locked)!r}, 'w').write('locked')
+while not os.path.exists({str(release)!r}):
+    time.sleep(0.02)
+open(str(paths['cooldown']), 'w').write(str(time.time()))
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+"""])
+        bridge = Bridge(Mock(), recovery=paths)
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline and not locked.exists():
+                time.sleep(0.05)
+            self.assertTrue(locked.exists(), 'child never acquired the lock')
+            self.assertIsNone(bridge.recovery_gate(), 'lock held by the child: must skip')
+        finally:
+            release.write_text('go')
+            child.wait(timeout=10)
+        self.assertIsNone(bridge.recovery_gate(),
+            'cooldown re-check must run inside the lock (R7): second gate must skip')
 
     def test_recovery_skips_non_transient_states(self):
         variants = [

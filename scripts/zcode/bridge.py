@@ -670,14 +670,8 @@ class Bridge:
         paths = self.recovery
         try:
             paths['lock'].parent.mkdir(parents=True, exist_ok=True)
-            try:
-                last = float(paths['cooldown'].read_text().strip())
-                if time.time() - last < RECOVERY_COOLDOWN_SECONDS:
-                    return None
-            except FileNotFoundError:
-                pass
             fd = os.open(paths['lock'], os.O_RDWR | os.O_CREAT, 0o600)
-        except (OSError, ValueError):
+        except OSError:
             return None
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -685,7 +679,18 @@ class Bridge:
             os.close(fd)
             return None
         try:
-            # The attempt record IS the start of the attempt: failures count too.
+            # Cooldown re-check and recording are one atomic step INSIDE the lock:
+            # racers that both passed an outer check would otherwise bypass the 90s
+            # window (reviewer-reproduced with real interleaved processes) — the
+            # second one re-reads the marker the first one wrote here. Failures
+            # count too: the record IS the start of the attempt.
+            try:
+                last = float(paths['cooldown'].read_text().strip())
+                if time.time() - last < RECOVERY_COOLDOWN_SECONDS:
+                    os.close(fd)
+                    return None
+            except FileNotFoundError:
+                pass
             paths['cooldown'].write_text(str(time.time()))
         except OSError:
             os.close(fd)
@@ -705,13 +710,18 @@ class Bridge:
         try:
             deadline = time.monotonic() + RECOVERY_WORK_BUDGET_SECONDS
             transport = Client()
-            def bounded(channel, method):
+            def bounded(channel, method, args=None):
                 remaining = deadline - time.monotonic()
                 if remaining < RECOVERY_MIN_STEP_SECONDS:
                     raise TimeoutError('恢复预算不足')
-                return transport.call(channel, method, None,
+                return transport.call(channel, method, args,
                     timeout=min(remaining, RECOVERY_STEP_CAP_SECONDS))
-            data = {'view': bounded('model-selection', 'getView'),
+            # The refresh IS the recovery: it re-runs upstream availability validation
+            # (force builtin + account re-resolution incl. billing/balance) on the same
+            # isolated, budgeted connection; the three views are then read fresh here.
+            data = {'refresh': bounded('provider-settings', 'refresh',
+                    ['pockethelm-start-plan-recovery']),
+                'view': bounded('model-selection', 'getView'),
                 'settings_view': bounded('provider-settings', 'getView'),
                 'settings': bounded('setting', 'get')}
             self.log_recovery(old, data, None)
