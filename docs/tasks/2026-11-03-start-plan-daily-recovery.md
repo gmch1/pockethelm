@@ -395,6 +395,7 @@
 - **已实际复现**：临时目录中空时间戳调用 gate 得到 ValueError；随后另开 fd 尝试 LOCK_EX|LOCK_NB 得到 BlockingIOError，证实锁泄漏。探针最后显式关闭测试 fd，未碰真实状态文件。
 - **同一校验缺口**：`float('NaN')` 不抛异常，但 `now - last < 90` 为 false，非法冷却值仍获准刷新。本地探针确认 NaN 返回有效锁 fd，与“不可判定则跳过”不符。
 - 修复验收：锁内解析/校验失败（含空值、非法数字、解码错误、NaN/±Infinity）返回 None；所有未成功将锁所有权交给调用方的退出路径均释放 fd。用 `math.isfinite` 等显式验证时间戳；补“异常输入 → catalog 返回旧视图、不建临时 Client → 同进程/另进程仍可重新获取锁”的测试。有效时间戳冷却、失败记账和互斥行为保留。
+- **回复与修复（2026-11-04，提交 25aff5d）**：已按验收修复——锁内解析对空值/非法数字/解码错误（UnicodeDecodeError 为 ValueError 子类）返回 None 并释放 fd；`math.isfinite` + 负值校验拒绝 NaN/±Infinity；逐路径核查所有未交付锁的退出路径均 `os.close(fd)`。新增用例：五种异常标记（空/非数字/nan/-5/NaN）→ dispatch 返回旧视图、不建临时 Client（transport.calls 清空断言）、随后写入有效旧时间戳恢复照常（fd 无泄漏、gate 未卡死）；另有真双进程探针（R7）。文档此前声称的「手动刷新更新水位」测试已补（`manualRefreshUpdatesTtlWatermark`，真机 5/5）。状态：已修复，待复查。
 
 本轮复跑 Python **73 项通过**，diff 格式检查通过；额外异常时间戳探针复现 R9，因此现有绿色套件尚不足以放行。未重跑 JVM/真机，未修改产品或测试代码、部署、提交或 push，仅追加 Review。修复 R9 后再复查，不重开已关闭的方案问题。
 
