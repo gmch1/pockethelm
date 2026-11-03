@@ -161,20 +161,13 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
             state.historyLoading, state.historyError, state.connected, state.busy, Modifier.weight(1f),
             vm::moreHistory, vm::retryHistory, detail, state.diff, vm::deleteQueued, dismissFailed = vm::dismissFailed)
         ExecutionControls(state, vm)
-        val context = androidx.compose.ui.platform.LocalContext.current
-        val processor = remember(context) { ImageProcessor(context) }
-        val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-            if (uri != null) {
-                val (name, mime) = processor.sourceInfo(uri)
-                vm.addAttachment(uri, name, mime)
-            }
-        }
+        val pickImage = rememberAttachmentPicker(vm::attachmentScope, vm::addAttachment)
         ChatComposer(state.draft, vm::draft, state.sending,
             state.connected && !state.busy && !state.sending && !state.attachmentsBusy && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.uncertain == null,
             steer, { steer = it }, { vm.send(steer && session.runtime == "active") },
             attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
             canAttach = !state.attachmentsBusy && state.attachments.size < ImagePolicy.MESSAGE_MAX && !state.sending,
-            attach = { pickImage.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+            attach = pickImage,
             removeAttachment = vm::removeAttachment)
     }
     if (approvalSheet && approvals.isNotEmpty()) {

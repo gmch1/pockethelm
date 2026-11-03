@@ -269,6 +269,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnectManually() = disconnect()
     private fun disconnect() {
         generation++
+        attachmentSerial.incrementAndGet()
         supportsSessionIndex = false
         backgroundJob?.cancel(); backgroundJob = null
         browser(ZcodeBrowserEvent.Disconnect)
@@ -528,6 +529,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     private fun select(session: ZSession) {
+        attachmentSelection++; attachmentSerial.incrementAndGet()
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
         persistSeen()
         older = emptyList()
@@ -557,6 +559,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun back() {
         if (mutable.value.busy) return
+        attachmentSelection++; attachmentSerial.incrementAndGet()
         navigationVersion++
         if (mutable.value.selected == null) return
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
@@ -699,6 +702,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val selection = selectionParams()
         params.put("selection", selection.get("selection")).put("guard", selection.get("guard"))
             .put("text", text).put("delivery", state.delivery)
+        val ownerSelection = attachmentSelection
         val gen = generation
         val scope = RequestScope(gen, sessionId = session.id)
         val key = outgoingKey(session.id)
@@ -746,7 +750,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 if (scope.appliesToSession(generation, mutable.value.selected?.id))
                     mutable.update { state -> state.copy(
                         attachments = state.attachments.filterNot { a -> attachments.any { b -> b.id == a.id } },
-                        attachmentsBusy = false) }
+                        attachmentsBusy = if (ownerSelection == attachmentSelection) false else state.attachmentsBusy) }
                 // Refresh only while the sending session is still the current one on the
                 // current connection; a stale read must not report errors into a new session.
                 if (scope.appliesToSession(generation, mutable.value.selected?.id)) read(session)
@@ -781,32 +785,37 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             // Compare the captured scope against the CURRENT generation: a reconnect must
             // detach this request's finally from the new connection's state.
             if (scope.appliesToSession(generation, mutable.value.selected?.id))
-                mutable.update { it.copy(sending = false, attachmentsBusy = false) }
+                mutable.update { it.copy(sending = false, attachmentsBusy = if (ownerSelection == attachmentSelection) false else it.attachmentsBusy) }
         }
     }
 
     // ---- Image attachments (task 2026-11-03-image-attachments) ----
 
     private val imageProcessor by lazy { ImageProcessor(app) }
+    private var attachmentSelection = 0L
     private val attachmentSerial = java.util.concurrent.atomic.AtomicLong(0)
     /** attachmentId -> committed upstream ref, valid for this connection scope only. */
     private val attachmentRefs = LinkedHashMap<String, String>()
     private val attachmentUploading = HashSet<String>()
     private var attachmentsEnabled = false
 
-    fun addAttachment(uri: Uri, displayName: String, mime: String?) {
+    fun attachmentScope(): String = "${generation}:${attachmentSelection}:${mutable.value.selected?.id}"
+
+    fun addAttachment(uri: Uri, displayName: String, mime: String?, scope: String = attachmentScope()) {
+        if (scope != attachmentScope()) return
         if (mutable.value.attachmentsBusy) return
         check(mutable.value.attachments.size < ImagePolicy.MESSAGE_MAX) { "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片" }
         // Scope-bound pick: late results after a session switch or reconnect are dropped.
         val generation = generation
+        val selection = attachmentSelection
         val sessionId = mutable.value.selected?.id ?: return
         val serial = attachmentSerial.incrementAndGet()
         mutable.update { it.copy(attachmentsBusy = true, error = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            val processed = imageProcessor.process(uri, displayName, mime)
+        viewModelScope.launch {
+            val processed = withContext(Dispatchers.IO) { imageProcessor.process(uri, displayName, mime) }
             if (attachmentSerial.get() != serial) return@launch
             mutable.update { state ->
-                if (generation != this@ZcodeViewModel.generation || state.selected?.id != sessionId)
+                if (generation != this@ZcodeViewModel.generation || selection != attachmentSelection || state.selected?.id != sessionId)
                     state.copy(attachmentsBusy = false)
                 else {
                     val value = processed.getOrElse { e ->
@@ -830,8 +839,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
      *  Serial by design; any failure keeps the batch (uploaded refs stay reusable). */
     private suspend fun uploadAttachments(session: ZSession) {
         val startGeneration = generation
+        val selection = attachmentSelection
         val connection = client()
-        fun stillValid() = startGeneration == generation &&
+        fun stillValid() = startGeneration == generation && selection == attachmentSelection &&
             mutable.value.selected?.id == session.id
         val pending = mutable.value.attachments.filter { it.id !in attachmentRefs }
         for (attachment in pending) {
@@ -860,7 +870,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                     attachmentRefs[attachment.id] = begin.string("ref")
                 }
             } finally {
-                if (startGeneration == generation) attachmentUploading.remove(attachment.id)
+                if (!stillValid()) withContext(NonCancellable) {
+                    // Abort only this old transaction on its captured connection.
+                    runCatching { withTimeout(3000) { connection.call("session/attachment/abort",
+                        obj("uploadId" to "upl-${attachment.id}"), timeout = 2500) } }
+                }
+                attachmentUploading.remove(attachment.id)
             }
         }
     }

@@ -780,8 +780,11 @@ class Bridge:
 
     def attachment_push_upstream(self, txn, size):
         index = txn.upstream_flushed // ATTACHMENT_UPSTREAM_CHUNK
-        self.agent('attachmentChunkV4', dict(self.attachment_upstream_target(txn), uploadId=txn.upload_id,
+        ack = self.agent('attachmentChunkV4', dict(self.attachment_upstream_target(txn), uploadId=txn.upload_id,
             chunkIndex=index, dataBase64=base64.b64encode(bytes(txn.buffer[:size])).decode('ascii')))
+        if type(ack.get('nextChunkIndex')) is not int or ack['nextChunkIndex'] != index + 1:
+            txn.pending_upstream = True
+            raise RequestError('上游块回执异常，请重试核对进度')
         del txn.buffer[:size]
         txn.upstream_flushed += size
 
@@ -795,6 +798,7 @@ class Bridge:
         official_next = result.get('nextChunkIndex')
         if type(official_next) is not int or official_next < 0:
             raise RequestError('无法核对上传进度，请重试')
+        require(official_next <= -(-txn.total_bytes // ATTACHMENT_UPSTREAM_CHUNK), '上游进度超出块数')
         expected = min(official_next * ATTACHMENT_UPSTREAM_CHUNK, txn.total_bytes)
         require(expected <= txn.received, '上游进度与已传数据不符，请重新上传')
         if expected > txn.upstream_flushed:
@@ -880,6 +884,11 @@ class Bridge:
             txn.last_used = time.time()
             if txn.committing:
                 return self.attachment_resolve_committing(txn)
+            if txn.pending_upstream:
+                committed = self.attachment_resync(txn)
+                if committed:
+                    return self.attachment_adopt_committed(txn, committed['ref'])
+                self.attachment_flush(txn)
             if not txn.begun:
                 result = self.attachment_upstream_begin(txn)
                 if result.get('state') == 'committed':
@@ -917,7 +926,7 @@ class Bridge:
             if txn.pending_upstream:
                 committed = self.attachment_resync(txn)
                 if committed:
-                    return committed
+                    return self.attachment_adopt_committed(txn, committed['ref'])
             self.attachment_flush(txn)
             return {'uploadId': txn.upload_id, 'nextChunkIndex': txn.next_index}
         require(index == txn.next_index, '块序号越序，请按顺序重传')
@@ -951,7 +960,7 @@ class Bridge:
             # already hold everything, or even have committed) before flushing the rest.
             committed = self.attachment_resync(txn)
             if committed:
-                return committed
+                return self.attachment_adopt_committed(txn, committed['ref'])
         if 'sha256:' + txn.hasher.hexdigest() != txn.checksum:
             # Checksum mismatch: the upload is cancelled outright, never committed.
             self.attachments.pop(upload_id, None)
@@ -1184,6 +1193,8 @@ def main():
     finally:
         # SSH EOF / normal termination releases native subscriptions explicitly.
         if bridge:
+            for txn in list(bridge.attachments.values()):
+                bridge.attachment_upstream_abort(txn)
             try:
                 bridge.indexes.pause()
             except Exception:

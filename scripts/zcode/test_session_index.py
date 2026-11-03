@@ -101,6 +101,7 @@ class IndexTests(unittest.TestCase):
     def test_stdin_eof_releases_subscriptions_before_closing_proxy(self):
         import bridge as module
         client, adapter, stdin = Mock(), Mock(), Mock()
+        adapter.attachments = {}
         stdin.buffer.readline.return_value = b''
         order = Mock(); order.attach_mock(adapter.indexes.pause, 'pause'); order.attach_mock(client.close, 'close')
         with patch.object(module, 'Client', return_value=client), patch.object(module, 'Bridge', return_value=adapter), patch.object(module.sys, 'stdin', stdin):

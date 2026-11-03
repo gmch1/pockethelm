@@ -186,6 +186,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun disconnect(reason: String = "已断开 · 执行保留在开发机") {
         epoch++
+        attachmentSerial.incrementAndGet()
         backgroundJob?.cancel(); backgroundJob = null; statusJob?.cancel()
         connectionJob?.cancel(); connectionJob = null; refreshJob?.cancel()
         resumeJob?.cancel(); resumeJob = null
@@ -708,7 +709,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     /** Picks one image, decodes/normalizes it off the main thread, appends to the batch.
      *  The pick is bound to its scope: a late result after a session switch, reconnect or
      *  another pick is dropped, never appended into whatever is on screen now. */
-    fun addAttachment(uri: Uri, displayName: String, mime: String?) {
+    fun attachmentScope(): String = "${epoch}:${selectionVersion}:${mutable.value.selected?.id}"
+
+    fun addAttachment(uri: Uri, displayName: String, mime: String?, scope: String = attachmentScope()) {
+        if (scope != attachmentScope()) return
         if (mutable.value.attachmentsBusy) return
         check(mutable.value.attachments.size < ImagePolicy.MESSAGE_MAX) { "一条消息最多 ${ImagePolicy.MESSAGE_MAX} 张图片" }
         val generation = epoch
@@ -716,8 +720,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val sessionId = mutable.value.selected?.id ?: return
         val serial = attachmentSerial.incrementAndGet()
         mutable.update { it.copy(attachmentsBusy = true, error = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            val processed = imageProcessor.process(uri, displayName, mime)
+        viewModelScope.launch {
+            val processed = withContext(Dispatchers.IO) { imageProcessor.process(uri, displayName, mime) }
             // Only this pick may clear its own busy flag (the entry gate rejects parallel
             // picks), but appending additionally requires the original scope.
             if (attachmentSerial.get() != serial) return@launch
@@ -745,27 +749,42 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         if (id in protectedIds) return@action
         val path = writtenFiles.remove(id)
         if (path != null && mutable.value.connected) {
-            try { client().call("fs/remove", obj("path" to path)) }
+            val cleanupKey = "attachment-cleanup:${mutable.value.profile.identity}"
+            recordAttachmentCleanup(cleanupKey, path, true)
+            try { client().call("fs/remove", obj("path" to path)); recordAttachmentCleanup(cleanupKey, path, false) }
             catch (e: CancellationException) { throw e }
             catch (_: Exception) { /* Cleanup is best-effort; the file sits in /tmp. */ }
         }
     }
 
+    // Only exact, definitely-unsent paths enter this metadata-only cleanup journal.
+    private fun recordAttachmentCleanup(key: String, path: String, add: Boolean) {
+        val paths = runCatching { JSONArray(vault.get(key) ?: "[]") }.getOrDefault(JSONArray())
+        val values = (0 until paths.length()).map { paths.getString(it) }.toMutableSet()
+        if (add) values.add(path) else values.remove(path)
+        vault.put(key, JSONArray(values.toList()).toString())
+    }
+
     /** Drops the in-memory attachment batch on scope switches; unsent written files are
      *  removed exactly, dispatched/protected ones keep their files for the server. */
     private fun discardAttachmentDraft(@Suppress("UNUSED_PARAMETER") reason: String) {
+        attachmentSerial.incrementAndGet()
         val doomed = writtenFiles.filterKeys { it !in protectedIds }
         writtenFiles.keys.removeAll { it !in protectedIds }
         mutable.update { it.copy(attachments = emptyList(), attachmentsBusy = false) }
         if (doomed.isEmpty() || !mutable.value.connected) return
-        val generation = epoch
+        val connection = client()
+        val cleanupKey = "attachment-cleanup:${mutable.value.profile.identity}"
         viewModelScope.launch {
             try {
-                val connection = client()
-                doomed.values.forEach { path -> connection.call("fs/remove", obj("path" to path)) }
+                doomed.values.forEach { recordAttachmentCleanup(cleanupKey, it, true) }
+                doomed.values.forEach { path ->
+                    connection.call("fs/remove", obj("path" to path))
+                    recordAttachmentCleanup(cleanupKey, path, false)
+                }
             } catch (e: CancellationException) { throw e }
             catch (_: Exception) { /* Best-effort cleanup of unsent files. */ }
-            finally { if (generation != epoch) return@launch }
+
         }
     }
 
@@ -859,7 +878,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             if (generation == epoch && mutable.value.selected?.id == selected.id)
                 mutable.update { it.copy(draft = if (clearDraft) "" else it.draft, uncertain = null,
                     attachments = it.attachments.filterNot { a -> a.id in attachments.map { b -> b.id } },
-                    attachmentsBusy = false) }
+                    attachmentsBusy = if (selection == selectionVersion) false else it.attachmentsBusy) }
         } catch (e: RpcException) {
             // An explicit server rejection is authoritative: 发送失败, draft kept. Before the
             // write this also means nothing was sent; afterwards the server answered for the write.
@@ -890,7 +909,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // see the settled state; a different session's flag is untouched.
             if (epoch == generation && mutable.value.profile.identity == env &&
                 mutable.value.selected?.id == selected.id)
-                mutable.update { it.copy(sending = false, attachmentsBusy = false) }
+                mutable.update { it.copy(sending = false, attachmentsBusy = if (selection == selectionVersion) false else it.attachmentsBusy) }
         }
         // Refresh boundary: after the ack was accepted, a failing history read must never
         // turn the already-accepted message into 发送失败/待确认 — it surfaces as historyError.

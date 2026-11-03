@@ -327,7 +327,7 @@ class BridgeTests(unittest.TestCase):
         import hashlib as h
         bridge, client = self.attachment_bridge()
         client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
-            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://u1'} if m == 'attachmentCommitV4' else {}))
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://u1'} if m == 'attachmentCommitV4' else {'nextChunkIndex': a[0].get('chunkIndex', 0) + 1}))
         # 5 phone chunks = 480KiB: upstream must see one full 384KiB block plus a 96KiB tail,
         # and official begin sees the UPSTREAM chunk count (2), never the phone count (5).
         data = bytes(range(256)) * (480 * 1024 // 256)
@@ -351,7 +351,7 @@ class BridgeTests(unittest.TestCase):
         # totalBytes < 384KiB: nothing flushes until commit pushes one partial upstream chunk.
         bridge, client = self.attachment_bridge()
         client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
-            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r'} if m == 'attachmentCommitV4' else {}))
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r'} if m == 'attachmentCommitV4' else {'nextChunkIndex': a[0].get('chunkIndex', 0) + 1}))
         data = b'x' * 1000
         begin, commit = self.full_upload(bridge, data)
         self.assertEqual(begin['nextChunkIndex'], 0)
@@ -363,7 +363,7 @@ class BridgeTests(unittest.TestCase):
     def test_attachment_idempotent_retry_and_mismatch_rejection(self):
         bridge, client = self.attachment_bridge()
         client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
-            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r'} if m == 'attachmentCommitV4' else {}))
+            if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r'} if m == 'attachmentCommitV4' else {'nextChunkIndex': a[0].get('chunkIndex', 0) + 1}))
         data = b'a' * (2 * 96 * 1024 + 10)  # 3 phone chunks
         bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='u',
             fileName='p.jpg', mime='image/jpeg', totalBytes=len(data), totalChunks=3,
@@ -426,7 +426,7 @@ class BridgeTests(unittest.TestCase):
         bridge, client = self.attachment_bridge()
         client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
             if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r1'}
-            if m == 'attachmentCommitV4' else {'commandId': 'c', 'status': 'accepted'}))
+            if m == 'attachmentCommitV4' else {'commandId': 'c', 'status': 'accepted', 'nextChunkIndex': a[0].get('chunkIndex', 0) + 1}))
         data = b'd' * 300
         self.full_upload(bridge, data)
         bridge.check_selection = Mock(return_value={'providerId': 'p', 'modelId': 'm'})
@@ -471,7 +471,7 @@ class BridgeTests(unittest.TestCase):
                 state['commit_failed'] = True
                 from wire import WireError
                 raise WireError('lost')
-            return {}
+            return {'nextChunkIndex': args[0].get('chunkIndex', 0) + 1}
 
         client.call = Mock(side_effect=upstream)
         bridge.dispatch('session/attachment/begin', dict(self.UPLOAD_TARGET, uploadId='upload-1',
@@ -485,6 +485,50 @@ class BridgeTests(unittest.TestCase):
         retry = bridge.dispatch('session/attachment/commit', {'uploadId': 'upload-1'})
         self.assertEqual(retry['state'], 'committed')
         self.assertEqual(retry['ref'], 'zcode-artifact://recovered')
+
+    def test_phone_retry_begin_recovers_unconfirmed_full_block(self):
+        from wire import WireError
+        for received in (False, True):
+            with self.subTest(server_received=received):
+                bridge, client = self.attachment_bridge()
+                state = {'failed': False, 'next': 0}
+                def upstream(ch, method, args):
+                    if method == 'attachmentBeginV4':
+                        return {'state': 'staging', 'nextChunkIndex': state['next']}
+                    if method == 'attachmentChunkV4':
+                        if not state['failed']:
+                            state['failed'] = True
+                            if received: state['next'] = 1
+                            raise WireError('lost')
+                        self.assertEqual(args[0]['chunkIndex'], state['next'])
+                        state['next'] += 1
+                        return {'nextChunkIndex': state['next']}
+                    return {'ref': 'zcode-artifact://retry'}
+                client.call = Mock(side_effect=upstream)
+                data = b'x' * (5 * 96 * 1024)
+                params = dict(self.UPLOAD_TARGET, uploadId='retry', fileName='p.jpg', mime='image/jpeg',
+                    totalBytes=len(data), totalChunks=5, checksum='sha256:' + __import__('hashlib').sha256(data).hexdigest())
+                bridge.attachment_begin(params)
+                def send(index):
+                    return bridge.attachment_chunk(dict(uploadId='retry', chunkIndex=index,
+                        dataBase64=base64.b64encode(data[index*96*1024:(index+1)*96*1024]).decode()))
+                for index in range(3): send(index)
+                with self.assertRaises(RequestError): send(3)
+                # Exact App retry: begin -> next reported phone index, never manual rewind.
+                index = bridge.attachment_begin(params)['nextChunkIndex']
+                self.assertEqual(index, 4)
+                send(index)
+                self.assertEqual(bridge.attachment_commit({'uploadId': 'retry'})['state'], 'committed')
+
+    def test_bad_upstream_ack_does_not_advance_or_release_buffer(self):
+        bridge, client = self.attachment_bridge()
+        client.call = Mock(return_value={'state': 'staging', 'nextChunkIndex': 0})
+        data = b'x' * (4 * 96 * 1024)
+        with self.assertRaises(RequestError): self.full_upload(bridge, data)
+        txn = bridge.attachments['upload-1']
+        self.assertEqual(txn.upstream_flushed, 0)
+        self.assertEqual(len(txn.buffer), len(data))
+        self.assertTrue(txn.pending_upstream)
 
     def test_attachment_abort_and_transaction_limits(self):
         import hashlib as h
@@ -520,7 +564,7 @@ class BridgeTests(unittest.TestCase):
                 if state['fail_push']:
                     raise WireError('upstream down')
                 state['official_next'] = args[0].get('chunkIndex', 0) + 1
-                return {}
+                return {'nextChunkIndex': state['official_next']}
             if method == 'attachmentCommitV4':
                 return {'ref': 'zcode-artifact://after-retry'}
             return {}
@@ -574,7 +618,7 @@ class BridgeTests(unittest.TestCase):
         bridge, client = self.attachment_bridge()
         client.call = Mock(side_effect=lambda ch, m, a: {'state': 'staging', 'nextChunkIndex': 0}
             if m == 'attachmentBeginV4' else ({'ref': 'zcode-artifact://r9'}
-            if m == 'attachmentCommitV4' else {}))
+            if m == 'attachmentCommitV4' else {'nextChunkIndex': a[0].get('chunkIndex', 0) + 1}))
         data = b'abc'
         good = dict(self.UPLOAD_TARGET, uploadId='dup', fileName='photo.jpg', mime='image/jpeg',
             totalBytes=3, totalChunks=1, checksum='sha256:' + h.sha256(data).hexdigest())

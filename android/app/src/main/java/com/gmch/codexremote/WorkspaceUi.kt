@@ -1,5 +1,6 @@
 package com.gmch.codexremote
 
+import kotlinx.coroutines.launch
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -362,6 +363,27 @@ private fun SheetOption(selected: Boolean, onClick: () -> Unit, content: @Compos
         content()
         if (selected) Icon(Icons.Outlined.Check, "已选中", Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
     }
+}
+
+/** Captures the scope at launch, before Android may pause/recreate the picker UI. */
+@Composable
+internal fun rememberAttachmentPicker(scope: () -> String,
+    picked: (android.net.Uri, String, String?, String) -> Unit): () -> Unit {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val processor = remember(context) { ImageProcessor(context) }
+    val jobs = rememberCoroutineScope()
+    var pendingScope by rememberSaveable { mutableStateOf<String?>(null) }
+    val launcher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()) { uri ->
+        val token = pendingScope
+        pendingScope = null
+        if (uri != null && token != null) jobs.launch {
+            val info = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { processor.sourceInfo(uri) }
+            picked(uri, info.first, info.second, token)
+        }
+    }
+    return { pendingScope = scope(); launcher.launch(androidx.activity.result.PickVisualMediaRequest(
+        androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly)) }
 }
 
 @Composable

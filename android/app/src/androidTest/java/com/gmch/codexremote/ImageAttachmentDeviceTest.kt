@@ -157,15 +157,20 @@ class ImageAttachmentDeviceTest {
         bridge.scripted["thread/queue/list"] = { obj("data" to org.json.JSONArray()) }
         bridge.scripted["thread/items/list"] = { obj("data" to org.json.JSONArray(), "nextCursor" to "") }
         bridge.install()
-        instrumentation.runOnMainSync { vm.send(false) }
+        lateinit var sendJob: kotlinx.coroutines.Job
+        instrumentation.runOnMainSync { sendJob = vm.send(false) }
         withTimeout(10_000) { while (sent.get() == 0) delay(20) }
-        // Dispatch parked in turn/start (receipt unknown): removing the image clears the
-        // draft chip but must NEVER delete the file the server may already reference.
-        instrumentation.runOnMainSync { runCatching { vm.removeAttachment(attachment.id) } }
-        delay(300)
-        assertEquals("结果未知时不得删除图片文件", 0, removes.get())
+        // Cancel the waiting call after dispatch: real unknown outcome, no successful ack.
+        sendJob.cancel(); sendJob.join()
+        assertFalse(vm.state.value.sending)
+        assertNotNull(vm.state.value.uncertain)
         gate.countDown()
-        withTimeout(10_000) { while (vm.state.value.sending) delay(20) }
+        lateinit var removeJob: kotlinx.coroutines.Job
+        instrumentation.runOnMainSync { removeJob = vm.removeAttachment(attachment.id) }
+        removeJob.join() // The action actually executes after the send released its mutex.
+        assertTrue(vm.state.value.attachments.isEmpty())
+        assertNotNull(vm.state.value.uncertain)
+        assertEquals("结果未知时不得删除图片文件", 0, removes.get())
         instrumentation.runOnMainSync { vm.background(); vm.viewModelScope.cancel() }
         bridge.close(); bridge.assertClean()
     }
@@ -221,6 +226,48 @@ class ImageAttachmentDeviceTest {
         assertFalse(vm.state.value.attachmentsBusy)
         instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
         bridge.close()
+    }
+
+    @Test fun zcodeReturnToSameSessionInvalidatesPickerAndUpload() = runBlocking {
+        val app = TestPrefsApp(UUID.randomUUID().toString()); app.attach(instrumentation.targetContext)
+        cleaners += { instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault") }
+        lateinit var vm: ZcodeViewModel
+        instrumentation.runOnMainSync { vm = ZcodeViewModel(app) }
+        val state = ZcodeViewModel::class.java.getDeclaredField("mutable").let {
+            it.isAccessible = true; it.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState> }
+        val attachment = ChatAttachment.new(ByteArray(4096) { 5 }, "A.jpg")
+        state.value = zSessionState(listOf(attachment))
+        val session = state.value.selected!!
+        val token = vm.attachmentScope()
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val gate = java.util.concurrent.CountDownLatch(1)
+        val sends = java.util.concurrent.atomic.AtomicInteger()
+        val aborts = java.util.concurrent.atomic.AtomicInteger()
+        val bridge = FakeRpcBridge(vm)
+        bridge.scripted["session/attachment/begin"] = {
+            entered.countDown(); gate.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            obj("state" to "committed", "ref" to "zcode-artifact://old") }
+        bridge.scripted["session/attachment/abort"] = { aborts.incrementAndGet(); obj("state" to "committed") }
+        bridge.scripted["session/send"] = { sends.incrementAndGet(); obj() }
+        bridge.install()
+        lateinit var job: kotlinx.coroutines.Job
+        instrumentation.runOnMainSync { job = vm.send() }
+        assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        val select = ZcodeViewModel::class.java.getDeclaredMethod("select", ZSession::class.java).apply { isAccessible = true }
+        instrumentation.runOnMainSync {
+            select.invoke(vm, session.copy(id = "B")); select.invoke(vm, session)
+            // A Picker result launched before A -> B -> A must be ignored before decoding.
+            vm.addAttachment(Uri.parse("content://invalid/late"), "late.jpg", "image/jpeg", token)
+        }
+        assertFalse(vm.state.value.attachmentsBusy)
+        assertTrue(vm.state.value.attachments.isEmpty())
+        gate.countDown(); withTimeout(10_000) { job.join() }
+        assertEquals(0, sends.get()); assertEquals(1, aborts.get())
+        val refs = ZcodeViewModel::class.java.getDeclaredField("attachmentRefs").let {
+            it.isAccessible = true; it.get(vm) as Map<*, *> }
+        assertTrue(refs.isEmpty())
+        instrumentation.runOnMainSync { vm.viewModelScope.cancel() }
+        bridge.close(); bridge.assertClean()
     }
 
     @Test fun zcodeSendRefusedWhileAttachmentsProcessing() = runBlocking {

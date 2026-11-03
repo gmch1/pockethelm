@@ -183,3 +183,5 @@ ZCode 通过原 App 更新提供，保留包名 `com.gmch.codexremote`、签名�
 桥接器测试：`python3 -m unittest discover -s scripts/zcode -p 'test_*.py' -v`。新增测试覆盖二进制帧、分片校验、计划指纹变化、拒绝隐式 provider 映射、接口白名单和内容投影，以及交互投影（身份保真、超限整条降级、存在性核对、autoResolution）、`session/interact` 应答白名单（含官方 content 结构校验）、snooze 封装和 `capabilities` 兼容协商（`bridgeVersion` 保持 1）。实际验证包含默认 Full access、运行中断开/重连、按 command ID 查询、GLM 模型切换、原生队列、带执行身份的停止和交互应答。Android 实机通过原有跳板完成独立扫码配对、读取会话/额度、交互应答和重连；其他账号和版本需要另测。Codex 审批链路另有 `python3 scripts/probe.py --run-approval` 真实 app-server 冒烟：验证审批请求形态、晚接入客户端接手与应答生效。
 
 可选实机测试通过 `-PpockethelmTestBuildType=release :app:assembleReleaseAndroidTest` 构建，仅在专用测试安装的私有目录放入短期 `pairing-qr.png` 和自己的 `zcode-test-target.json` 后运行 `ZcodeDeviceIntegrationTest`。测试包不发布。二维码图片导入增加纯二维码解码回退，覆盖某些高密度图像定位失败的情况。
+
+图片真实模型 smoke 使用 `scripts/image_e2e.py`，必须显式传入引擎、`--model`、ZCode 的 `--provider` 和 `--cost-evidence` 私有 JSON（字段见脚本 `--help`）；先核实视觉能力及最低适用费用。ZCode 合成 JPEG 生成需要 Pillow，建议装在仓库外 venv。脚本会确认回合停止后归档 Codex / 原生删除 ZCode 测试会话；ZCode 首条带 `[测试]` 的图片消息持久化后立即原生改名并读回确认；命名失败不会重发消息，仍进入停止与清理。确认停止后，Codex 即使归档失败也会继续精确删图并汇总错误；无法确认停止时保留文件。

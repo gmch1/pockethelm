@@ -111,21 +111,14 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
                     ZcodeTimeline(state, vm, Modifier.weight(1f), vm::history, vm::retryLoad) { a, b -> detail = a to b }
                     ChatSettingsBar(zcodeSettingsSummary(state), state.quotaSummary,
                         { showSettings = true }, { showSettings = true; vm.quota() })
-                    val app = androidx.compose.ui.platform.LocalContext.current.applicationContext as android.app.Application
-                    val processor = remember(app) { ImageProcessor(app) }
-                    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-                        if (uri != null) {
-                            val (name, mime) = processor.sourceInfo(uri)
-                            vm.addAttachment(uri, name, mime)
-                        }
-                    }
+                    val pickImage = rememberAttachmentPicker(vm::attachmentScope, vm::addAttachment)
                     ChatComposer(state.draft, vm::draft, state.sending,
                         state.connected && !state.busy && !state.pending && !state.sending && !state.attachmentsBusy && (state.draft.isNotBlank() || state.attachments.isNotEmpty()) && state.selection != null,
                         state.delivery == "guide", { vm.delivery(if (it) "guide" else "queue") }, vm::send,
                         attachments = state.attachments, attachmentsBusy = state.attachmentsBusy,
                         canAttach = state.attachmentsEnabled && !state.attachmentsBusy
                             && state.attachments.size < ImagePolicy.MESSAGE_MAX && !state.sending && !state.busy,
-                        attach = { pickImage.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                        attach = pickImage,
                         removeAttachment = vm::removeAttachment)
                     if (showSettings) ModalBottomSheet(onDismissRequest = { showSettings = false },
                         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {

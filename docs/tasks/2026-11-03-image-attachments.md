@@ -1,6 +1,6 @@
 # 图片附件发送：Codex 与 ZCode 双端支持
 
-状态：review 未通过，待修复
+状态：最终 review 通过，未提交或发布
 
 执行约定：当前 Codex 直接负责实现、测试、review 和交付。下文 ZCode 指目标引擎，不代表委派执行；未经用户明确要求不启动其他 AI。
 
@@ -185,7 +185,7 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 
 ## Review 由 Codex 维护问题和结论
 
-整体结论：Codex 对 d66601d 的实现 review 未通过，见 IMG-C1…C8。前述实现者自查记录保留为历史陈述，不视为 review 已确认；方案项 IMG-R1…R7 尚不能全部关闭。
+整体结论：历史两轮 review 问题见下；最新结论以“Codex 直接修复与验证”一节为准。前述实现者自查保留为历史陈述，不替代本轮实际证据。
 
 | 编号 | 原方案问题 | 修订及后续验收 |
 | --- | --- | --- |
@@ -232,6 +232,73 @@ Codex 直接完成：协议待核验项 → ZCode 桥接器与 Python 测试 →
 合并后全量重验：Python 62 项通过（含背压/resync、committed 元数据 2 项新增）；JVM 114 项通过；真机 androidTest 104 项（含 4 项新增 C 场景）+ ReadingUi 两项分次 OK；双端真实读图 e2e 复跑通过（Codex「上=红色，下=蓝色」+ CLEANUP 输出；ZCode 两段上传 + GLM-5.3-Flash 同色回复 + session 停止）；部署 bridge 后真链路冒烟 capabilities 含 attachments。
 
 本轮实际检查：Python `unittest discover -s scripts/zcode -p 'test_*.py'` 59 项通过；bridge 单文件 47 项通过；两个只用 Mock 的补充探针复现 IMG-C5/C6；diff 空白检查通过。没有重跑 Android 构建/真机或调用真实模型，产品逻辑已发现阻塞问题，不以旧自查通过记录替代本次结论。原自查未提供最终 APK/source hash 与可定位日志，尚不能独立确认所有数量和清理陈述。
+
+### Codex 二次复查（2026-11-03，78a8867）
+
+结论：仍未通过。检查 153394b 与合并结果 2838c40；本轮仅修改 review 记录，没有部署、发布或真实模型调用。
+
+- **IMG-C1 / IMG-C3：部分修复，仍开放（P1）。** Codex 的 selectionVersion 核验及切换清态已补入；ZCode `addAttachment`（797–819）和 `uploadAttachments.stillValid`（831–835）仅比较 generation + sessionId，select/back 不递增选择代次，也不使 attachmentSerial 失效。A 的处理/上传挂起期间 A→B→A，旧任务重新通过检查，可追加旧附件、登记旧 ref 并继续发送。须为每次 select/back 增加代次，贯穿处理和上传，新增确定性 A→B→A 测试。双端 Picker 仍在结果回调内才调用 addAttachment 捕获作用域；需要在 launch 时保存 token，断线/重连后到达的 Picker 回调不能被当成新连接的新选择。上传取消/切换还没有发 abort，需补齐未提交事务释放。
+- **IMG-C2：产品保护修复有效，验证未关闭。** protectedIds 已在 dispatch 前登记，移除不再删可能被引用的文件。但新测试 `codexDispatchedAttachmentNeverRemovedEvenWithLostReceipt` 在 send 持有 actions mutex 时调用同样经 action 加锁的 removeAttachment；断言发生时移除协程尚未执行。随后放行的是成功回执，并非超时/丢回执。因此旧实现也可通过此测试，不能证明回归被覆盖。应令发送以真正的未知结果结束、锁释放后执行移除，并断言 chip 已移除、pending 仍在、fs/remove 为 0。删除失败清理记录仍被丢弃，需补上记录/明确残留。
+- **IMG-C4：本项代码复查通过。** 双端 UI 与 ViewModel 均检查 attachmentsBusy，成功按附件 ID 清理批次。该结论不包含 IMG-C1/C3 的旧回调问题。
+- **IMG-C5：仍开放（P1，可复现的 App 重试卡死）。** bridge 有 pending_upstream 时要求重复上一手机块才能 resync，但 begin 仍返回已经递增的 txn.next_index；App 在 ZcodeViewModel.kt:846 直接从该索引续传。以 5×96KiB 数据、上游第一个 384KiB 块首次失败模拟：第 4 个手机块报错后 next_index=4，App 重试 begin→chunk(4) 连续两次得到“上一块尚未确认，请重传上一块”，永远无法进入重复块 resync 分支。单测手动重复旧块并不等价于 App 的重试方式。应在 begin 处理 pending_upstream/恢复 flush，或明确协议返回待重试索引并修改客户端；覆盖实际 App begin→chunk→失败→重新发送全链路，确保恢复且不重复 send。另 `attachment_push_upstream` 仍忽略 ack.nextChunkIndex，异常 ack 的验收尚未落实。
+- **IMG-C6：本项代码与测试复查通过。** committed 映射保留 checksum，同目标同 ID 的重试比较文件名/MIME/bytes/phoneChunks/checksum；新增字段变更测试通过。
+- **IMG-C7：源码基线问题关闭。** HEAD 已包含 8aa8629 祖先，合并保留图片文本及失败行锚点；guard/下拉刷新/失败移除改动在基线中。文档“versionCode 仍为 26”不准确，实际 build.gradle 为 0.4.18/28；正式发布须递增并验证最终产物，不能用当前版本覆盖商店条目。
+- **IMG-C8：仍开放。** scripts/image_e2e.py 的 ZCode stop 仍在成功路径（178–181），断言失败/超时直接进 finally 关闭 bridge，不保证回合停止；成功 stop 后也未查询确认停止。Codex interrupt 同样未确认终态。模型仍是 Codex 默认及 ZCode 第一个 provider/Flash 名称选择，没有费用核实依据；提示词标注不能替代会话命名。桥接器不暴露删除，不等于原生引擎没有删除，需核实原生清理入口并清理先前测试会话。修复记录明确再次将 AppOps 还原并回读为 ignore，与持续授权基线相反，不能作为修复完成证据。需用全局入口恢复并实测权限基线；补齐 Picker 真机 UI、最终 APK/source hash 与证据定位，不以“留待日常使用”替代验收。
+
+本轮实际验证：Python `unittest discover -s scripts/zcode -p 'test_*.py'` 62 项通过；补充离线 Mock 探针按 App 实际重试路径连续复现两次 IMG-C5；`git merge-base --is-ancestor 8aa8629 HEAD` 与 diff 检查通过。未重跑 Android/真机，未花费模型 token；新增真机测试的缺陷来自逐行审查，未宣称本轮实际运行。修复记录中的全量通过数仍属于实现者报告。
+
+### Codex 直接修复与验证（2026-11-03，78a8867 + 工作区修改）
+
+用户要求当前 Codex 直接修复；没有启动其他 AI。以下为实际完成结果，覆盖前两次 review 的开放项。
+
+- **IMG-C1/C3 关闭**：ZCode 增加每次 select/back 的选择代次；切换/断开使处理序号失效，避免 A→B→A 复活旧工作。两引擎共享 `rememberAttachmentPicker`，在 launch 时保存作用域 token，返回后核验；URI 元数据/解码在后台执行，作用域检查及 state 更新回到主线程。ZCode 每个上传挂起点核验代次和连接，失效后在原连接限时尽力 abort；bridge EOF 也 abort 未完成事务。旧发送完成时不清除新选择代次的附件 busy 状态。真机确定性测试阻塞 begin 后 A→B→A，旧 Picker token 被拒、无 send/ref 污染且发出 abort。
+- **IMG-C2 关闭**：保留 dispatch 前的 protectedIds 保护；未知回执测试改为真正取消已经 dispatch 的等待，等待发送协程退出及锁释放，再执行并等待 remove 完成，验证附件已移除、pending 保留、fs/remove 为 0。确定未发送的删除路径增加按开发机身份记录的 metadata-only 清理日志，失败保留精确路径；清理协程捕获原 RPC，避免切到另一开发机删除。日志不含图片字节；已发送/未知文件继续保留，不承诺自动回收。
+- **IMG-C4 关闭**：保留 UI/VM 双重处理期间禁发及按批次 ID 清空，真机回归通过。
+- **IMG-C5 关闭**：begin 若发现 pending_upstream，先查询官方进度并恢复 flush，再返回手机端 nextChunkIndex。手机无需特殊倒退，可按现有 begin→chunk 重试；chunk ack 需精确符合 nextChunkIndex，异常回执保持缓冲及未知状态。增加两种丢回执回归（服务端已收到/未收到）及异常 ack 保护。真实服务端用约 0.8MiB 合成 JPEG 跨上游块验证：第一个块官方确认后人为丢弃回执，App 相同重试顺序成功，无重复上游块，重复 begin/commit ref 稳定。未调用 session/send 或模型。
+- **IMG-C6/C7 关闭**：committed 元数据比较、已发布基线整合保持有效。当前测试包为 0.4.18/28，不是新商店发布；后续发布须递增版本并验证对应发行产物。
+- **IMG-C8 关闭本轮修复/验证项**：真实模型 smoke 脚本改为显式指定模型/来源及私有费用核实依据，不再猜默认或 Flash；ZCode 使用官方原生 deleteSession，停止后查询确认再删除并核验索引，Codex 确认终态再归档（明确不是删除）。失败路径通过 finally 执行清理，无法确认停止时不删除依赖文件，清理失败可见且失败退出；4 项无模型清理测试覆盖顺序和失败保护。此前两个 ZCode 图片 smoke 会话已确认结束并原生删除；两份遗留 Codex 合成图片在核实唯一归档会话和终态后精确删除。129 使用全局入口重新配置并验证 10021/10032 为 allow，清理未还原权限。
+
+实际验证与证据：
+
+- 签名 release/AndroidTest 构建、lintRelease、diff 检查通过。JVM **114 项：113 通过、1 可选 SSH 跳过**（不是“114 全通过”）；Python bridge **64 项**、e2e 清理 **4 项**通过。
+- 129 真机最终产物 **36 项**（系统 Photo Picker → 实际图片返回 → 共享 Composer chip → 移除；附件处理、未知回执、作用域、两引擎发送）通过；独立 UI 回归 **9 项**（下拉刷新、阅读/失败气泡等）通过，共 **45 项**。两次最终执行 OEM 确认弹窗均为 0；测试包已卸载，正常 App 数据保留。
+- 首轮组合运行出现两个失败：Picker 返回匿名名称使测试按原文件名断言失败，改为比对 MediaStore ID 后通过；已有下拉刷新测试组合运行未触发手势，独立 UI 回归通过，产品下拉刷新代码未修改。保留首次失败日志，不计入最终通过数。
+- 真实上传探针首次因私有环境缺 Pillow 未启动；随后空白 ZCode 会话原生 rename 被上游拒绝，失败会话均立即原生删除。本轮无模型上传探针记录该限制后完成上传并删除；正式模型 smoke 若命名失败会在模型请求前退出，不静默绕过。[测试] 文字命名未成功不记录为成功。
+- 本轮 **模型调用 0**；真实模型识图结果仅沿用旧实现记录，本轮验证的是修复后的系统选图、协议事务和状态保护，未重做“手机选图后真实模型回答”的单次端到端测试。Android 8 系统选择器回退未在实体旧系统验证；本轮实际设备为 Android 13。不把以上边界写成已测。
+- 私有证据：`~/.local/state/pockethelm/image-review-fix/`，含 build-final.log、instrument-verified.txt、instrument-ui-regression.txt、相应 device 日志、live-upload.json/log、旧会话/文件清理记录、verification.json、签名 APK。真实探针依赖 Pillow，安装于该私有目录 venv；不修改系统 Python。
+- APK SHA-256：`5dab01fbe33da181e46481b1e246120c602cac4d669d6e9de227e3ad2dfd88e8`；安装包核对一致，原签名验证通过。源码快照（排序所有已跟踪及新增 android/app/src、scripts、app/build.gradle.kts，以 path + NUL + bytes + NUL 累计）：`7e6a4cbb32fc6d48d73101ed08a957b67b6df97fd4ba19b3f69d05b63d6de8b0`。
+- bridge SHA-256：`89e3de5ad94b064f75bb03b4c7ad19b64c66236402c20b3223b454a776a3da98`；已部署至现有开发机入口，安装内容核对一致，保留原 Codex 路由。商店未更新，当前分支修改未提交。
+
+### 本批未提交修改的追加 review（2026-11-03）
+
+范围：78a8867 之后全部未提交代码、两个新增测试文件及验证证据。当前源码指纹仍与 45 项真机测试对应产物一致；本轮没有发现产品侧新的阻塞问题。**IMG-C8 重新开放**，此前“关闭本轮修复/验证项”的表述不包含以下遗漏，不能据此判整批完全通过。
+
+- **IMG-C8a / P2：ZCode 模型 smoke 无法到达上传与发送。** `scripts/image_e2e.py:146` 在新建空会话后无条件调用 renameSession，拒绝即退出。上一轮真实探针已经确认当前上游会拒绝此步骤；成功的上传探针使用的是仓库外脚本，捕获该异常后继续，并没有证明这里的正式 smoke 可用。安全失败不消耗 token 是正确的，但作为验收入口仍不可执行。修复须使用实际支持的测试命名时序/原生入口，保证会话可识别，且最终能执行上传和识图断言；命名失败和清理分支都需覆盖，不能只在私有脚本绕过。
+- **IMG-C8b / P2：已确认终态后归档失败会跳过图片清理。** `scripts/image_e2e.py:66` 的 archive 异常直接越过 68–69 的 fs/remove。空会话尚无 rollout，或会话已归档，均可能触发这一情况；即使 turns 已证明没有运行中回合，文件也会残留。本轮 Mock 复现 RPC 序列为 turns/list → turns/list → archive，未调用 fs/remove。应区分“无法确认停止”（保留文件）与“确认停止但归档失败”（继续精确删图并汇总归档错误），补充测试。不得吞掉真正的停止核验失败。
+
+验证边界：本轮仅核对已有源码/产物指纹并执行上述无模型探针，未重跑未变更的 Android 构建/真机套件；没有提交、部署或发布。
+
+### IMG-C8a/C8b 修复与复验（2026-11-03）
+
+- **IMG-C8a 关闭**：本地 ZCode 源码确认 createSession 创建 deferred 草稿，首条 sendText 才提升持久化；renameSession 需要更新持久化会话。正式 `scripts/image_e2e.py` 已改为上传 → 发送带 `[测试]` 标记的首条图片消息 → 检查 accepted → 原生 renameSession → session/read 读回精确标题 → 识图断言。不是捕获改名失败后跳过；改名失败仍抛错，外层 finally 停止/清理，绝不重发首条消息。测试覆盖正确顺序、拒绝发送不改名、改名失败不重发。
+- **真实正式脚本验证通过**：只发送一次短图片消息，使用 GLM-5.3-Flash / 当前唯一可执行的个人 Coding Plan；Start Plan 本轮不在 catalog。事前核对官方 Coding Plan 抵扣系数（Flash 输入/缓存/输出 2.3/0.56/8，另一个可用模型 GLM-5.3 为 6.9/1.7/24）、图片能力及本账户剩余额度，未仅凭名称猜费用。脚本输出 native title verified、model identified image、stopped and native deletion verified 三项成功；会话先有 `[测试]` 首条消息，随后原生命名，结束即删除。
+- **IMG-C8b 关闭**：停止核验仍是文件清理的前置门槛；门槛通过后 archive 与 fs/remove 独立执行，归档失败不再阻止删除已可安全清理的精确路径。两步错误统一报告并非零退出，不吞掉原始失败。测试覆盖空会话/已完成回合归档失败仍删图、两个清理步骤同时失败汇总、停止无法确认时不删图。
+- 本轮 Python 清理/时序测试 **9 项通过**，bridge **64 项通过**，diff 检查通过；Android 产品和测试代码未改，不重复构建或真机测试，沿用上轮 APK 与 45 项真机证据。本轮没有提交、重新部署 bridge 或更新商店。
+- 私有证据：`~/.local/state/pockethelm/image-smoke-followup/`，包含 cost-evidence.json、正式入口 live-smoke.log、verification.json。当前完整源码指纹 `bb1acca2b5b06037e9a4d4061319cb9562698f8d74c7aa11d2595988a5f37c29`（算法同上），上轮 APK hash 保持 `5dab01fbe33da181e46481b1e246120c602cac4d669d6e9de227e3ad2dfd88e8`。
+- 费用/能力核实来源：[官方 Coding Plan 套餐说明](https://docs.bigmodel.cn/cn/coding-plan/overview)、[官方 API 价格及输入模态](https://docs.bigmodel.cn/cn/guide/start/pricing)。本轮模型用户消息数为 1，不将它误报为“0 模型调用”，也不推测未读取的底层模型请求数或实际扣费金额。
+
+### 最终复查（2026-11-03）
+
+结论：本批修改 review 通过，未发现新的阻塞问题。IMG-C8a/C8b 已关闭：ZCode 首发接受后原生命名并读回、失败不重发且进入停止/删除；Codex 停止确认失败保留文件，确认终态后归档与精确删图独立执行并汇总错误。已核对外层 finally 与错误传播，而非仅检查成功路径。
+
+本轮重新运行 Python 清理/时序 9 项及 bridge 64 项，全部通过；diff 检查通过。完整源码指纹及 APK hash 与 image-smoke-followup/verification.json 一致，正式 live-smoke.log 含标题验证、模型识图、停止及原生删除三项成功。未重复未改动的 Android 构建/45 项真机测试，也未新增模型调用。
+
+保留已披露验证边界：Android 8 系统选择器回退未在旧系统实体设备执行；本轮真实模型验证通过正式主机脚本运行，不等价于从手机 UI 到真实模型的一次完整测试。以上不影响本批状态保护/脚本修复的复查结论。未提交或推送，未更新商店。
+
+### 用户确认点澄清（2026-11-03）
+
+- **权限基线为 allow，不是 ignore。** 依据用户持续授权、全局 AGENTS 及 `ops-notes/runbooks/android-agent-unattended-testing.md`，129 上本项目的 MIUI AppOps 10021/10032 应保留 allow；测试结束不得按测试前观察值恢复 ignore/deny。相机 CAMERA 依系统正常行为可为 allow/foreground，不与这两个 MIUI 后台启动选项混淆。文档中先前“还原 ignore”的内容仅是被 review 指出的历史操作，不是现行基线。本次已再次运行全局入口配置，并直接回读 10021/10032 均为 allow；证据位于 image-smoke-followup/appops-baseline-confirmed.json。此次只确认并恢复权限状态，没有重新声称完成安装/UI 验收；此前 45 项真机证据仍是原次验证。
+- **清理日志条数限制：用户接受当前实现。** `recordAttachmentCleanup` 按开发机分 key、路径去重，但没有条数上限；失败残留可累积。本次作为可接受限制保留，不自动截断可能需要清理的路径，不新增产品修改。
 
 ## 发布或完成 由 Codex 维护
 
