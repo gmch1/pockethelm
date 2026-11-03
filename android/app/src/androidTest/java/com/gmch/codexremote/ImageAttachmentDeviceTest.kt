@@ -361,6 +361,42 @@ class ImageAttachmentDeviceTest {
         return all.single()
     }
 
+    @Test fun zcodeUploadRpcFailureBeforeDispatchIsFailedNotUncertain() = runBlocking {
+        for (stage in listOf("begin", "chunk", "commit")) {
+            val app = TestPrefsApp(UUID.randomUUID().toString())
+            app.attach(instrumentation.targetContext)
+            cleaners += { instrumentation.targetContext.deleteSharedPreferences("zcode_load_test_${app.namespace}-vault") }
+            lateinit var vm: ZcodeViewModel
+            instrumentation.runOnMainSync { vm = ZcodeViewModel(app) }
+            val state = ZcodeViewModel::class.java.getDeclaredField("mutable").let {
+                it.isAccessible = true; it.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState> }
+            val attachment = ChatAttachment.new(ByteArray(1024) { 7 }, "图片.jpg")
+            state.value = zSessionState(listOf(attachment))
+            instrumentation.runOnMainSync { vm.draft("保留草稿") }
+            val bridge = FakeRpcBridge(vm)
+            bridge.scripted["session/attachment/begin"] = { obj("state" to "staging", "nextChunkIndex" to 0) }
+            bridge.scripted["session/attachment/chunk"] = { obj("nextChunkIndex" to 1) }
+            bridge.scripted["session/attachment/commit"] = { obj("state" to "committed", "ref" to "zcode-artifact://test") }
+            bridge.scripted["session/attachment/$stage"] = {
+                throw FakeRpcBridge.FakeRpcError(-32001, "ZCode 拒绝请求") }
+            bridge.scripted["session/send"] = { error("上传失败不得发送") }
+            bridge.install()
+            try {
+                instrumentation.runOnMainSync { vm.send() }
+                withTimeout(15_000) { while (vm.state.value.error == null || vm.state.value.sending) delay(20) }
+                assertEquals(stage, OutgoingState.FAILED, vm.state.value.outgoing.single().state)
+                assertFalse(vm.state.value.pending)
+                assertEquals("保留草稿", vm.state.value.draft)
+                assertEquals(listOf(attachment), vm.state.value.attachments)
+                assertFalse(vm.state.value.attachmentsBusy)
+            } finally {
+                instrumentation.runOnMainSync { vm.background(); vm.viewModelScope.cancel() }
+                bridge.close()
+            }
+            bridge.assertClean()
+        }
+    }
+
     @Test fun zcodeCommitRefusalKeepsBatchAndNeverSends() = runBlocking {
         val app = TestPrefsApp(UUID.randomUUID().toString())
         app.attach(instrumentation.targetContext)

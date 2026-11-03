@@ -767,9 +767,9 @@ class Bridge:
             pass
 
     def attachment_upstream_target(self, txn):
-        # Official attachment RPCs take the plain workspace/session pair; the workspace
-        # identity stays in the trusted local scope only.
-        return {'workspacePath': txn.target['workspacePath'], 'sessionId': txn.target['sessionId']}
+        # Server Core routes attachment RPCs by the same workspace identity as
+        # conversation RPCs. Dropping it selects the wrong CLI for desktop sessions.
+        return dict(txn.target)
 
     def attachment_upstream_begin(self, txn):
         result = self.agent('attachmentBeginV4', dict(self.attachment_upstream_target(txn),

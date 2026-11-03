@@ -323,6 +323,29 @@ class BridgeTests(unittest.TestCase):
                 'chunkIndex': index, 'dataBase64': base64.b64encode(chunk).decode()})
         return begin, bridge.dispatch('session/attachment/commit', {'uploadId': upload_id})
 
+    def test_attachment_routes_all_stages_to_desktop_workspace_identity(self):
+        import hashlib
+        bridge, client = self.attachment_bridge()
+        target = dict(self.UPLOAD_TARGET, workspaceIdentity='remote:server:test:/w')
+        bridge.session_target = Mock(return_value=target)
+        def upstream(channel, method, args):
+            for key, value in target.items():
+                if args[0].get(key) != value:
+                    raise WireError('Request workspace is not owned by this CLI')
+            if method == 'attachmentBeginV4':
+                return {'state': 'staging', 'nextChunkIndex': 0}
+            if method == 'attachmentCommitV4':
+                return {'ref': 'zcode-artifact://desktop'}
+            return {'nextChunkIndex': args[0].get('chunkIndex', 0) + 1}
+        client.call = Mock(side_effect=upstream)
+        self.full_upload(bridge, b'picture')
+        bridge.dispatch('session/attachment/begin', dict(target, uploadId='abort-me',
+            fileName='p.jpg', mime='image/jpeg', totalBytes=1, totalChunks=1,
+            checksum='sha256:' + hashlib.sha256(b'x').hexdigest()))
+        bridge.dispatch('session/attachment/abort', {'uploadId': 'abort-me'})
+        self.assertEqual({m for m, _ in self.upstream_attachment_calls(client)},
+            {'attachmentBeginV4', 'attachmentChunkV4', 'attachmentCommitV4', 'attachmentAbortV4'})
+
     def test_attachment_two_stage_chunking_aligns_phone_blocks_to_upstream(self):
         import hashlib as h
         bridge, client = self.attachment_bridge()

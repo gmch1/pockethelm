@@ -269,6 +269,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnectManually() = disconnect()
     private fun disconnect() {
         generation++
+        quotaAutoSyncedAt = 0L
         attachmentSerial.incrementAndGet()
         supportsSessionIndex = false
         backgroundJob?.cancel(); backgroundJob = null
@@ -492,6 +493,19 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         catch (e: CancellationException) { throw e }
         catch (e: Exception) { if (stillSelected()) mutable.update { it.copy(quota = "额度暂不可用，请重试", quotaSummary = "额度 ▾") } }
     }
+
+    /** Automatic quota refresh on session entry: deduped within 30s, silently skipped
+     *  while no valid selection exists (the manual tap stays as the explicit fallback). */
+    private var quotaAutoSyncedAt = 0L
+    private fun autoRefreshQuota() {
+        val now = System.currentTimeMillis()
+        if (now - quotaAutoSyncedAt < 30_000) return
+        val choice = mutable.value.selection ?: return
+        val provider = mutable.value.providers.find { it.id == choice.provider } ?: return
+        if (provider.guard != mutable.value.selectionGuard || provider.models.none { it.id == choice.model }) return
+        quotaAutoSyncedAt = now
+        quota()
+    }
     fun create(project: ZProject) = action {
         check(project.roots.size == 1) { "当前仅支持单目录项目" }
         val params = selectionParams().put("workspacePath", project.roots.single()).put("projectId", project.id)
@@ -507,7 +521,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         navigationVersion++
         if (!mutable.value.connected && mutable.value.selected?.id == session.id) return@action
         select(session)
-        if (mutable.value.connected) readGuarded(session, useSessionSelection = true)
+        if (mutable.value.connected) {
+            readGuarded(session, useSessionSelection = true)
+            // Entering a session syncs its actual plan/model — fetch quota in the
+            // background so the summary is current without a manual tap.
+            autoRefreshQuota()
+        }
         else mutable.update { it.copy(historyLoading = false, historyError = "连接后加载会话内容") }
     }
     fun retryLoad() = action {
@@ -761,9 +780,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             throw e
         } catch (e: RpcException) {
             if (!ackAccepted) {
-                // -32602 is a definite validation failure; other bridge/transport errors keep
-                // the pending protection and stay 结果待确认 — never 发送失败 with pending.
-                if (e.code == -32602) updateOutgoing(key, commandId) { it.copy(state = OutgoingState.FAILED) }
+                // An upload RPC may fail before session/send is dispatched. No message
+                // can have landed then, regardless of the upload error code.
+                // After dispatch, only definite validation failures permit retry.
+                if (!dispatched || e.code == -32602) updateOutgoing(key, commandId) { it.copy(state = OutgoingState.FAILED) }
                 else markOutgoingUncertain(key, commandId)
             }
             throw e

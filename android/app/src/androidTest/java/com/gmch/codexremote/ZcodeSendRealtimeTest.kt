@@ -94,6 +94,8 @@ class ZcodeSendRealtimeTest {
                 "status" to "success", "commandId" to record.first))
             readPayload(p.string("sessionId"), items, JSONArray())
         }
+        // Entering a session auto-refreshes quota; give it a benign answer.
+        bridge.scripted["quota"] = { obj("planKind" to "individual-coding-plan", "limits" to JSONArray()) }
     }
 
     private fun readPayload(sessionId: String, items: JSONArray, queue: JSONArray) = obj(
@@ -153,6 +155,7 @@ class ZcodeSendRealtimeTest {
             scriptSend { req ->
                 cmd.set(req.optJSONObject("params")?.string("commandId").orEmpty())
                 obj("status" to "accepted", "result" to obj("delivery" to "queue")) }
+            bridge.scripted["quota"] = { obj("planKind" to "individual-coding-plan", "limits" to JSONArray()) }
             bridge.scripted["session/read"] = { req ->
                 val p = req.optJSONObject("params") ?: obj()
                 val record = sentCommands[p.string("sessionId")]
