@@ -399,8 +399,34 @@
 
 本轮复跑 Python **73 项通过**，diff 格式检查通过；额外异常时间戳探针复现 R9，因此现有绿色套件尚不足以放行。未重跑 JVM/真机，未修改产品或测试代码、部署、提交或 push，仅追加 Review。修复 R9 后再复查，不重开已关闭的方案问题。
 
+
+### 实现 review 最终复查：ccef1a6（2026-11-04，当前有效结论）
+
+**通过。R6、R7、R8、R9 全部关闭，本轮未发现新的阻塞问题。** 复核 HEAD `ccef1a60ada2d58ea721a1a7523624cb8db8e3c0`，代码修复提交 `25aff5d`，文档提交 `ccef1a6`；检查范围 `62665ae..ccef1a6`，未以此前版本作为当前实现。
+
+- **R9：关闭。** 锁内解析捕获 ValueError/OSError（含 UnicodeDecodeError），拒绝非有限值和负值；解析、校验、冷却命中及写入失败均释放未交付 fd。有效尝试才将锁交给调用方，在恢复/清理结束后释放。
+- 本轮新增独立检查（一次性本地探针，未修改产品/测试代码）：对空值、非法数字、nan、NaN、负值、+Infinity、-Infinity、非法 UTF-8 共 8 种标记逐一调用 catalog；每种均返回旧视图，并断言临时 Client 构造未发生。随后另开 fd 非阻塞取得 flock，确认锁已释放；改写为有效旧时间后 gate 正常获准。使用临时目录，未触碰部署环境冷却状态。
+- **R6–R8：保持关闭。** refresh 首调用与预算、锁内冷却检查/记账、成功响应使用 elapsedRealtime 记录 TTL 的修复未回退。manualRefreshUpdatesTtlWatermark 已在提交中实际新增，前轮“文档声称存在但代码缺失”的证据差异关闭。
+- 测试增强建议（非阻塞）：手动刷新用例目前在原自动缓存仍有效时立即手动刷新；后续可先让原缓存过期再手动刷新，增强它对“忘记更新手动水位”回归的检出能力。当前实现成功路径本身已确认正确。
+
+验证：本轮实际运行 Python **75 项全部通过**，diff 格式检查通过；额外 8 种异常标记探针全部通过。读取交付的 `device-quota-r9.txt` 确认 **OK (5 tests)**，这是既有设备证据而非本轮重跑。直接比对部署 bridge.py、wire.py、session_index.py 与当前仓库，三者字节一致；未重新触发真实恢复或模型调用。JVM/其余真机结果沿用已有交付记录，不声称本轮重复执行。
+
+本结论是实现 review 通过；跨天实测与 H1/H2 取证仍为后续独立验收，不将正常态冒烟或模拟测试写成跨天效果已证实。本轮仅追加 Review，未修改产品代码、部署、提交或推送。
+
+### 发布前 review：ccef1a6 / 0.4.22（32）（2026-11-04）
+
+**结论：通过（可发布）。** 本轮重新读取磁盘代码，检查 `daaef8d..ccef1a6` 全部五个提交、六个变更文件以及当前任务文档；HEAD 为 `ccef1a60ada2d58ea721a1a7523624cb8db8e3c0`，产品/测试文件无未提交改动，工作区仅本文档有更新。未发现新增发布阻塞，R6–R9 保持关闭。
+
+- **实现一致性**：临时 Client 首调用 refresh（单元素 reason 数组），随后同连接重读三视图，各步传递剩余工作预算；失败保留整套旧视图。初始化异常走 Client 自身 close；terminate 与 kill 后 wait 共用清理预算。flock 后重读、校验、记账，锁贯穿尝试；非法标记 fail-closed 并释放 fd。App 成功响应统一更新来源与 elapsedRealtime 水位，10 分钟 TTL 与失败占位重试已落实。取证不裁决 H1/H2，沿用既有范围边界。
+- **实际候选 APK**：已运行 sha256sum、apksigner verify --print-certs、aapt badging/xmltree。`android/app/build/outputs/apk/release/app-release.apk` SHA-256 为 `4c8af0ba845e0e984cbeec3537fce1702689e1c4bf659192bc41db759e3f91f5`，与交付记录中的测试包哈希一致；包名 `com.gmch.codexremote`，versionName `0.4.22`、versionCode `32`；Manifest 未开启 debuggable。签名验证成功，证书 SHA-256 `54c2508d89048ef721e3d67d0a192397f103886a9f40e65ba31d696c2e2fbab5` 与历史发布记录一致。本轮核对现存产物，未重新构建；版本号继承基线，非本分支新增。
+- **测试实证及统计更正**：本轮实际复跑 unittest discover，Python **75 项全部通过**；完整提交范围 diff --check 通过。读取现有 JVM XML：**总计 114，113 通过、1 跳过、0 失败/错误**；跳过为 SshIntegrationTest.productionTransportThroughTencent，不应写成“114 通过另加 1 跳过”。读取既有真机记录：device.txt 总计 36（**35 通过、1 条件跳过**；pairedZcodeReadAndReconnect 缺少可选 target fixture），device-quota-r9.txt **5/5 通过**。合计为两个批次 **41 项、40 通过、1 跳过**，不是本轮在最终包上重跑全部 41 项，也不是 41 项全部执行通过。跳过的可选集成场景不作为已验证能力；既有回归证据与修复后额度专项证据共同支持本次发布。
+- **部署一致性**：直接逐字节比对已部署 bridge.py、wire.py、session_index.py 与仓库，三者一致；读取 post-R9 smoke.json，记录为健康态、恢复未触发，未将其冒充真实故障恢复成功。
+- **独立后续验收**：跨天真实恢复效果和 H1/H2 上游取证仍待发布后验证，不是本次已完成项。既有手动刷新测试增强建议为非阻塞。本次只追加 Review，未修改产品代码、上传商店、合并分支或提交/push。
+
 ## 发布或完成
 
-- bridge 部分：无 APK 发版，`install.py` 部署后记录部署与冒烟结果。
-- App 部分（R1）：随 0.4.22 / versionCode 32 发布（沿用既有发布授权与校验流程）。
-- 跨天取证与验收结论完成后回填本文档；假设 H1/H2 的裁决结果一并记录。
+- **版本更正**：准备上传时发现商店 0.4.22 / versionCode 32 已被并行会话占用（发布于本分支开发期间，哈希 `0baf3f48…`，即 `daaef8d` 额度修复基线构建）；按顺延规则本任务发行 **0.4.23 / versionCode 33**。实现 review 所批的代码不变，仅发行元数据顺延；真机 37/37 在 0.4.23 构建上重跑通过。
+- bridge 部分：无 APK 发版；开发机桥接器已部署（与仓库逐字节一致）并冒烟通过。
+- App 发布（R1 + 额度 TTL）：已上传原商店条目并返回 published；公开索引与完整下载包校验通过——0.4.23 / 33，APK SHA-256 `b3868185ecc5ed5149304919bd30e31cf7f08b1fd61aad31e535a36c626bed12`，签名 `54c2508d…` 与历史一致。证据：`~/.local/state/pockethelm/release-0.4.23/`（notes.txt、index-v1.jar、download.apk、store-verified.json）。发布前 review 为「通过（可发布）」（见 Review 区，其核对的 0.4.22/32 为上传前版本，发行号顺延不影响代码与测试结论）。
+- 合并：`start-plan-daily-recovery` 快进合并至 `main` 并推送。
+- 待办：跨天实测（23 点后）与 H1/H2 取证结论完成后回填本文档；bridge 更新已生效，App 端更新随商店分发。
