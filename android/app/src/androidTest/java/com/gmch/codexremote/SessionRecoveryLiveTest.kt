@@ -1,6 +1,9 @@
 package com.gmch.codexremote
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.gmch.codexremote.engines.contract.*
+import com.gmch.codexremote.engines.codex.CodexEngineClient
+import com.gmch.codexremote.engines.zcode.ZcodeEngineClient
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -28,10 +31,18 @@ class SessionRecoveryLiveTest {
                 client = rpc
                 if (zcode) {
                     assertEquals("zcode", rpc.call("initialize", obj("clientId" to "pockethelm-recovery-${java.util.UUID.randomUUID()}")).string("engine"))
-                    assertTrue(rpc.call("projects", obj()).has("projects"))
+                    val reader: EngineClient = ZcodeEngineClient(EngineOrigin(profile.resumeIdentity, "zcode", "bridge-v1"), rpc)
+                    val catalog = reader.projects()
+                    assertNotNull(catalog.sessions)
+                    assertEquals(SessionCatalogMode.Snapshot, catalog.sessions!!.mode)
+                    assertTrue(catalog.sessions.items.all { it.ref.origin == reader.origin })
                 } else {
                     assertTrue(rpc.initialize().has("userAgent"))
-                    assertTrue(rpc.call("thread/list", obj("limit" to 1)).has("data"))
+                    val reader: EngineClient = CodexEngineClient(EngineOrigin(profile.resumeIdentity, "codex", profile.binary), rpc, profile.root)
+                    val page = reader.sessions(SessionQuery(limit = 1))
+                    assertEquals(SessionCatalogMode.Paged, page.mode)
+                    assertTrue(page.items.all { it.ref.origin == reader.origin })
+                    assertTrue(reader.projects().projects.all { it.origin == reader.origin })
                 }
             } finally {
                 client?.close(); ssh.close()

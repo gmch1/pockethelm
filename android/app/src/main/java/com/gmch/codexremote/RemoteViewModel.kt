@@ -2,7 +2,14 @@ package com.gmch.codexremote
 
 import android.app.Application
 import android.net.Uri
-import android.graphics.BitmapFactory
+import com.gmch.codexremote.app.EnvironmentStore
+import com.gmch.codexremote.app.EnvironmentController
+import com.gmch.codexremote.engines.verifyLegacyEnvironment
+import com.gmch.codexremote.engines.codex.CodexEngineClient
+import com.gmch.codexremote.engines.contract.EngineOrigin
+import com.gmch.codexremote.engines.contract.SessionQuery
+import com.gmch.codexremote.engines.contract.HistoryCursor
+import com.gmch.codexremote.engines.presentationItem
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
@@ -43,10 +50,14 @@ data class UiState(
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private data class ThreadAttachment(val response: JSONObject, val unmaterialized: Boolean = false)
-    private val vault = Vault(app)
+    private val environmentStore = EnvironmentStore.forApp(app)
+    private val vault = environmentStore.vault
+    private var appliedEnvironmentRevision = -1L
+    internal val environmentRevision get() = appliedEnvironmentRevision
     private val mutable = MutableStateFlow(UiState())
     val state = mutable.asStateFlow()
     private val actions = Mutex()
+    private val actionJobs = mutableSetOf<Job>()
     private var transport: SshTransport? = null
     private var retiringTransport: SshTransport? = null
     private var rpc: RpcClient? = null
@@ -61,8 +72,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var quotaRequest = 0
     private val settingsRevisions = mutableMapOf<String, Long>()
     private var epoch = 0
-    private var targetPassphrase = ""
-    private var jumpPassphrase = ""
     private var selectionVersion = 0
     private val timeline = LinkedHashMap<String, TimelineItem>()
     private val imageProcessor by lazy { ImageProcessor(app) }
@@ -92,20 +101,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         runCatching {
-            // Retire only app-generated v1 credentials; imported administrator keys are untouched.
-            vault.put("device-identity", null)
-            var saved = vault.get("profile")
-            saved?.let { raw ->
-                val old = ConnectionProfile.from(JSONObject(raw))
-                if (old.useDeviceKey && old.configVersion != 2) {
-                    vault.put("profile", null); saved = null
-                    mutable.update { it.copy(status = "旧设备凭据已停用，请重新扫码连接") }
-                }
-            }
-            mutable.update { it.copy(profile = saved?.let { v -> ConnectionProfile.from(JSONObject(v)) } ?: ConnectionProfile(),
-                saved = saved != null, tab = if (saved == null) 2 else 0,
-                engine = vault.get("ui:engine").takeIf { value -> value == "zcode" } ?: "codex",
-                targetKeyName = vault.get("target-key-name") ?: "未导入", jumpKeyName = vault.get("jump-key-name") ?: "未导入") }
+            val environment = environmentStore.refresh()
+            appliedEnvironmentRevision = environment.revision
+            mutable.update { it.copy(profile = environment.profile, saved = environment.saved,
+                tab = if (environment.saved) 0 else 2, engine = environmentStore.selectedEngine().ifBlank { "codex" },
+                targetKeyName = environment.targetKeyName, jumpKeyName = environment.jumpKeyName) }
         }.onFailure { fail(it) }
         val identity = mutable.value.profile.resumeIdentity
         restoreJob = viewModelScope.launch {
@@ -129,9 +129,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    @Deprecated("App UI owns engine selection through AppViewModel")
     fun engine(value: String) {
-        require(value == "codex" || value == "zcode")
-        vault.put("ui:engine", value)
+        require(value.matches(Regex("[a-z][a-z0-9_-]*")))
+        environmentStore.selectEngine(value)
         mutable.update { it.copy(engine = value) }
     }
 
@@ -140,7 +141,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun tab(index: Int) { mutable.update { it.copy(tab = index) } }
     private fun localKey(type: String, id: String) = "$type:${mutable.value.profile.identity}:$id"
     private fun client() = rpc ?: error("请先连接开发机")
-    private fun action(block: suspend () -> Unit) = viewModelScope.launch {
+    internal fun sessionClient(connection: RpcClient = client()) = CodexEngineClient(
+        EngineOrigin(mutable.value.profile.resumeIdentity, "codex", mutable.value.profile.binary), connection, mutable.value.profile.root)
+    private fun action(block: suspend () -> Unit): Job {
+        lateinit var job: Job
+        job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
         val generation = epoch
         actions.withLock {
             if (generation != epoch) return@withLock
@@ -149,12 +155,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             catch (t: Throwable) { if (generation == epoch) fail(t) }
             finally { if (generation == epoch) mutable.update { it.copy(busy = false) } }
         }
+            } finally { actionJobs.remove(job) }
+        }
+        actionJobs.add(job); job.start()
+        return job
     }
+    private fun cancelEnvironmentActions() { actionJobs.toList().forEach { it.cancel() } }
 
     fun foreground() {
         val alreadyVisible = mutable.value.foreground
         backgroundJob?.cancel(); backgroundJob = null
         mutable.update { it.copy(foreground = true) }
+        if (!reloadEnvironment()) return
         if (!mutable.value.saved) return
         if (!mutable.value.connected) { if (!manuallyDisconnected) connect(); return }
         if (alreadyVisible) return
@@ -225,7 +237,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         backgroundJob = viewModelScope.launch {
             delay(BACKGROUND_GRACE_MS)
             disconnect("后台连接已释放 · 返回后自动连接")
-            targetPassphrase = ""; jumpPassphrase = ""
         }
     }
     fun disconnect(reason: String = "已断开 · 执行保留在开发机") {
@@ -260,103 +271,58 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         writtenFiles.clear()
     }
 
-    fun saveProfile(profile: ConnectionProfile, targetPass: String, jumpPass: String) {
-        runCatching {
-            profile.validate()
+    internal fun environmentChanging() { cancelEnvironmentActions(); manuallyDisconnected = false; disconnect() }
+    internal fun reloadEnvironment(): Boolean {
+        return runCatching {
+            val next = environmentStore.refresh()
+            if (next.revision == appliedEnvironmentRevision) return true
+            val profileChanged = next.profile != mutable.value.profile
+            cancelEnvironmentActions()
             disconnect()
-            vault.put("profile", profile.json().toString())
-            targetPassphrase = targetPass; jumpPassphrase = jumpPass
-            pauseRecovery(); selectionVersion++; timeline.clear()
-            // A different environment owns no local records from the previous one.
-            outgoingBySession.clear()
-            mutable.update { it.copy(profile = profile, saved = true, sessions = emptyList(), selected = null,
-                items = emptyList(), queue = emptyList(), projects = emptyList(), cursor = null, draft = "", uncertain = null, diff = "",
-                sessionsCached = false, historyCached = false,
-                models = emptyList(), modelsError = null, modelSettings = null, settingsNotice = null, quota = null, quotaError = null) }
-            if (mutable.value.foreground) connect()
-        }.onFailure(::fail)
+            appliedEnvironmentRevision = next.revision
+            if (profileChanged) {
+                selectionVersion++; timeline.clear(); outgoingBySession.clear()
+                mutable.update { it.copy(sessions = emptyList(), selected = null, items = emptyList(), queue = emptyList(),
+                    projects = emptyList(), cursor = null, draft = "", uncertain = null, diff = "",
+                    sessionsCached = false, historyCached = false, models = emptyList(), modelsError = null,
+                    modelSettings = null, settingsNotice = null, quota = null, quotaError = null) }
+            }
+            mutable.update { it.copy(profile = next.profile, saved = next.saved,
+                targetKeyName = next.targetKeyName, jumpKeyName = next.jumpKeyName) }
+        }.onFailure { disconnect(); fail(it) }.isSuccess
     }
 
-    fun importKey(uri: Uri, jump: Boolean) = action {
-        val slot = if (jump) "jump-key" else "target-key"
-        val resolver = getApplication<Application>().contentResolver
-        val text = withContext(Dispatchers.IO) {
-            resolver.openInputStream(uri)?.use { stream ->
-                val buffer = java.io.ByteArrayOutputStream()
-                val chunk = ByteArray(8192)
-                while (buffer.size() <= 1_048_576) {
-                    val count = stream.read(chunk, 0, minOf(chunk.size, 1_048_577 - buffer.size()))
-                    if (count < 0) break
-                    buffer.write(chunk, 0, count)
+    // Transitional API for existing integration harnesses. Configuration logic lives
+    // exclusively in the app service; production UI uses AppViewModel directly.
+    private val legacyEnvironment by lazy {
+        EnvironmentController(getApplication(), viewModelScope, environmentStore, ::verifyLegacyEnvironment,
+            beforeChange = ::environmentChanging,
+            changed = { reconnect -> reloadEnvironment(); if (reconnect && mutable.value.saved && mutable.value.foreground) connect() }
+        ).also { controller ->
+            viewModelScope.launch {
+                controller.state.collect { env ->
+                    mutable.update { it.copy(busy = env.busy || connectionJob?.isActive == true,
+                        error = env.error ?: if (env.busy) null else it.error,
+                        status = if (env.busy || env.error != null) env.status else it.status,
+                        tab = if (env.pairingCompleted > 0) 0 else it.tab) }
                 }
-                val bytes = buffer.toByteArray()
-                require(bytes.size <= 1_048_576) { "私钥文件过大" }
-                val value = bytes.toString(Charsets.UTF_8); bytes.fill(0); value
-            } ?: error("无法读取私钥文件")
+            }
         }
-        require(text.contains("PRIVATE KEY-----")) { "请选择 OpenSSH 或 PEM 格式的私钥" }
-        vault.put(slot, text)
-        vault.put("$slot-name", "已导入 · 加密保存")
-        mutable.update { if (jump) it.copy(jumpKeyName = "已导入 · 加密保存") else it.copy(targetKeyName = "已导入 · 加密保存") }
     }
-
-    fun trustHost() {
-        val challenge = mutable.value.challenge ?: return
-        if (challenge.changed) return
-        vault.put("host:${challenge.host}", challenge.key)
-        mutable.update { it.copy(challenge = null) }
-        connect()
-    }
+    @Deprecated("Use the application environment service")
+    fun saveProfile(profile: ConnectionProfile, targetPass: String, jumpPass: String) = legacyEnvironment.saveProfile(profile, targetPass, jumpPass)
+    @Deprecated("Use the application environment service")
+    fun importKey(uri: Uri, jump: Boolean) = legacyEnvironment.importKey(uri, jump)
+    @Deprecated("Use the application environment service")
+    fun pair(raw: String) = legacyEnvironment.pair(raw)
+    @Deprecated("Use the application environment service")
+    fun pairImage(uri: Uri) = legacyEnvironment.pairImage(uri)
+    @Deprecated("Use the application environment service")
+    fun trustHost() { mutable.value.challenge?.takeUnless { it.changed }?.let(legacyEnvironment::trust) }
     fun cancelTrust() { mutable.update { it.copy(challenge = null, status = "尚未信任主机") } }
 
-    fun pair(raw: String) = action { pairInternal(raw) }
-    fun pairImage(uri: Uri) = action {
-        val raw = withContext(Dispatchers.IO) {
-            val resolver = getApplication<Application>().contentResolver
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-            require(bounds.outWidth > 0 && bounds.outHeight > 0) { "无法读取二维码图片" }
-            var sample = 1
-            while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 2048) sample *= 2
-            val bitmap = resolver.openInputStream(uri)?.use {
-                BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
-            } ?: error("无法读取二维码图片")
-            try { decodePairingQr(bitmap) } finally { bitmap.recycle() }
-        }
-        pairInternal(raw)
-    }
-
-    private suspend fun pairInternal(raw: String) {
-        val ticket = PairingTicket.parse(raw)
-        disconnect()
-        mutable.update { it.copy(busy = true, status = "正在配对开发机…", error = null) }
-        var committed = false
-        try {
-            val identity = withContext(Dispatchers.IO) {
-                DeviceIdentity.read(vault) ?: DeviceIdentity.generate().also { vault.put(DeviceIdentity.SLOT, it.json()) }
-            }
-            val grant = PairingClient.redeem(ticket, identity.publicKey)
-            mutable.update { it.copy(status = "正在验证开发机连接…") }
-            val candidate = SshTransport()
-            var checkRpc: RpcClient? = null
-            try {
-                candidate.connect(grant.profile, SecretReader { grant.pins[it] ?: vault.get(it) }, "", "")
-                val c = RpcClient(candidate.input, candidate.output, {}, {}); checkRpc = c
-                c.initialize()
-            } finally {
-                checkRpc?.close()
-                withContext(NonCancellable + Dispatchers.IO) { candidate.close() }
-            }
-            grant.pins.forEach { (name, value) -> vault.put(name, value) }
-            saveProfile(grant.profile, "", "")
-            mutable.update { it.copy(tab = 0) }
-            committed = true
-        } finally {
-            if (!committed) mutable.update { it.copy(status = "配对未完成，请重试或生成新的连接码") }
-        }
-    }
-
     fun connect() {
+        if (!reloadEnvironment()) return
         manuallyDisconnected = false
         if (connectionJob?.isActive == true) return
         if (mutable.value.connected) { refresh(); return }
@@ -370,7 +336,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 try {
                     retiringTransport?.let { check(it.awaitClosed()) { "旧连接尚未释放，请稍后重连" }; retiringTransport = null }
                     val connectionDeadline = System.nanoTime() + 45_000_000_000L
-                    withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(mutable.value.profile, vault, targetPassphrase, jumpPassphrase) }
+                    withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(mutable.value.profile, vault, environmentStore.targetPassphrase, environmentStore.jumpPassphrase) }
                     ensureActive()
                     val connection = RpcClient(ssh.input, ssh.output, { event ->
                         withContext(Dispatchers.Main) { if (generation == epoch) handle(event) }
@@ -563,12 +529,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val connection = client()
         val generation = epoch
         val request = ++listVersion
-        val page = connection.call("thread/list", obj("limit" to 30, "sortKey" to "updated_at", "sortDirection" to "desc",
-            "cursor" to if (more) mutable.value.cursor else null,
-            "sourceKinds" to JSONArray(listOf("cli", "vscode", "appServer", "exec", "unknown"))))
+        val reader = sessionClient(connection)
+        val page = reader.sessions(SessionQuery(if (more) reader.cursor(mutable.value.cursor) else null, 30))
         if (generation != epoch || request != listVersion) return
         val previous = mutable.value.sessions.associateBy { it.id }
-        val base = page.optJSONArray("data").objects().map(SessionInfo::parse).map { session ->
+        val base = page.items.map { it.native }.map { session ->
             val old = previous[session.id]
             if (old != null && old.updatedAt == session.updatedAt && old.runtime == session.runtime)
                 session.copy(lastTurnStatus = old.lastTurnStatus, activeTurnId = old.activeTurnId) else session
@@ -576,7 +541,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         listSyncedAt = System.currentTimeMillis()
         // Publish the first RPC immediately. Slow per-session status queries never block navigation.
         mutable.update { state -> state.copy(sessions = (if (more) state.sessions + base else base).distinctBy { it.id },
-            sessionsCached = false, cursor = page.string("nextCursor").ifBlank { null }, lastSync = listSyncedAt) }
+            sessionsCached = false, cursor = page.next?.token, lastSync = listSyncedAt) }
         refreshSessionStatuses(base, connection, generation, request)
     }
 
@@ -592,13 +557,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 semaphore.withPermit {
                     val revision = turnRevisions[session.id] ?: 0L
                     try {
-                        val last = connection.call("thread/turns/list", obj("threadId" to session.id, "limit" to 1,
-                            "sortDirection" to "desc", "itemsView" to "notLoaded"), timeout = 10_000).optJSONArray("data")?.optJSONObject(0)
+                        val reader = sessionClient(connection)
+                        val last = reader.latestTurn(reader.session(session.id), timeout = 10_000)
                         if (generation == epoch && request == listVersion && revision == (turnRevisions[session.id] ?: 0L))
                             mutable.update { state -> state.copy(sessions = state.sessions.map { current ->
                                 if (current.id == session.id && current.updatedAt == session.updatedAt) current.copy(
-                                    lastTurnStatus = last?.string("status").orEmpty(),
-                                    activeTurnId = if (current.runtime == "active" && last?.string("status") == "inProgress") last.string("id") else "")
+                                    lastTurnStatus = last?.status.orEmpty(),
+                                    activeTurnId = if (current.runtime == "active" && last?.status == "inProgress") last.id else "")
                                 else current
                             }) }
                     } catch (e: CancellationException) { throw e } catch (_: Exception) { /* Base metadata remains usable. */ }
@@ -610,11 +575,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun moreSessions() = action { if (mutable.value.cursor != null) loadSessions(true) }
 
     private suspend fun loadProjects() {
-        val root = mutable.value.profile.root.trimEnd('/')
-        val result = client().call("fs/readDirectory", obj("path" to root))
+        val generation = epoch
+        val projects = sessionClient().projects()
+        if (generation != epoch) return
         projectsSyncedAt = System.currentTimeMillis()
-        mutable.update { it.copy(projects = result.optJSONArray("entries").objects().filter { j -> j.optBoolean("isDirectory") && !j.string("fileName").startsWith('.') }
-            .map { j -> "$root/${j.string("fileName")}" }.sorted()) }
+        mutable.update { it.copy(projects = projects.projects.map { p -> p.path }) }
     }
 
     fun openThread(session: SessionInfo) {
@@ -692,21 +657,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (session.runtime == "notLoaded" && generation == epoch && version == selectionVersion && mutable.value.selected?.id == id)
             mutable.update { it.copy(modelSettings = ModelSettings.metadata(metadata)) }
-        val turns = connection.call("thread/turns/list", obj("threadId" to id, "limit" to 1, "sortDirection" to "desc", "itemsView" to "notLoaded"))
-            .optJSONArray("data").objects()
-        val latest = turns.firstOrNull()
-        connection.call("thread/items/list", obj("threadId" to id, "limit" to 80, "sortDirection" to "desc"), onResult = { snapshot ->
+        val reader = sessionClient(connection)
+        val ref = reader.session(id)
+        val latest = reader.latestTurn(ref)
+        reader.history(ref, onPage = { snapshot ->
             withContext(Dispatchers.Main) {
                 if (generation == epoch && mutable.value.selected?.id == id && version == selectionVersion) {
-                    val list = snapshot.optJSONArray("data").objects().mapNotNull { it.optJSONObject("item") }.map(TimelineItem::parse).reversed()
-                    applyHistorySnapshot(timeline, list, baseline)
-                    mutable.update { it.copy(items = timeline.values.toList(), historyCursor = snapshot.string("nextCursor").ifBlank { null }) }
+                    applyHistorySnapshot(timeline, snapshot.items.map { it.presentationItem() }, baseline)
+                    mutable.update { it.copy(items = timeline.values.toList(), historyCursor = snapshot.next?.token) }
                 }
             }
         })
         if (generation != epoch || mutable.value.selected?.id != id || version != selectionVersion) return
-        var updated = session.copy(model = mutable.value.modelSettings?.model ?: session.model, lastTurnStatus = latest?.string("status").orEmpty(),
-            activeTurnId = if (session.runtime == "active" && latest?.string("status") == "inProgress") latest.string("id") else "")
+        var updated = session.copy(model = mutable.value.modelSettings?.model ?: session.model, lastTurnStatus = latest?.status.orEmpty(),
+            activeTurnId = if (session.runtime == "active" && latest?.status == "inProgress") latest.id else "")
         if ((statusRevisions[id] ?: 0L) != statusRevision) {
             // A completion/next-turn event may arrive while history is being paged in.
             mutable.value.selected?.let { liveStatus ->
@@ -730,13 +694,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val scope = RequestScope(epoch, selectionVersion, id)
         mutable.update { it.copy(historyLoading = true) }
         try {
-            val result = client().call("thread/items/list", obj("threadId" to id, "cursor" to cursor, "limit" to 80, "sortDirection" to "desc"))
+            val reader = sessionClient()
+            val ref = reader.session(id)
+            val result = reader.history(ref, HistoryCursor(ref, cursor))
             // A late success from a superseded selection must not splice into the new session.
             if (!scope.appliesTo(epoch, selectionVersion, mutable.value.selected?.id)) return@action
             val old = timeline.toMap(); timeline.clear()
-            result.optJSONArray("data").objects().mapNotNull { it.optJSONObject("item") }.map(TimelineItem::parse).reversed().forEach { timeline[it.id] = it }
+            result.items.map { it.presentationItem() }.forEach { timeline[it.id] = it }
             timeline.putAll(old)
-            mutable.update { it.copy(items = timeline.values.toList(), historyCursor = result.string("nextCursor").ifBlank { null }) }
+            mutable.update { it.copy(items = timeline.values.toList(), historyCursor = result.next?.token) }
             reconcilePending(id)
             reconcileOutgoing(id)
         } finally {

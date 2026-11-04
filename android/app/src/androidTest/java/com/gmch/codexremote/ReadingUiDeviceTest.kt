@@ -1,6 +1,8 @@
 package com.gmch.codexremote
 
 import android.view.accessibility.AccessibilityNodeInfo
+import com.gmch.codexremote.app.LocalEngineDescriptors
+import com.gmch.codexremote.engines.contract.EngineDescriptor
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.cancel
 import androidx.activity.compose.setContent
@@ -407,7 +409,7 @@ class ReadingUiDeviceTest {
                     (field(c, "mutable").get(c) as kotlinx.coroutines.flow.MutableStateFlow<UiState>).value = UiState(engine = "zcode", saved = false)
                     @Suppress("UNCHECKED_CAST")
                     (field(z, "mutable").get(z) as kotlinx.coroutines.flow.MutableStateFlow<ZcodeState>).value = ZcodeState(
-                        connected = true, sessionsFresh = true,
+                        connected = true, recoveryPhase = RecoveryPhase.Ready, sessionsFresh = true,
                         projects = listOf(ZProject("p", "合成项目", listOf("/work")), ZProject("q", "其他项目", listOf("/other"))),
                         sessions = listOf(ZSession("old", "已有会话", "/work", project = "p"),
                             ZSession("other", "其他会话", "/other", project = "q")),
@@ -459,11 +461,13 @@ class ReadingUiDeviceTest {
             scenario.onActivity { activity -> activity.setContent {
                 PocketHelmTheme {
                     var engine by remember { mutableStateOf("codex") }
+                    CompositionLocalProvider(LocalEngineDescriptors provides listOf(EngineDescriptor("codex", "Codex"), EngineDescriptor("zcode", "ZCode"))) {
                     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
                         WorkspaceListPage(engine, { require(it in setOf("codex", "zcode")); engine = it },
                             data, connected = true, busy = false, canCreate = true, canOpen = true,
                             open = {}, create = {}, reconnect = {}, refresh = {}, addProject = { added.set(true) },
                             error = null, dismissError = {}, detail = { _, _ -> }, selectTab = {})
+                    }
                     }
                 }
             } }

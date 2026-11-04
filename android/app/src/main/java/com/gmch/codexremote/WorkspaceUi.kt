@@ -2,6 +2,7 @@ package com.gmch.codexremote
 
 import kotlinx.coroutines.launch
 import androidx.activity.compose.BackHandler
+import com.gmch.codexremote.app.LocalEngineDescriptors
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -289,7 +290,7 @@ private fun OfflineBanner(busy: Boolean, reconnect: () -> Unit) {
 internal fun EngineTabs(engine: String, onEngine: (String) -> Unit, small: Boolean = false) {
     Row(Modifier.height(48.dp).selectableGroup(), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-        listOf("codex" to "Codex", "zcode" to "ZCode").forEach { (id, label) ->
+        LocalEngineDescriptors.current.forEach { (id, label) ->
             val active = id == engine
             Box(Modifier.height(48.dp).widthIn(min = 48.dp).clip(RoundedCornerShape(10.dp))
                 .background(if (active) MaterialTheme.colorScheme.primary else Color.Transparent)

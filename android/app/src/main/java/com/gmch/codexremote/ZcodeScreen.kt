@@ -1,5 +1,8 @@
 package com.gmch.codexremote
 
+import com.gmch.codexremote.app.AppViewModel
+import com.gmch.codexremote.app.ConnectionScreen
+import com.gmch.codexremote.engines.contract.EngineConnection
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -28,33 +31,22 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.first
 
-@Composable
-internal fun EngineApp(codex: RemoteViewModel, zcode: ZcodeViewModel) {
-    val navigation by codex.state.collectAsStateWithLifecycle()
-    HostTrustDialog(navigation, codex)
-    val engine = navigation.engine
-    val pages = rememberSaveableStateHolder()
-    LaunchedEffect(engine, navigation.profile.resumeIdentity) {
-        if (engine == "zcode") { codex.leave(); zcode.enter() }
-        else { zcode.leave(); codex.foreground() }
-    }
-    Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Box(Modifier.weight(1f)) {
-            pages.SaveableStateProvider("${navigation.profile.resumeIdentity}:$engine") {
-                if (engine == "codex") RemoteApp(codex)
-                else ZcodeScreen(zcode, codex)
-            }
-        }
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
+internal fun ZcodeScreen(vm: ZcodeViewModel, app: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
-    val navigation by codex.state.collectAsStateWithLifecycle()
+    val environment by app.environment.state.collectAsStateWithLifecycle()
+    val navigation = environment.environment
     var newSession by remember { mutableStateOf(false) }
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    var handledPairing by rememberSaveable { mutableIntStateOf(0) }
+    LaunchedEffect(environment.pairingCompleted) {
+        if (environment.pairingCompleted == 0) handledPairing = 0
+        else if (environment.pairingCompleted > handledPairing) {
+            handledPairing = environment.pairingCompleted
+            tab = 0
+        }
+    }
     val pages = rememberSaveableStateHolder()
     var detail by remember { mutableStateOf<Pair<String, String>?>(null) }
     var unlock by remember { mutableStateOf(false) }
@@ -77,12 +69,13 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
     val chat = state.selected != null && tab == 0
     BackHandler(chat) { vm.back() }
     when {
-        tab == 2 -> WorkspaceScaffold("连接", chat = false, tab = tab, busy = state.busy || navigation.busy,
-            refresh = vm::refresh, selectTab = { tab = it }, engine = "zcode" to { codex.engine(it) }) {
-            WorkspaceError(navigation.error ?: state.error, { codex.dismissError(); vm.dismissError() }) { title, text -> detail = title to text }
+        tab == 2 -> WorkspaceScaffold("连接", chat = false, tab = tab, busy = state.busy || environment.busy,
+            refresh = vm::refresh, selectTab = { tab = it }, engine = "zcode" to app::selectEngine) {
+            WorkspaceError(state.error, vm::dismissError) { title, text -> detail = title to text }
             pages.SaveableStateProvider("tab:2") {
-                ConnectionScreen(navigation.copy(connected = state.connected, busy = state.busy || navigation.busy,
-                    status = "ZCode · " + if (state.connected) "已连接" else "未连接"), codex, vm::connect, vm::disconnectManually)
+                ConnectionScreen(environment, EngineConnection(state.connected, state.busy,
+                    if (state.connected) "ZCode · 已连接" else "ZCode · 未连接", state.error, state.challenge, vm.environmentRevision),
+                    app.environment, vm::connect, vm::disconnectManually)
             }
         }
         chat -> WorkspaceScaffold(state.selected!!.title, state.selected!!.workspace(state.projects).project,
@@ -134,7 +127,7 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
                 }
             }
         }
-        else -> pages.SaveableStateProvider("tab:0") { WorkspaceListPage(engine = "zcode", onEngine = { codex.engine(it) },
+        else -> pages.SaveableStateProvider("tab:0") { WorkspaceListPage(engine = "zcode", onEngine = app::selectEngine,
             sessions = state.sessions.map { it.workspace(state.projects, state.connected && state.sessionsFresh, state.liveStatuses, state.listMeta) },
             connected = state.connected, busy = state.busy,
             canCreate = state.connected && !state.busy && !state.pending, canOpen = state.connected && !state.busy,

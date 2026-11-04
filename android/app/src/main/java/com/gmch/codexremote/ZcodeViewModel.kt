@@ -2,6 +2,10 @@ package com.gmch.codexremote
 
 import android.app.Application
 import android.net.Uri
+import com.gmch.codexremote.app.EnvironmentStore
+import com.gmch.codexremote.engines.zcode.ZcodeEngineClient
+import com.gmch.codexremote.engines.contract.EngineOrigin
+import com.gmch.codexremote.engines.presentationItem
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
@@ -21,6 +25,7 @@ private const val INTERACT_RECORDS_MAX = 128
 
 data class ZcodeState(
     val recoveryPhase: RecoveryPhase = RecoveryPhase.Cached,
+    val challenge: HostChallenge? = null,
     val connected: Boolean = false, val busy: Boolean = false, val error: String? = null,
     val providers: List<ZProvider> = emptyList(), val selection: ZSelection? = null, val selectionGuard: String = "",
     val projects: List<ZProject> = emptyList(), val sessions: List<ZSession> = emptyList(),
@@ -63,13 +68,17 @@ data class ZcodeState(
 )
 
 class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
-    private val vault = Vault(app)
+    private val environmentStore = EnvironmentStore.forApp(app)
+    private val vault = environmentStore.vault
+    private var appliedEnvironmentRevision = -1L
+    internal val environmentRevision get() = appliedEnvironmentRevision
     private val mutable = MutableStateFlow(ZcodeState())
     val state = mutable.asStateFlow()
     var active = false
         private set
     private var visible = false
     private val actions = Mutex()
+    private val actionJobs = mutableSetOf<Job>()
     private var transport: SshTransport? = null
     private var retiringTransport: SshTransport? = null
     private var rpc: RpcClient? = null
@@ -118,8 +127,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
-        val raw = runCatching { vault.get("profile") }.getOrNull()
-        profile = raw?.let { runCatching { ConnectionProfile.from(JSONObject(it)) }.getOrNull() }
+        runCatching { environmentStore.refresh() }.getOrNull()?.let {
+            profile = it.profile.takeIf { _ -> it.saved }
+            appliedEnvironmentRevision = it.revision
+        }
         val identity = profile?.resumeIdentity
         restoreJob = viewModelScope.launch {
             if (identity == null) return@launch
@@ -210,8 +221,13 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     private fun key(type: String, id: String = "") = "zcode:$type:${if (type == "pending-interact") profile?.resumeIdentity else profile?.identity}:$id"
     private fun client() = rpc ?: error("请先连接 ZCode")
+    internal fun sessionClient(connection: RpcClient = client()) = ZcodeEngineClient(
+        EngineOrigin(profile?.resumeIdentity ?: "unconfigured", "zcode", "bridge-v1"), connection)
     private suspend fun call(method: String, params: JSONObject = obj()) = client().call(method, params, timeout = 90_000)
-    private fun action(block: suspend () -> Unit) = viewModelScope.launch {
+    private fun action(block: suspend () -> Unit): Job {
+        lateinit var job: Job
+        job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
         val epoch = generation
         actions.withLock {
             if (epoch != generation) return@withLock
@@ -221,30 +237,43 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             catch (e: Exception) { if (epoch == generation) mutable.update { it.copy(error = e.message ?: "请求失败") } }
             finally { if (epoch == generation) mutable.update { it.copy(busy = false) } }
         }
+            } finally { actionJobs.remove(job) }
+        }
+        actionJobs.add(job); job.start()
+        return job
     }
+    private fun cancelEnvironmentActions() { actionJobs.toList().forEach { it.cancel() } }
     fun enter() { active = true; foreground() }
     // A tab change is not an Activity background transition. Keep the channel, pause polling.
     fun leave() { active = false; poll?.cancel(); poll = null; pauseRecovery(all = true); pauseStatuses() }
     fun keepConnection() { visible = true; backgroundJob?.cancel(); backgroundJob = null }
+    internal fun environmentChanging() { cancelEnvironmentActions(); manuallyDisconnected = false; disconnect() }
+    internal fun dismissChallenge() { mutable.update { it.copy(challenge = null) } }
+    internal fun reloadEnvironment(): Boolean {
+        val environment = runCatching { environmentStore.refresh() }.getOrElse { e ->
+            disconnect(); mutable.update { it.copy(error = e.message ?: "无法读取连接配置") }; return false
+        }
+        val next = environment.profile.takeIf { environment.saved }
+        if (environment.revision == appliedEnvironmentRevision && next == profile) return true
+        val changed = next != profile
+        cancelEnvironmentActions()
+        disconnect()
+        appliedEnvironmentRevision = environment.revision
+        profile = next
+        if (changed) {
+            navigationVersion++; entrySelection = null
+            listSyncedAt = 0; historySyncedAt = 0
+            older = emptyList(); outgoingBySession.clear(); pending = null
+            resetInteractionEnvironment(); snoozeStates.clear(); seenActivity.clear()
+            mutable.value = ZcodeState()
+        }
+        return true
+    }
     fun foreground() {
         visible = true
         backgroundJob?.cancel(); backgroundJob = null
         if (!active) return
-        val next = runCatching { vault.get("profile")?.let { ConnectionProfile.from(JSONObject(it)) } }.getOrNull()
-        if (next?.resumeIdentity != profile?.resumeIdentity) {
-            disconnect()
-            navigationVersion++
-            profile = next
-            entrySelection = null
-            listSyncedAt = 0; historySyncedAt = 0
-            older = emptyList(); outgoingBySession.clear(); pending = null
-            // Environment switch: records in memory belong to the old environment (their
-            // vault blob is per-environment and will not reload); drop them wholesale.
-            resetInteractionEnvironment()
-            snoozeStates.clear()
-            seenActivity.clear()
-            mutable.value = ZcodeState()
-        }
+        if (!reloadEnvironment()) return
         if (!mutable.value.connected) { if (!manuallyDisconnected) connect(); return }
         schedulePoll()
         resumePausedAux()
@@ -344,7 +373,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         // attachment drafts are memory-only and dropped with an explicit re-pick prompt.
         attachmentRefs.clear(); attachmentUploading.clear()
         mutable.update {
-            it.copy(connected = false, busy = false, sending = false, historyLoading = false, recoveryPhase = RecoveryPhase.Cached, sessionsFresh = false, liveStatuses = emptyList(),
+            it.copy(challenge = null, connected = false, busy = false, sending = false, historyLoading = false, recoveryPhase = RecoveryPhase.Cached, sessionsFresh = false, liveStatuses = emptyList(),
                 phase = "", executionId = "", interactionCount = 0, currentSelection = null, permission = "",
                 // A session opened but never loaded must not fall back to a blank timeline.
                 historyError = if (it.selected != null && it.items.isEmpty() && it.historyLoading)
@@ -358,6 +387,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun connect() {
+        if (!reloadEnvironment()) return
         manuallyDisconnected = false
         if (job?.isActive == true) return
         if (mutable.value.connected) { refresh(); return }
@@ -425,6 +455,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                     if (epoch == generation && retiringTransport == null) retiringTransport = ssh
                 }
             }
+            } catch (e: HostIdentityException) {
+                if (attempt == generation) mutable.update { it.copy(connected = false, challenge = e.challenge, error = null) }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 if (attempt == generation) mutable.update { it.copy(connected = false,
@@ -456,14 +488,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     private suspend fun loadProjects() {
         val startGeneration = generation
-        val data = call("projects")
+        val data = sessionClient().projects()
         if (generation != startGeneration) return
         listSyncedAt = System.currentTimeMillis()
-        mutable.update { it.copy(sessionsFresh = true, projects = data.optJSONArray("projects").objects().map { p ->
-            ZProject(p.getString("id"), p.getString("name"), p.optJSONArray("roots").strings())
-        }, sessions = data.optJSONArray("sessions").objects().map(ZSession::parse)
-            // Most recently active first; stable sort keeps peers without timestamps in place.
-            .sortedByDescending { it.updatedAt }) }
+        mutable.update { it.copy(sessionsFresh = true, projects = data.projects.map { p -> p.native },
+            sessions = data.sessions!!.items.map { session -> session.native }) }
         publishListMeta()
         // readTree is a complete list. Removed sessions must not survive a cold-start snapshot.
         val selected = mutable.value.selected
@@ -790,21 +819,22 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     fun history() = action {
         val state = mutable.value; val session = state.selected ?: return@action
         val cursor = state.beforeRow ?: return@action
-        val scope = RequestScope(generation, sessionId = session.id)
+        val scope = RequestScope(generation, navigationVersion, session.id)
         mutable.update { it.copy(historyLoading = true) }
         try {
-            val data = call("session/history", session.target().put("beforeRowId", cursor))
-            check(data.string("logEpoch") == state.logEpoch && data.optLong("revision") == state.revision) { "会话已更新，请刷新后重试" }
-            if (!scope.appliesToSession(generation, mutable.value.selected?.id)) return@action
-            older = (zcodeItems(data) + older).distinctBy { it.id }
+            val reader = sessionClient()
+            val ref = reader.session(session)
+            val data = reader.history(ref, reader.cursor(ref, cursor, state.logEpoch, state.revision))
+            if (!scope.appliesTo(generation, navigationVersion, mutable.value.selected?.id)) return@action
+            older = (data.items.map { it.presentationItem() } + older).distinctBy { it.id }
             mutable.update { it.copy(items = (older + it.items).distinctBy { row -> row.id },
-                beforeRow = if (data.optBoolean("hasMore") && !data.isNull("beforeRowId")) data.optDouble("beforeRowId") else null) }
+                beforeRow = data.next?.let(reader::before)) }
             // An older page may contain the formal message of a local record; drop it only
             // after the paginated items are published and the scope still applies.
             reconcileOutgoing(session.id)
         } finally {
             // Never clear the loading state of a session opened while this page was in flight.
-            if (scope.appliesToSession(generation, mutable.value.selected?.id))
+            if (scope.appliesTo(generation, navigationVersion, mutable.value.selected?.id))
                 mutable.update { it.copy(historyLoading = false) }
         }
     }
@@ -1050,6 +1080,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun write(method: String, params: JSONObject, commandId: String? = null,
                              onDispatch: () -> Unit = {}): JSONObject? {
         check(pending == null) { "上一条命令结果尚未确认，请先刷新查询" }
+        val ownerGeneration = generation
         val command = params.put("commandId", commandId ?: UUID.randomUUID().toString())
         // Persist before the member record and any UI state: a failed vault write must
         // leave the previous pending protection and the outgoing records untouched.
@@ -1062,14 +1093,15 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         onDispatch()
         try {
             val ack = call(method, command)
+            check(ownerGeneration == generation) { "连接已变化，请在原环境核对操作结果" }
             finishAck(ack)
             return ack
         } catch (e: RpcException) {
             // Request validation failures are definite. Transport/adapter failures can be uncertain.
-            if (e.code == -32602) clearPending()
+            if (ownerGeneration == generation && e.code == -32602) clearPending()
             throw e
         } finally {
-            mutable.update { it.copy(commandInFlight = false) }
+            if (ownerGeneration == generation) mutable.update { it.copy(commandInFlight = false) }
         }
     }
     private fun clearPending() {

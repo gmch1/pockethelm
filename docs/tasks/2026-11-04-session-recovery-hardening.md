@@ -435,3 +435,8 @@ I/O 和锁的具体约束：
 - 上传商店返回 `published`；公开 HTTPS 索引确认 0.4.26/36，完整下载 `com.gmch.codexremote_36.apk`，其 SHA-256 与索引、已测本地包及已安装包一致。
 - 证据：`~/.local/state/pockethelm/release-0.4.26/`（build.log、device.txt、verified-local.json、upload.json、index-v1.jar、download.apk、store-verified.json、notes.txt、app-release.apk）。
 - 本次只发布批次 A；P2–P4/批次 B–D 仍未实施，不属于本次发行内容。
+
+
+### 后续架构安排（2026-11-04）
+
+用户认可按引擎边界重组项目。后续 B–D 应基于 [引擎扩展边界任务](2026-11-04-engine-boundaries.md) 的应用协调器、注册表及接下来建立的会话端口推进，避免继续在两套 ViewModel 中复制通用流程；既有 0.4.26 发布记录不变。

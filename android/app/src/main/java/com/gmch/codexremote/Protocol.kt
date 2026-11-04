@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
+import com.gmch.codexremote.transport.RpcEndpoint
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
@@ -177,7 +178,7 @@ class RpcClient(
     input: InputStream, private val output: OutputStream,
     private val onEvent: suspend (JSONObject) -> Unit,
     private val onClosed: (Throwable) -> Unit
-) : Closeable {
+) : Closeable, RpcEndpoint {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private data class Request(
         val result: CompletableDeferred<JSONObject>, val onResult: (suspend (JSONObject) -> Unit)?
@@ -220,9 +221,9 @@ class RpcClient(
         }
     }
 
-    suspend fun call(
-        method: String, params: JSONObject = obj(), timeout: Long = 45_000,
-        onResult: (suspend (JSONObject) -> Unit)? = null
+    override suspend fun call(
+        method: String, params: JSONObject, timeout: Long,
+        onResult: (suspend (JSONObject) -> Unit)?
     ): JSONObject {
         check(!closed) { "连接已关闭" }
         val id = serial.incrementAndGet().toString()
