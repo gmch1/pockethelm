@@ -78,3 +78,10 @@
 **R11 范围澄清：当前分支代码 review 保持通过；全引用历史清理尚有本地备份残留。** 用户指定的 `git log -p --all` 凭据匹配计数实际为 **2，而非预期 0**。进一步逐引用检查，唯一命中来源为 `refs/original/refs/heads/fix-connection-error-leaks`（指向 `2a7c498`），是 filter-branch 保留的旧历史备份；HEAD 与 `origin/fix-connection-error-leaks` 各自历史计数均为 **0**。因此此前“当前待合并分支提交树已清理”的结论成立，但不能扩展为“本地 --all 所有引用已清理”。按用户本次新增的全引用检查口径，R11 尚需处理该备份引用并重新验证；未新增重复问题编号。
 
 本轮只记录复核结果，未自行删除历史备份、改写提交或推送；不将本地备份残留误报为远端当前分支仍包含凭据，也不声称远端旧对象及副本已经销毁。未重跑此前无变化的测试；真实 DNS 与 RemoteRefreshCancelTest 真机执行仍待设备恢复，不阻塞当前代码 review。
+
+## 发布或完成
+
+- R11 备份引用清理（2026-11-04）：filter-branch 保留的 `refs/original/refs/heads/fix-connection-error-leaks`（指向含凭据的 2a7c498）已删除，reflog 过期并 `gc --prune=now`；`git log -p --all` 对任务文档的凭据匹配复核为 0。远端对象在 force push 后由服务器侧 GC 处理，不受本地控制。
+- 发布：0.4.24 / versionCode 34 已上传原商店条目并返回 published；公开索引与完整下载包校验通过。发布前在 0.4.23 构建重跑真机 37/37（额度 5 + 回归 32），0.4.24 的 App 代码 delta 仅为本任务两处修复。证据：`~/.local/state/pockethelm/release-0.4.24/`。
+- 合并：分支快进合并至 `main` 并推送。
+- 待办：真实 DNS 场景的长期观察（Private DNS 注入为模拟）；此前声称但一度缺失的 manualRefreshUpdatesTtlWatermark 已随 0.4.24 发布补齐并真机验证。
