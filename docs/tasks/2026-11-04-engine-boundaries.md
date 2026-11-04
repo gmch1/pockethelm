@@ -1,6 +1,6 @@
 # 引擎扩展边界：应用管理与引擎生命周期解耦
 
-状态：应用外壳与只读会话端口已在 refactor-engine-client 本地提交；第三步会话控制、写操作适配、共享流程及可注册传输端点已完成，自查与 129 真机验证通过。第三步尚未提交，未 push 或发布。
+状态：已复审、提交并发布 0.4.27/37。代码提交 284c1bc，位于 refactor-engine-client；未 push，未合并 main。
 
 ## 需求与验收
 
@@ -192,7 +192,7 @@ transport/
 
 **通过。** 实际两引擎创建/发送路径已使用适配器，共用气泡账本；新增引擎可使用公共会话控制器、存储和 UI，传输采用注册端点。协议差异、原生高级扩展、旧存储兼容和不自动重放写入的边界明确。R1–R4 已关闭，没有本轮已知未修复的阻塞问题。
 
-当前第三步代码保留在 refactor-engine-client 工作区，未提交、未 push、未合并、未发布商店。129 上安装最终测试 APK，正常数据和权限保留。新增真实 CLI 的握手、能力映射、远端注册与专项验收仍由该 CLI 接入任务承担；本轮没有声称已经接入第三个真实 CLI。
+第三步终审时的历史状态：代码保留在 refactor-engine-client 工作区，尚未提交、未 push、未合并、未发布商店；随后发布记录见下文。129 上安装最终测试 APK，正常数据和权限保留。新增真实 CLI 的握手、能力映射、远端注册与专项验收仍由该 CLI 接入任务承担；本轮没有声称已经接入第三个真实 CLI。
 
 ## 发布前复审（2026-11-05，0.4.27/37）
 
@@ -215,3 +215,11 @@ transport/
 - 实际发行包 129 定向复验 **53 项：52 通过、1 专用真实空会话夹具跳过、0 失败**。覆盖公共界面/连接替换、Vault、原生 SSH、Codex 新会话与发送、ZCode 发送及列表失败标记。已卸载 instrumentation 包，保留权限基线与正常数据。
 - 发行 APK SHA-256：`8644be32c03e8085b8a9c769383b92f703a61cbec9be2ce26f2e3a28d45e1172`，从 129 拉回安装包校验一致。
 - 本次源文件快照：`efa1f574db3d6f52581c16899221572d18da48fa1870699d2f1fbf0c6001e281`，沿用 android/、scripts/ 已跟踪及未忽略新增文件的 path + NUL + bytes + NUL 口径。证据目录 `~/.local/state/pockethelm/release-0.4.27/`。
+
+
+### 发布记录
+
+- 用户授权后的代码提交：`284c1bc`（refactor-engine-client）。提交前核对暂存源码快照与实际发行构建一致。
+- **已发布 PocketHelm 0.4.27 / versionCode 37**。原商店上传 API 返回 published；公开 HTTPS 索引确认原包名、版本、签名及 SHA-256，完整下载 `com.gmch.codexremote_37.apk` 与本地已测 APK、129 安装包哈希一致：`8644be32c03e8085b8a9c769383b92f703a61cbec9be2ce26f2e3a28d45e1172`。
+- 发布证据：`~/.local/state/pockethelm/release-0.4.27/`，含 source-commit.json、verified-local.json、build-final.log、device.txt、signature.txt、badging.txt、upload.json、index-v1.jar、download.apk、store-verified.json。
+- 按会话约束仅本地提交，**未 push、未合并 main**。未部署远端 dispatcher；现存 Codex/ZCode 入口兼容性已由原生 SSH 测试核验。本次未新增真实模型调用，沿用此前一次 Start Plan Flash 的已清理证据。
