@@ -1,6 +1,6 @@
 # 新建空会话切后台后无法恢复
 
-状态：修复完成，自查通过；发布 0.4.25/35 验证中
+状态：已发布 0.4.25/35；本地提交完成，按用户要求未 push
 
 ## 需求与验收
 
@@ -10,7 +10,7 @@
 
 ## 实现与验证
 
-- 基线 main `e62963a`；分支 `fix-empty-thread-foreground`；产品与测试改动尚未提交。变更文件为 RemoteViewModel.kt、RemoteNewThreadTest.kt，另新增本文档。
+- 基线 main `e62963a`；分支 `fix-empty-thread-foreground`；产品、测试和发行版本提交为 `64722ee`。变更文件为 RemoteViewModel.kt、RemoteNewThreadTest.kt、build.gradle.kts，另新增本文档。
 - 两个源码文件快照 SHA-256（按路径排序，path + NUL + bytes + NUL）：`3789d5602d933336837585436be8a10a227a7a8d629b22c02aadd54fb548ae6d`。
 - 开发机对截图目标元数据读取返回 thread not loaded，原生恢复返回 no rollout found，确认目标无可恢复 rollout。未读取会话内容、未发送消息、未创建替代目标。
 - 未命名 thread/start 仅创建内存会话；历史修复只在用户填写名称时调用 thread/name/set。协议探针确认未命名空会话 resume 失败，而命名后恢复成功；单纯短时重连不一定导致丢失，未声称已复现服务端内存失效的具体时点。
@@ -32,3 +32,12 @@
 ## 发布或完成
 
 用户追加授权：提交并更新商店，先不 push。已核对商店最高版本为 0.4.24/34，本次发行顺延为 0.4.25/35；最终发行包验证进行中。
+
+
+### 0.4.25 / versionCode 35 发布记录（2026-11-04）
+
+- 用户明确授权提交并更新商店，**先不 push**。分支仍为 `fix-empty-thread-foreground`，未合并 main、未推送远程。
+- 发行代码提交 `64722ee`；相对上一轮已测修复只顺延版本元数据。签名 release 构建成功，包名 `com.gmch.codexremote`，Manifest 未启用 debuggable，证书指纹沿用 `54c2508d89048ef721e3d67d0a192397f103886a9f40e65ba31d696c2e2fbab5`。
+- 最终 APK SHA-256：`3701d0e71bdd8a5cddc77ab6f4fbfe382161594d295f51cbfd97a8ebc2541317`。在 129 覆盖安装该发行包并重跑 RemoteNewThreadTest：**12 项，11 通过、1 专用模型夹具条件跳过，0 失败**；安装包拉回哈希与发行包一致。原生权限基线保留、测试包已卸载，未调用模型。
+- 商店上传返回 `published`，公开 HTTPS 索引确认 0.4.25/35；完整下载 `com.gmch.codexremote_35.apk`，哈希与索引、已安装测试包及本地发行包四者一致。
+- 发布证据：`~/.local/state/pockethelm/release-0.4.25/`（build.log、device.txt、verified-local.json、upload.json、index-v1.jar、download.apk、store-verified.json、notes.txt）。
