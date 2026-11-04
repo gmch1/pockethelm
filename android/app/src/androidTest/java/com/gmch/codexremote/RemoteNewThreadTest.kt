@@ -56,12 +56,12 @@ class RemoteNewThreadTest {
     private fun resumed() = obj("thread" to metadata(), "model" to "test-model", "reasoningEffort" to "low",
         "approvalPolicy" to "never", "sandbox" to obj("type" to "dangerFullAccess"))
 
-    private fun script() {
+    private fun script(persistName: Boolean = true) {
         fun on(method: String, handler: (JSONObject) -> JSONObject) {
             bridge.scripted[method] = { request -> requests.add(request); handler(request.getJSONObject("params")) }
         }
         on("thread/start") { mode = it.string("historyMode", "legacy"); materialized = false; resumed() }
-        on("thread/name/set") { title = it.getString("name"); materialized = true; obj() }
+        on("thread/name/set") { title = it.getString("name"); if (persistName) materialized = true; obj() }
         on("thread/list") { obj("data" to JSONArray()) }
         on("thread/read") { obj("thread" to metadata()) }
         on("thread/resume") {
@@ -138,17 +138,17 @@ class RemoteNewThreadTest {
         instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
         settled()
         assertEquals("新会话", state.value.selected?.title)
-        assertTrue(calls("thread/name/set").isEmpty())
+        assertEquals("新会话", calls("thread/name/set").single().getJSONObject("params").getString("name"))
         assertNull(state.value.historyError); assertFalse(state.value.historyLoading)
         assertFalse(state.value.historyCached); assertFalse(state.value.sending)
         assertTrue(state.value.outgoing.isEmpty())
-        // The real server still has no rollout despite historyMode=paginated.
-        // Refresh and settings preparation must recognize the live empty thread.
+        // The default title now persists the empty thread before the first input.
+        // Refresh and first send must work without creating a replacement thread.
         instrumentation.runOnMainSync { vm.retryHistory() }
         settled()
         assertNull(state.value.error); assertNull(state.value.historyError)
         assertFalse(state.value.historyLoading)
-        assertFalse(materialized)
+        assertTrue(materialized)
         instrumentation.runOnMainSync { vm.draft("首条消息"); vm.send(false) }
         settled()
         assertNull(state.value.error)
@@ -174,6 +174,63 @@ class RemoteNewThreadTest {
         assertEquals(1, calls("thread/start").size)
     }
 
+    @Test fun defaultTitleSurvivesBackgroundAndConnectionReplacementWithDraft() = runBlocking {
+        fresh(); script()
+        instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "  ") }
+        settled()
+        assertEquals("新会话", state.value.selected?.title)
+        assertTrue(materialized)
+        instrumentation.runOnMainSync { vm.draft("切后台前尚未发送的草稿"); vm.background() }
+        // Model daemon eviction: only persisted threads can be read on the next
+        // connection. Old unnamed creation fails this contract with thread not loaded.
+        instrumentation.runOnMainSync { vm.disconnect() }
+        bridge.close()
+        bridge = FakeRpcBridge(vm).also { it.install() }; script()
+        bridge.scripted["thread/read"] = {
+            if (!materialized) throw FakeRpcBridge.FakeRpcError(-32600, "thread not loaded: new-thread")
+            obj("thread" to metadata())
+        }
+        state.value = state.value.copy(connected = true, saved = true)
+        RemoteViewModel::class.java.getDeclaredField("backgroundAt").apply { isAccessible = true }
+            .setLong(vm, System.currentTimeMillis() - 6_000)
+        val before = calls("thread/items/list").size
+        instrumentation.runOnMainSync { vm.foreground() }
+        withTimeout(15_000) {
+            while (calls("thread/items/list").size == before || state.value.historyLoading) delay(20)
+        }
+        assertEquals("new-thread", state.value.selected?.id)
+        assertEquals("切后台前尚未发送的草稿", state.value.draft)
+        assertNull(state.value.error); assertNull(state.value.historyError)
+        assertTrue(state.value.items.isEmpty())
+        assertEquals(1, calls("thread/start").size)
+        assertTrue(calls("turn/start").isEmpty())
+    }
+
+    @Test fun legacyLiveUnmaterializedThreadStillRefreshesAndSends() = runBlocking {
+        fresh(); script(persistName = false)
+        instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
+        settled()
+        assertFalse(materialized)
+        instrumentation.runOnMainSync { vm.retryHistory() }
+        settled()
+        assertNull(state.value.error); assertNull(state.value.historyError)
+        instrumentation.runOnMainSync { vm.draft("旧版内存空会话首条消息"); vm.send(false) }
+        settled()
+        assertNull(state.value.error)
+        assertEquals("旧版内存空会话首条消息", state.value.items.single().text)
+        assertEquals(1, calls("turn/start").size)
+    }
+
+    @Test fun defaultTitlePersistenceFailureDoesNotPretendCreationSucceeded() = runBlocking {
+        fresh(); script()
+        bridge.scripted["thread/name/set"] = { throw FakeRpcBridge.FakeRpcError(-32603, "持久化失败") }
+        instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
+        settled()
+        assertNull(state.value.selected)
+        assertEquals("持久化失败", state.value.error)
+        assertTrue(calls("turn/start").isEmpty())
+    }
+
     @Test fun missingRolloutForStoredHistoryIsNotTreatedAsANewThread() = runBlocking {
         fresh(); script()
         instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "[测试]已有历史") }
@@ -191,7 +248,7 @@ class RemoteNewThreadTest {
     }
 
     @Test fun anotherThreadsUnmaterializedErrorCannotAuthorizeThisSend() = runBlocking {
-        fresh(); script()
+        fresh(); script(persistName = false)
         instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
         settled()
         bridge.scripted["thread/turns/list"] = { throw FakeRpcBridge.FakeRpcError(-32600,
@@ -204,7 +261,7 @@ class RemoteNewThreadTest {
     }
 
     @Test fun activeUnmaterializedThreadDoesNotStartOrQueueAnotherTurn() = runBlocking {
-        fresh(); script()
+        fresh(); script(persistName = false)
         instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
         settled()
         bridge.scripted["thread/read"] = { obj("thread" to metadata().put("status", obj("type" to "active"))) }

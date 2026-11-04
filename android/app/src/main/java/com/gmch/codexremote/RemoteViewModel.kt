@@ -698,9 +698,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val result = client().call("thread/start", params)
         assertYolo(result)
         val session = SessionInfo.parse(result.getJSONObject("thread"))
-        if (name.isNotBlank()) client().call("thread/name/set", obj("threadId" to session.id, "name" to name.trim().take(120)))
+        // thread/start alone leaves an unnamed empty thread only in daemon memory.
+        // Naming also persists its rollout, so background disconnects/daemon eviction
+        // cannot destroy the session before its first input. Do this for the default
+        // title too; never claim creation succeeded until the server confirms it.
+        val title = name.trim().take(120).ifBlank { "新会话" }
+        client().call("thread/name/set", obj("threadId" to session.id, "name" to title))
         selectionVersion++; timeline.clear()
-        mutable.update { it.copy(selected = session.copy(title = name.ifBlank { "新会话" }), items = emptyList(), queue = emptyList(),
+        mutable.update { it.copy(selected = session.copy(title = title), items = emptyList(), queue = emptyList(),
             historyCursor = null, draft = "", uncertain = null, diff = "", tab = 0, modelSettings = ModelSettings.parse(result), settingsNotice = null,
             historyLoading = false, historyError = null, historyCached = false, sending = false, outgoing = emptyList()) }
         loadSessions(false)
