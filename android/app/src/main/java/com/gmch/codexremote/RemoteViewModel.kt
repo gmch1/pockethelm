@@ -1,11 +1,14 @@
 package com.gmch.codexremote
 
 import android.app.Application
+import com.gmch.codexremote.application.OutgoingLedger
 import android.net.Uri
 import com.gmch.codexremote.app.EnvironmentStore
 import com.gmch.codexremote.app.EnvironmentController
 import com.gmch.codexremote.engines.verifyLegacyEnvironment
 import com.gmch.codexremote.engines.codex.CodexEngineClient
+import com.gmch.codexremote.engines.codex.CodexAttachment
+import com.gmch.codexremote.engines.contract.*
 import com.gmch.codexremote.engines.contract.EngineOrigin
 import com.gmch.codexremote.engines.contract.SessionQuery
 import com.gmch.codexremote.engines.contract.HistoryCursor
@@ -49,11 +52,11 @@ data class UiState(
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
-    private data class ThreadAttachment(val response: JSONObject, val unmaterialized: Boolean = false)
     private val environmentStore = EnvironmentStore.forApp(app)
     private val vault = environmentStore.vault
     private var appliedEnvironmentRevision = -1L
     internal val environmentRevision get() = appliedEnvironmentRevision
+    internal val connectionRevision get() = epoch.toLong()
     private val mutable = MutableStateFlow(UiState())
     val state = mutable.asStateFlow()
     private val actions = Mutex()
@@ -85,7 +88,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val turnRevisions = mutableMapOf<String, Long>()
     // Locally-sent messages awaiting reconciliation, keyed by environment identity + session
     // so a profile switch or a conversation switch never leaks records across.
-    private val outgoingBySession = LinkedHashMap<OutgoingKey, MutableList<OutgoingMessage>>()
+    private val outgoingLedger = OutgoingLedger(::publishOutgoing)
+    private val outgoingBySession = outgoingLedger.records
     private var paintJob: Job? = null
     private val cache = ResumeCache(app, "codex")
     private val restoreJob: Job
@@ -336,7 +340,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 try {
                     retiringTransport?.let { check(it.awaitClosed()) { "旧连接尚未释放，请稍后重连" }; retiringTransport = null }
                     val connectionDeadline = System.nanoTime() + 45_000_000_000L
-                    withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(mutable.value.profile, vault, environmentStore.targetPassphrase, environmentStore.jumpPassphrase) }
+                    withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(mutable.value.profile, vault, environmentStore.targetPassphrase, environmentStore.jumpPassphrase, com.gmch.codexremote.engines.BuiltinEndpoints.Codex) }
                     ensureActive()
                     val connection = RpcClient(ssh.input, ssh.output, { event ->
                         withContext(Dispatchers.Main) { if (generation == epoch) handle(event) }
@@ -443,33 +447,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             sessions = state.sessions.map { if (it.id == id) it.copy(model = settings.model) else it }) }
     }
 
-    private suspend fun resumeSettings(id: String, connection: RpcClient = client(), yoloMode: Boolean = false): ThreadAttachment {
+    private suspend fun resumeSettings(id: String, connection: RpcClient = client(), yoloMode: Boolean = false): CodexAttachment {
         val generation = epoch; val selection = selectionVersion
-        val params = (if (yoloMode) yolo() else obj()).put("threadId", id).put("excludeTurns", true)
-        try {
-            return ThreadAttachment(connection.call("thread/resume", params, onResult = { result ->
-                withContext(Dispatchers.Main) {
-                    if (generation == epoch && selection == selectionVersion && mutable.value.selected?.id == id)
-                        acceptSettings(id, ModelSettings.parse(result))
-                }
-            }))
-        } catch (e: RpcException) {
-            // An unnamed thread already exists in memory, but has no rollout until its
-            // first input. A metadata read and the target-specific history error must
-            // both confirm this case; never bypass an arbitrary resume rejection.
-            if (e.code != -32600 || e.message != "no rollout found for thread id $id") throw e
-            val metadata = connection.call("thread/read", obj("threadId" to id, "includeTurns" to false)).getJSONObject("thread")
-            if (metadata.string("id") != id || metadata.optJSONObject("status")?.string("type") !in setOf("idle", "active")) throw e
-            try {
-                connection.call("thread/turns/list", obj("threadId" to id, "limit" to 1,
-                    "sortDirection" to "desc", "itemsView" to "notLoaded"))
-            } catch (history: RpcException) {
-                if (history.code == -32600 && history.message ==
-                    "thread $id is not materialized yet; thread/turns/list is unavailable before first user message")
-                    return ThreadAttachment(obj("thread" to metadata), unmaterialized = true)
-                throw e
+        val adapter = sessionClient(connection)
+        return adapter.attach(adapter.session(id), yoloMode) { settings ->
+            withContext(Dispatchers.Main) {
+                if (generation == epoch && selection == selectionVersion && mutable.value.selected?.id == id) acceptSettings(id, settings)
             }
-            throw e
         }
     }
 
@@ -719,22 +703,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun createThread(cwd: String, name: String) = action {
-        require(cwd.startsWith('/')) { "请选择项目绝对路径" }
-        // All history reads below use the paginated contract. Legacy threads are not
-        // materialized until their first message, so resuming one before send fails.
-        val params = yolo().put("cwd", cwd).put("historyMode", "paginated")
-        val result = client().call("thread/start", params)
-        assertYolo(result)
-        val session = SessionInfo.parse(result.getJSONObject("thread"))
-        // thread/start alone leaves an unnamed empty thread only in daemon memory.
-        // Naming also persists its rollout, so background disconnects/daemon eviction
-        // cannot destroy the session before its first input. Do this for the default
-        // title too; never claim creation succeeded until the server confirms it.
-        val title = name.trim().take(120).ifBlank { "新会话" }
-        client().call("thread/name/set", obj("threadId" to session.id, "name" to title))
+        val created = sessionClient().create(EngineCreateRequest(UUID.randomUUID().toString(), cwd, name))
+        val session = created.session.native
         pauseRecovery(); selectionVersion++; timeline.clear()
-        mutable.update { it.copy(recoveryPhase = RecoveryPhase.Ready, selected = session.copy(title = title), items = emptyList(), queue = emptyList(),
-            historyCursor = null, draft = "", uncertain = null, diff = "", tab = 0, modelSettings = ModelSettings.parse(result), settingsNotice = null,
+        mutable.update { it.copy(recoveryPhase = RecoveryPhase.Ready, selected = session, items = emptyList(), queue = emptyList(),
+            historyCursor = null, draft = "", uncertain = null, diff = "", tab = 0, modelSettings = created.settings, settingsNotice = null,
             historyLoading = false, historyError = null, historyCached = false, sending = false, outgoing = emptyList()) }
         loadSessions(false)
     }
@@ -885,32 +858,26 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             if (imagePaths.isNotEmpty()) receipt.put("imagePaths", JSONArray(imagePaths))
-            val params = obj("threadId" to selected.id, "clientUserMessageId" to clientId,
-                "input" to messageInput(text, imagePaths))
-            // Persist before the write only. On timeout/disconnect after this point, do not
-            // automatically replay a possibly accepted write.
-            vault.put(pendingKey, receipt.toString())
-            // Display only: the protection prompt stays owned by uncertain; sending merely hides it in flight.
-            mutable.update { it.copy(uncertain = receipt) }
-            // From this point the server may consume the files at any time — even an
-            // unsettled (timeout/lost-receipt) send keeps them undeletable forever.
-            protectedIds.addAll(attachments.map { it.id })
-            dispatched = true
-            when {
-                steer -> {
-                    check(resumed.runtime == "active" && selected.activeTurnId.isNotBlank()) { "当前没有可介入的执行，请刷新后重试" }
-                    client().call("turn/steer", params.put("expectedTurnId", selected.activeTurnId))
-                }
-                resumed.runtime == "active" -> client().call("thread/queue/add", params)
-                else -> client().call("turn/start", params.put("approvalPolicy", "never").put("sandboxPolicy", obj("type" to "dangerFullAccess")))
+            val sender = sessionClient(connection)
+            val ref = sender.session(selected.id)
+            val sent = sender.sendAttached(EngineMessage(ref, clientId, text,
+                if (steer) MessageDelivery.Steer else MessageDelivery.Auto, selected.activeTurnId,
+                attachments = attachments.zip(imagePaths).map { (item, path) ->
+                    EngineAttachment(ref, path, item.fileName, item.mime, item.bytes.toLong())
+                }), attachment) {
+                check(generation == epoch && selection == selectionVersion) { "会话已切换，消息尚未发送" }
+                vault.put(pendingKey, receipt.toString())
+                mutable.update { it.copy(uncertain = receipt) }
+                protectedIds.addAll(attachments.map { it.id })
+                dispatched = true
             }
             ackAccepted = true
             // The receipt states what the server did with the submission, not that the model
             // has read it; the bubble stays until history or the queue reconciles it by id.
-            val (settled, ack) = when {
-                steer -> OutgoingState.ACCEPTED to "已插入"
-                resumed.runtime == "active" -> OutgoingState.QUEUED to "已排队"
-                else -> OutgoingState.ACCEPTED to "已接收"
+            val (settled, ack) = when (sent.delivery) {
+                ReceiptDelivery.Steered -> OutgoingState.ACCEPTED to "已插入"
+                ReceiptDelivery.Queued -> OutgoingState.QUEUED to "已排队"
+                ReceiptDelivery.Accepted -> OutgoingState.ACCEPTED to "已接收"
             }
             updateOutgoing(key, clientId) { it.copy(state = settled, receipt = ack) }
             vault.put(pendingKey, null)
@@ -923,6 +890,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 mutable.update { it.copy(draft = if (clearDraft) "" else it.draft, uncertain = null,
                     attachments = it.attachments.filterNot { a -> a.id in attachments.map { b -> b.id } },
                     attachmentsBusy = if (selection == selectionVersion) false else it.attachmentsBusy) }
+        } catch (e: EngineRejectedException) {
+            vault.put(pendingKey, null)
+            updateOutgoing(key, clientId) { it.copy(state = OutgoingState.FAILED) }
+            if (generation == epoch && mutable.value.selected?.id == selected.id) mutable.update { it.copy(uncertain = null) }
+            throw e
         } catch (e: RpcException) {
             // An explicit server rejection is authoritative: 发送失败, draft kept. Before the
             // write this also means nothing was sent; afterwards the server answered for the write.
@@ -966,26 +938,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             mutable.update { it.copy(outgoing = (outgoingBySession[key] ?: emptyList()).toList()) }
     }
 
-    private fun addOutgoing(key: OutgoingKey, message: OutgoingMessage) {
-        val list = outgoingBySession.getOrPut(key) { mutableListOf() }
-        list.removeAll { it.clientId == message.clientId }
-        list.add(message)
-        // Reconciled records are dropped on arrival. Never silently drop an unconfirmed
-        // (SENDING/UNCERTAIN) or awaiting-reconciliation (ACCEPTED/QUEUED) record — the
-        // bound only trims settled failures.
-        while (list.size > 20) {
-            val oldestFailed = list.indexOfFirst { it.state == OutgoingState.FAILED }
-            if (oldestFailed < 0) break
-            list.removeAt(oldestFailed)
-        }
-        publishOutgoing(key)
-    }
-
-    private fun updateOutgoing(key: OutgoingKey, clientId: String, transform: (OutgoingMessage) -> OutgoingMessage) {
-        val list = outgoingBySession[key] ?: return
-        val index = list.indexOfFirst { it.clientId == clientId }
-        if (index >= 0) { list[index] = transform(list[index]); publishOutgoing(key) }
-    }
+    private fun addOutgoing(key: OutgoingKey, message: OutgoingMessage) = outgoingLedger.add(key, message)
+    private fun updateOutgoing(key: OutgoingKey, clientId: String, transform: (OutgoingMessage) -> OutgoingMessage) =
+        outgoingLedger.update(key, clientId, transform)
 
     fun dismissFailed(message: OutgoingMessage) {
         if (mutable.value.selected?.id != message.sessionId) return
@@ -994,21 +949,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         if (current.state == OutgoingState.FAILED) removeOutgoing(key, current.clientId)
     }
 
-    private fun removeOutgoing(key: OutgoingKey, clientId: String) {
-        val list = outgoingBySession[key] ?: return
-        if (list.removeAll { it.clientId == clientId }) publishOutgoing(key)
-    }
-
-    private fun markOutgoingUncertain(key: OutgoingKey, clientId: String? = null) {
-        val list = outgoingBySession[key] ?: return
-        var changed = false
-        list.replaceAll { m ->
-            if ((clientId == null || m.clientId == clientId) && m.state == OutgoingState.SENDING) {
-                changed = true; m.copy(state = OutgoingState.UNCERTAIN)
-            } else m
-        }
-        if (changed) publishOutgoing(key)
-    }
+    private fun removeOutgoing(key: OutgoingKey, clientId: String?) = outgoingLedger.remove(key, clientId)
+    private fun markOutgoingUncertain(key: OutgoingKey, clientId: String? = null) = outgoingLedger.uncertain(key, clientId)
 
     /** Drops bubbles whose real userMessage (or queue entry) has arrived under the same id. */
     private fun reconcileOutgoing(id: String) {
@@ -1019,8 +961,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val itemIds = timeline.values.filter { it.kind == "userMessage" }
             .map { it.clientId }.filter { it.isNotBlank() }.toSet()
         val queueIds = mutable.value.queue.map { it.clientId }.filter { it.isNotBlank() }.toSet()
-        val remaining = reconcileOutgoingList(list, itemIds, queueIds)
-        if (remaining.size != list.size) { outgoingBySession[key] = remaining.toMutableList(); publishOutgoing(key) }
+        outgoingLedger.reconcile(key, itemIds, queueIds)
     }
 
     private fun reconcilePending(id: String) {
@@ -1047,7 +988,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun interrupt() = action {
         val session = mutable.value.selected ?: return@action
         require(session.activeTurnId.isNotBlank()) { "执行轮次尚未同步，请刷新后重试" }
-        client().call("turn/interrupt", obj("threadId" to session.id, "turnId" to session.activeTurnId))
+        val adapter = sessionClient()
+        adapter.interrupt(adapter.session(session.id), session.activeTurnId, UUID.randomUUID().toString())
     }
     fun deleteQueued(message: QueuedMessage) = action {
         val id = mutable.value.selected?.id ?: return@action
@@ -1056,7 +998,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun rename(name: String) = action {
         val id = mutable.value.selected?.id ?: return@action
         require(name.isNotBlank())
-        client().call("thread/name/set", obj("threadId" to id, "name" to name.trim()))
+        val adapter = sessionClient()
+        adapter.rename(adapter.session(id), name)
         loadThreadGuarded(id); loadSessions(false)
     }
     /** Answer a pending approval on the connection it arrived on. */

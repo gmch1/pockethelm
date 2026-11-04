@@ -1,9 +1,12 @@
 package com.gmch.codexremote
 
 import android.app.Application
+import com.gmch.codexremote.application.OutgoingLedger
 import android.net.Uri
 import com.gmch.codexremote.app.EnvironmentStore
 import com.gmch.codexremote.engines.zcode.ZcodeEngineClient
+import com.gmch.codexremote.engines.zcode.ZcodeSnapshot
+import com.gmch.codexremote.engines.contract.*
 import com.gmch.codexremote.engines.contract.EngineOrigin
 import com.gmch.codexremote.engines.presentationItem
 import androidx.lifecycle.AndroidViewModel
@@ -72,6 +75,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private val vault = environmentStore.vault
     private var appliedEnvironmentRevision = -1L
     internal val environmentRevision get() = appliedEnvironmentRevision
+    internal val connectionRevision get() = generation.toLong()
     private val mutable = MutableStateFlow(ZcodeState())
     val state = mutable.asStateFlow()
     var active = false
@@ -95,7 +99,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private var older = emptyList<TimelineItem>()
     // Locally-sent messages awaiting reconciliation, keyed by environment identity + session
     // so a reconnect to another dev machine or a conversation switch never leaks records.
-    private val outgoingBySession = LinkedHashMap<OutgoingKey, MutableList<OutgoingMessage>>()
+    private val outgoingLedger = OutgoingLedger(::publishOutgoing)
+    private val outgoingBySession = outgoingLedger.records
     private val cache = ResumeCache(app, "zcode")
     private val restoreJob: Job
     private var backgroundJob: Job? = null
@@ -162,25 +167,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             mutable.update { it.copy(outgoing = (outgoingBySession[key] ?: emptyList()).toList()) }
     }
 
-    private fun addOutgoing(key: OutgoingKey, message: OutgoingMessage) {
-        val list = outgoingBySession.getOrPut(key) { mutableListOf() }
-        list.removeAll { it.clientId == message.clientId }
-        list.add(message)
-        // Never silently drop unconfirmed or awaiting-reconciliation records; only settled
-        // failures are trimmed once the bound is exceeded.
-        while (list.size > 20) {
-            val oldestFailed = list.indexOfFirst { it.state == OutgoingState.FAILED }
-            if (oldestFailed < 0) break
-            list.removeAt(oldestFailed)
-        }
-        publishOutgoing(key)
-    }
-
-    private fun updateOutgoing(key: OutgoingKey, clientId: String, transform: (OutgoingMessage) -> OutgoingMessage) {
-        val list = outgoingBySession[key] ?: return
-        val index = list.indexOfFirst { it.clientId == clientId }
-        if (index >= 0) { list[index] = transform(list[index]); publishOutgoing(key) }
-    }
+    private fun addOutgoing(key: OutgoingKey, message: OutgoingMessage) = outgoingLedger.add(key, message)
+    private fun updateOutgoing(key: OutgoingKey, clientId: String, transform: (OutgoingMessage) -> OutgoingMessage) =
+        outgoingLedger.update(key, clientId, transform)
 
     fun dismissFailed(message: OutgoingMessage) {
         if (mutable.value.selected?.id != message.sessionId) return
@@ -189,22 +178,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (current.state == OutgoingState.FAILED) removeOutgoing(key, current.clientId)
     }
 
-    private fun removeOutgoing(key: OutgoingKey, clientId: String?) {
-        if (clientId.isNullOrBlank()) return
-        val list = outgoingBySession[key] ?: return
-        if (list.removeAll { it.clientId == clientId }) publishOutgoing(key)
-    }
-
-    private fun markOutgoingUncertain(key: OutgoingKey, clientId: String? = null) {
-        val list = outgoingBySession[key] ?: return
-        var changed = false
-        list.replaceAll { m ->
-            if ((clientId == null || m.clientId == clientId) && m.state == OutgoingState.SENDING) {
-                changed = true; m.copy(state = OutgoingState.UNCERTAIN)
-            } else m
-        }
-        if (changed) publishOutgoing(key)
-    }
+    private fun removeOutgoing(key: OutgoingKey, clientId: String?) = outgoingLedger.remove(key, clientId)
+    private fun markOutgoingUncertain(key: OutgoingKey, clientId: String? = null) = outgoingLedger.uncertain(key, clientId)
 
     /** Drops bubbles whose real userMessage (or queue entry) has arrived under the same id. */
     private fun reconcileOutgoing(sessionId: String) {
@@ -213,8 +188,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val list = outgoingBySession[key] ?: return
         if (list.isEmpty()) return
         val (itemIds, queueIds) = reconcileIdsForRead(mutable.value.items, mutable.value.queue)
-        val remaining = reconcileOutgoingList(list, itemIds, queueIds)
-        if (remaining.size != list.size) { outgoingBySession[key] = remaining.toMutableList(); publishOutgoing(key) }
+        outgoingLedger.reconcile(key, itemIds, queueIds)
     }
     private val clientId: String by lazy {
         vault.get("zcode:clientId") ?: ("pockethelm-" + UUID.randomUUID()).also { vault.put("zcode:clientId", it) }
@@ -298,7 +272,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             started = { if (!silent) mutable.update { it.copy(recoveryPhase = RecoveryPhase.Restoring,
                 historyLoading = session != null, historyError = null, error = null) } },
             failed = { e -> mutable.update { it.copy(recoveryPhase = RecoveryPhase.Failed, historyLoading = false,
-                historyError = if (session != null) e.message else it.historyError, error = e.message) } },
+                historyError = if (session != null) e.message else it.historyError,
+                sessionsFresh = if (session == null) false else it.sessionsFresh, error = e.message) } },
             finished = { mutable.update { it.copy(historyLoading = false,
                 recoveryPhase = if (it.recoveryPhase == RecoveryPhase.Failed) it.recoveryPhase else RecoveryPhase.Ready) } }) {
             if (session == null) loadProjects() else {
@@ -416,7 +391,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 retiringTransport?.let { check(it.awaitClosed()) { "旧连接尚未释放，请稍后重连" }; retiringTransport = null }
                 val connectionDeadline = System.nanoTime() + 45_000_000_000L
-                withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(next, vault, "", "", zcode = true) }
+                withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(next, vault, "", "", endpoint = com.gmch.codexremote.engines.BuiltinEndpoints.Zcode) }
                 currentCoroutineContext().ensureActive()
                 val connection = RpcClient(ssh.input, ssh.output, {}, { error ->
                     viewModelScope.launch {
@@ -631,16 +606,19 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (cached && android.os.SystemClock.elapsedRealtime() - quotaFetchedAt < quotaTtlMs) return
         quota()
     }
+    private fun selectedChoice(adapter: ZcodeEngineClient): EngineChoice {
+        selectionParams() // Preserve the live model/guard validation before dispatch.
+        val choice = mutable.value.selection!!
+        return EngineChoice(adapter.origin, choice.provider, choice.model, choice.level, mutable.value.selectionGuard)
+    }
     fun create(project: ZProject) = action {
         check(project.roots.size == 1) { "当前仅支持单目录项目" }
-        val params = selectionParams().put("workspacePath", project.roots.single()).put("projectId", project.id)
-        val result = write("session/create", params)
-        val id = result?.optJSONObject("result")?.string("sessionId").orEmpty()
-        if (id.isNotBlank()) {
-            select(ZSession(id, "新会话", project.roots.single(), project = project.id))
-            readGuarded(mutable.value.selected!!)
-            loadProjects()
-        }
+        val adapter = sessionClient()
+        val request = EngineCreateRequest(UUID.randomUUID().toString(), project.roots.single(), projectId = project.id, choice = selectedChoice(adapter))
+        val result = commandTransaction("session/create", adapter.createParams(request), request.commandId) { adapter.create(request) }
+        select(result.session.native)
+        readGuarded(mutable.value.selected!!)
+        loadProjects()
     }
     fun open(session: ZSession) {
         if (!mutable.value.connected && sameTarget(mutable.value.selected, session)) return
@@ -750,25 +728,27 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             .map { it.interactionId }).distinct().take(16)
         if (checks.isNotEmpty() && interactSupport)
             request.put("checkInteractionIds", org.json.JSONArray(checks))
-        var data = connection.call("session/read", request, timeout = 90_000)
+        val adapter = sessionClient(connection)
+        val ref = adapter.session(session)
+        var data = adapter.readNative(ref, if (interactSupport) checks else emptyList())
         fun isCurrent() = current(scope) && navigation == navigationVersion && (snapshotApplied[target] ?: 0L) <= sequence
         if (!isCurrent()) return
         val visible = mutable.value
         val previous = snapshotVersions[target] ?: if (sameTarget(visible.selected, session) && visible.logEpoch.isNotBlank())
             SnapshotVersion(visible.logEpoch, visible.revision) else null
-        var epoch = data.string("logEpoch")
-        var revision = data.optLong("revision")
+        var epoch = data.logEpoch
+        var revision = data.revision
         if (previous != null) {
             if (epoch == previous.epoch && revision < previous.revision) return
             if (epoch != previous.epoch) {
                 if (epoch in previous.retired) return
                 // Epochs have no ordering. Establish a changed epoch with a second fresh read
                 // before it may revoke any answer protection or replace the visible history.
-                val confirmation = connection.call("session/read", request, timeout = 90_000)
-                if (!isCurrent() || confirmation.string("logEpoch") != epoch ||
-                    confirmation.optLong("revision") < revision) return
+                val confirmation = adapter.readNative(ref, if (interactSupport) checks else emptyList())
+                if (!isCurrent() || confirmation.logEpoch != epoch ||
+                    confirmation.revision < revision) return
                 data = confirmation
-                revision = data.optLong("revision")
+                revision = data.revision
             }
         }
         snapshotApplied[target] = sequence
@@ -780,30 +760,30 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (!isCurrent() || !sameTarget(mutable.value.selected, session)) return
         historySyncedAt = System.currentTimeMillis()
-        val items = zcodeItems(data)
+        val items = data.items
         if (epoch != mutable.value.logEpoch || revision != mutable.value.revision) older = emptyList()
-        val actual = ZSelection.parse(data.optJSONObject("selection"))
+        val actual = data.selection
         val entering = entrySelection?.takeIf { it.navigation == navigation &&
             it.choiceVersion == choiceVersion && sameTarget(it.session, session) }
         val syncChoice = entering != null || (useSessionSelection && choiceAtStart == choiceVersion)
-        val queue = queueEntries(data)
-        val first = if (data.isNull("firstRowId")) null else data.optDouble("firstRowId")
-        val interactions = if (interactSupport) zcodeInteractions(data) else emptyList()
+        val queue = data.queue
+        val first = data.firstRowId
+        val interactions = if (interactSupport) data.interactions else emptyList()
         activityBeforeRead?.let { seenActivity[session.id] = maxOf(seenActivity[session.id] ?: 0, it) }
-        mutable.update { it.copy(selected = session.copy(title = data.string("title").ifBlank { session.title }),
-            items = (older + items).distinctBy { row -> row.id }, phase = data.string("phase"), queue = queue,
-            executionId = if (data.optBoolean("canStop")) data.string("executionId") else "",
-            interactionCount = data.optInt("interactionCount"), currentSelection = actual,
-            interactions = interactions, interactionsComplete = data.optBoolean("interactionsComplete"),
-            interactionPresence = interactionPresence(data),
+        mutable.update { it.copy(selected = session.copy(title = data.title.ifBlank { session.title }),
+            items = (older + items).distinctBy { row -> row.id }, phase = data.phase, queue = queue,
+            executionId = if (data.canStop) data.executionId else "",
+            interactionCount = data.interactionCount, currentSelection = actual,
+            interactions = interactions, interactionsComplete = data.interactionsComplete,
+            interactionPresence = data.presence,
             selection = if (syncChoice) actual ?: it.selection else it.selection,
             selectionGuard = if (syncChoice && actual != null) it.providers.find { p -> p.id == actual.provider }?.guard.orEmpty() else it.selectionGuard,
-            permission = if (data.string("mode") == "yolo") "完全访问" else data.string("mode"),
+            permission = if (data.mode == "yolo") "完全访问" else data.mode,
             historyLoading = false, historyError = null, historyCached = false,
-            beforeRow = if (older.isNotEmpty()) it.beforeRow else first?.takeIf { _ -> data.optBoolean("hasMore") },
+            beforeRow = if (older.isNotEmpty()) it.beforeRow else first?.takeIf { _ -> data.hasMore },
             logEpoch = epoch, revision = revision,
-            turn = ZTurn.parse(data.optJSONObject("turn")),
-            notice = noticeForPhase(data.string("phase"), data.string("lastError").ifBlank { it.notice })) }
+            turn = data.turn,
+            notice = noticeForPhase(data.phase, data.lastError.ifBlank { it.notice })) }
         if (entering != null && entrySelection === entering) {
             entrySelection = null
             pausedAux.remove("aux:quota")
@@ -844,10 +824,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val attachments = state.attachments
         check(!state.attachmentsBusy) { "图片处理中，请稍候再发送" }
         check(text.isNotBlank() || attachments.isNotEmpty()) { "请输入消息或添加图片" }
-        val params = session.target()
-        val selection = selectionParams()
-        params.put("selection", selection.get("selection")).put("guard", selection.get("guard"))
-            .put("text", text).put("delivery", state.delivery)
+        val adapter = sessionClient()
+        val ref = adapter.session(session)
+        val choice = selectedChoice(adapter)
         val ownerSelection = attachmentSelection
         val gen = generation
         val scope = RequestScope(gen, sessionId = session.id)
@@ -866,25 +845,22 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             // The upload runs inside the try: its failure must flow the normal FAILED
             // receipt + finally reset like every other pre-dispatch failure. Attachment
             // params are assembled only afterwards — refs exist exclusively after upload.
-            if (attachments.isNotEmpty()) {
-                uploadAttachments(session)
-                val sent = attachments.map { attachment ->
-                    val ref = attachmentRefs[attachment.id]
-                        ?: error("图片尚未上传完成：${attachment.displayName}")
-                    obj("ref" to ref, "fileName" to attachment.fileName,
-                        "mime" to attachment.mime, "bytes" to attachment.bytes)
-                }
-                params.put("attachments", org.json.JSONArray().apply { sent.forEach { put(it) } })
+            if (attachments.isNotEmpty()) uploadAttachments(session)
+            check(gen == generation && ownerSelection == attachmentSelection) { "会话已切换，消息尚未发送" }
+            val request = EngineMessage(ref, commandId, text,
+                if (state.delivery == "guide") MessageDelivery.Steer else MessageDelivery.Queue,
+                choice = choice, attachments = attachments.map { item ->
+                    EngineAttachment(ref, attachmentRefs[item.id] ?: error("图片尚未上传完成：${item.displayName}"),
+                        item.fileName, item.mime, item.bytes.toLong())
+                })
+            val result = commandTransaction("session/send", adapter.messageParams(request), commandId, { dispatched = true }) {
+                adapter.send(request)
             }
-            // dispatched flips only after the pending record was persisted and just before
-            // the RPC leaves; a failed guard or vault write below this point is a definite
-            // local failure (nothing was sent) and must not touch the previous pending.
-            val result = write("session/send", params, commandId) { dispatched = true }
-            if (result != null) {
+            run {
                 ackAccepted = true
                 // Receipt follows the server's actual delivery; a requested guide may be
                 // accepted as queue. It never claims the model has read the message.
-                val delivery = result.optJSONObject("result")?.string("delivery").orEmpty()
+                val delivery = when (result.delivery) { ReceiptDelivery.Queued -> "queue"; ReceiptDelivery.Steered -> "guide"; ReceiptDelivery.Accepted -> "startNow" }
                 updateOutgoing(key, commandId) { it.copy(
                     state = if (delivery == "queue") OutgoingState.QUEUED else OutgoingState.ACCEPTED,
                     receipt = deliveryReceipt(delivery)) }
@@ -901,6 +877,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 // current connection; a stale read must not report errors into a new session.
                 if (scope.appliesToSession(generation, mutable.value.selected?.id)) read(session)
             }
+        } catch (e: EngineRejectedException) {
+            if (!ackAccepted) updateOutgoing(key, commandId) { it.copy(state = OutgoingState.FAILED) }
+            throw e
         } catch (e: AckRejectedException) {
             // The server explicitly rejected the command: 发送失败, draft kept, pending cleared.
             if (!ackAccepted) updateOutgoing(key, commandId) { it.copy(state = OutgoingState.FAILED) }
@@ -1077,32 +1056,37 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(diffText = formatFileChanges(data)) }
     }
     fun clearTurnDiff() { mutable.update { it.copy(diffText = null) } }
-    private suspend fun write(method: String, params: JSONObject, commandId: String? = null,
-                             onDispatch: () -> Unit = {}): JSONObject? {
+    private suspend fun <T> commandTransaction(method: String, params: JSONObject, commandId: String? = null,
+        onDispatch: () -> Unit = {}, execute: suspend (JSONObject) -> T): T {
         check(pending == null) { "上一条命令结果尚未确认，请先刷新查询" }
         val ownerGeneration = generation
         val command = params.put("commandId", commandId ?: UUID.randomUUID().toString())
-        // Persist before the member record and any UI state: a failed vault write must
-        // leave the previous pending protection and the outgoing records untouched.
         val record = obj("method" to method, "params" to command)
         vault.put(key("pending"), record.toString())
         pending = record
-        // commandInFlight hides the pending warning for any ordinary in-flight command
-        // (send/stop/create) without touching the persisted pending protection itself.
         mutable.update { it.copy(pending = true, pendingUnknown = false, commandInFlight = true) }
         onDispatch()
         try {
-            val ack = call(method, command)
+            val result = execute(command)
             check(ownerGeneration == generation) { "连接已变化，请在原环境核对操作结果" }
-            finishAck(ack)
-            return ack
+            clearPending()
+            mutable.update { it.copy(notice = "命令已接收") }
+            return result
+        } catch (e: EngineRejectedException) {
+            if (ownerGeneration == generation) clearPending()
+            throw e
         } catch (e: RpcException) {
-            // Request validation failures are definite. Transport/adapter failures can be uncertain.
             if (ownerGeneration == generation && e.code == -32602) clearPending()
             throw e
         } finally {
             if (ownerGeneration == generation) mutable.update { it.copy(commandInFlight = false) }
         }
+    }
+    private suspend fun write(method: String, params: JSONObject, commandId: String? = null,
+                             onDispatch: () -> Unit = {}): JSONObject? {
+        val adapter = sessionClient()
+        return commandTransaction(method, params, commandId, onDispatch) { adapter.nativeCommand(method, it) }
+            .also(::finishAck)
     }
     private fun clearPending() {
         vault.put(key("pending"), null); pending = null
@@ -1417,16 +1401,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
      * presence=false, or absence from an interactionsComplete=true snapshot of the same
      * target, proves an interaction ended — a truncated window or an unsupported kind never does.
      */
-    private fun interactionPresence(data: JSONObject): Map<String, Boolean> =
-        data.optJSONArray("interactionPresence")?.objects()?.mapNotNull {
-            val pending = it.opt("pending") as? Boolean ?: return@mapNotNull null
-            it.string("interactionId") to pending
-        }?.toMap().orEmpty()
-
-    private suspend fun reconcileInteractions(session: ZSession, data: JSONObject, scope: InteractionScope, eligibleReceipts: Set<String>) {
-        val presence = interactionPresence(data)
-        val complete = data.optBoolean("interactionsComplete")
-        val detailIds = data.optJSONArray("interactions")?.objects()?.mapTo(HashSet()) { it.string("interactionId") }.orEmpty()
+    private suspend fun reconcileInteractions(session: ZSession, data: ZcodeSnapshot, scope: InteractionScope, eligibleReceipts: Set<String>) {
+        val presence = data.presence
+        val complete = data.interactionsComplete
+        val detailIds = data.interactionIds
         fun ended(id: String) = presence[id] == false ||
             (presence[id] != true && complete && id !in detailIds)
         var endedAny = false

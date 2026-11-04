@@ -18,7 +18,7 @@ class SshIntegrationTest {
         val ssh = SshTransport()
         var rpc: RpcClient? = null
         try {
-            ssh.connect(profile, secrets, "", "")
+            ssh.connect(profile, secrets, "", "", com.gmch.codexremote.engines.BuiltinEndpoints.Codex)
             val client = RpcClient(ssh.input, ssh.output, {}, {}); rpc = client
             assertTrue(client.initialize().has("userAgent"))
             assertTrue(client.call("thread/list", obj("limit" to 1)).has("data"))

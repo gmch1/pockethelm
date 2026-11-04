@@ -1,6 +1,8 @@
 package com.gmch.codexremote
 
 import com.jcraft.jsch.*
+import com.gmch.codexremote.transport.EngineEndpoint
+import com.gmch.codexremote.transport.RpcFraming
 import kotlinx.coroutines.*
 import java.io.Closeable
 import java.io.InputStream
@@ -46,16 +48,16 @@ class SshTransport : Closeable {
     var diagnostics: String = ""
         private set
 
-    suspend fun connect(profile: ConnectionProfile, vault: SecretReader, targetPassword: String, jumpPassword: String, zcode: Boolean = false) {
+    suspend fun connect(profile: ConnectionProfile, vault: SecretReader, targetPassword: String, jumpPassword: String, endpoint: EngineEndpoint) {
         check(connector == null && !closing) { "连接已关闭" }
-        connectionIdentity = "${profile.resumeIdentity}|$zcode"
+        connectionIdentity = "${profile.resumeIdentity}|${endpoint.id}"
         retiring.filter { it !== this && it.connectionIdentity == connectionIdentity }.forEach {
             check(it.awaitClosed()) { "旧连接尚未释放，请稍后重连或重启 App" }
             retiring.remove(it)
         }
         val budget = minOf(45_000L, currentCoroutineContext()[RecoveryDeadline]?.remainingMillis() ?: 45_000L)
         if (budget <= 0) throw RecoveryTimeout()
-        val worker = connectionScope.async(start = CoroutineStart.LAZY) { connectBlocking(profile, vault, targetPassword, jumpPassword, zcode) }
+        val worker = connectionScope.async(start = CoroutineStart.LAZY) { connectBlocking(profile, vault, targetPassword, jumpPassword, endpoint) }
         connector = worker
         worker.invokeOnCompletion { if (cleanupSucceeded) retiring.remove(this) }
         worker.start()
@@ -66,7 +68,7 @@ class SshTransport : Closeable {
     }
 
     private suspend fun connectBlocking(profile: ConnectionProfile, vault: SecretReader, targetPassword: String,
-        jumpPassword: String, zcode: Boolean) = withContext(Dispatchers.IO) {
+        jumpPassword: String, endpoint: EngineEndpoint) = withContext(Dispatchers.IO) {
         // Socket keepalives alone cannot time out a silent exec command / WebSocket upgrade.
         val deadline = launch { delay(45_000); close() }
         try {
@@ -132,11 +134,7 @@ class SshTransport : Closeable {
             val exec = target.openChannel("exec") as ChannelExec
             channel = exec
             if (closing) { exec.disconnect(); error("连接已取消") }
-            val bin = shellQuote(profile.binary)
-            val proxy = "$bin app-server proxy" + if (profile.socket.isNotBlank()) " --sock ${shellQuote(profile.socket)}" else ""
-            // Reuse the shared daemon; a custom socket is never started/replaced implicitly.
-            val command = if (profile.socket.isBlank()) "$bin app-server daemon start >/dev/null && exec $proxy" else "exec $proxy"
-            exec.setCommand(if (zcode) "pockethelm-zcode-v1" else "bash -lc ${shellQuote(command)}")
+            exec.setCommand(endpoint.command(profile))
             exec.setPty(false)
             val rawInput = exec.inputStream
             val rawOutput = exec.outputStream
@@ -147,7 +145,7 @@ class SshTransport : Closeable {
                 catch (_: Exception) { /* transport closure */ }
             }, "ssh-stderr").apply { isDaemon = true; start() }
             target.timeout = 20_000
-            if (zcode) {
+            if (endpoint.framing == RpcFraming.JsonLines) {
                 input = rawInput
                 output = rawOutput
             } else {

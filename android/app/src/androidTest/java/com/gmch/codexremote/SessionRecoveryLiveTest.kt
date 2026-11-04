@@ -26,7 +26,7 @@ class SessionRecoveryLiveTest {
             val ssh = SshTransport()
             var client: RpcClient? = null
             try {
-                ssh.connect(profile, vault, "", "", zcode = zcode)
+                ssh.connect(profile, vault, "", "", endpoint = if (zcode) com.gmch.codexremote.engines.BuiltinEndpoints.Zcode else com.gmch.codexremote.engines.BuiltinEndpoints.Codex)
                 val rpc = RpcClient(ssh.input, ssh.output, {}, {})
                 client = rpc
                 if (zcode) {
@@ -74,7 +74,7 @@ class SessionRecoveryLiveTest {
         try {
             val error = runCatching {
                 withContext(RecoveryDeadline(System.nanoTime() + 2_000_000_000L)) {
-                    ssh.connect(profile, vault, "", "")
+                    ssh.connect(profile, vault, "", "", com.gmch.codexremote.engines.BuiltinEndpoints.Codex)
                 }
             }.exceptionOrNull()
             assertNotNull("stalled handshake must not connect", error)

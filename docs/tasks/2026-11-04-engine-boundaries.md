@@ -1,10 +1,10 @@
 # 引擎扩展边界：应用管理与引擎生命周期解耦
 
-状态：应用外壳与只读会话端口两步已实现、自查通过，已在 refactor-engine-client 本地提交；完整详情控制/写操作仍待迁移。未 push 或发布。
+状态：应用外壳与只读会话端口已在 refactor-engine-client 本地提交；第三步会话控制、写操作适配、共享流程及可注册传输端点已完成，自查与 129 真机验证通过。第三步尚未提交，未 push 或发布。
 
 ## 需求与验收
 
-用户认可结构分析方向，优先建立第三种 CLI 可扩展的接入边界。本阶段将应用级环境配置、配对、主机信任、当前引擎选择和生命周期调度移出 Codex 的业务实现；引擎通过注册表与生命周期接口接入应用。保留现有两套原生协议与写入语义，第二步建立只读 EngineClient；完整详情控制与发送端口后续迁移。
+用户认可结构分析方向，优先建立第三种 CLI 可扩展的接入边界。将应用级环境配置、配对、主机信任、当前引擎选择和生命周期调度移出 Codex 的业务实现；引擎通过注册表与生命周期接口接入应用。范围经用户要求扩展为完成会话控制和写端口、公共会话流程及可注册传输端点，同时保留现有两套原生协议、缓存和写入保护。下文第一、二步是历史证据，不能用作第三步测试结论。
 
 - ZCode UI 不再接收或调用 RemoteViewModel；应用配置由 app/ 服务拥有。
 - Activity 与公共 UI 不用 codex/zcode 条件分支分发生命周期；引擎标签来自注册信息。
@@ -13,7 +13,7 @@
 - 配对、私钥导入及信任操作复用既有持久键和安全校验。环境变化取消旧连接与本地动作；非当前引擎不能接受旧主机确认。
 - 旧缓存、草稿、回执不迁移、不清空；临时私钥口令不写入持久存储，并在后台宽限结束/应用管理对象销毁时清空。
 
-## 当前结构与职责
+## 第一、二步结构与职责（历史记录）
 
 ```text
 app/
@@ -45,7 +45,7 @@ transport/
 - 主机信任校验当前引擎、当前挑战与环境版本，拒绝旧页面/旧环境/已改变指纹；配置操作期间不接受并发信任确认。
 - 配对完成的页面跳转使用可保存的已处理标记，避免 Activity 重建重复跳转。配置读取错误不改变“当前在前台”的生命周期事实，修复配置后仍可正常连接。
 
-## 迁移边界与后续工作
+## 第一、二步迁移边界与后续工作（历史记录）
 
 基线为已审查并发布的 `d1beac3`（0.4.26/36）；本地 main 快进至该基线后建立 `refactor-engine-boundaries`，没有 push。按包组织，没有新增 Gradle 模块或依赖。
 
@@ -138,3 +138,80 @@ transport/
 提交前重新计算源码快照，与第二步已验证的 ef902c22… 一致。暂存检查随后发现两个新文件末尾的多余空行，已清理，仅涉及 EOF 空白；最终格式检查通过，未重复执行运行逻辑没有变化的测试。保留既有“不 push”要求，未推送、合并或发布。完整详情控制、发送与回执迁移仍是后续工作。
 
 提交版 Kotlin 源码快照 SHA-256：`cabd20df80203eaf06ac793159faabd99f9b2bf17df16e28d89ac08c4c48298b`；相对已测快照只删除 ConnectionUi.kt、EngineUiRegistry.kt 末尾多余空行，运行代码不变。
+
+
+## 第三步：会话控制、共享流程与端点注册（2026-11-05）
+
+### 范围与实现
+
+本轮基于本地 `5007b6e`，所有第三步改动均未提交。用户先要求暂停设备验收、只改代码，随后明确允许恢复 129 真机测试；不再使用 212。此前 212 的安装在暂停前已完成，未在其上执行测试或模型回合。
+
+- `engines/contract/EngineCommands.kt`：创建、发送、停止、原生回执查询、模型选择、来源绑定的附件引用及命令结果。能力显式声明，不提供自动重发；未知运行状态用 null，不伪造空闲。
+- CodexEngineClient 承担附着与未持久化空会话保护、创建并命名持久化、发送/队列/介入、停止、重命名、模型目录及详情投影。effort 使用原生 `thread/settings/update` / `turn/start` 字段，不把不支持的字段塞进 thread/start。
+- ZcodeEngineClient 承担创建/发送/停止/命令回执查询、完整详情解析；高级队列操作使用受限原生扩展。保留来源 guard、commandId、服务端实际 delivery 和明确拒绝/未知结果的区别。
+- 原生 ViewModel 的实际创建/发送路径已接入适配器；两者共同使用 OutgoingLedger 管理气泡对账。仍由原生控制器处理流式事件、审批、图片上传以及既有缓存和持久回执，以保留高级功能与兼容性。
+- `application/EngineSessionController.kt`：供新增引擎复用的目录、详情、创建、发送、停止、草稿、待确认保护、分页与只读对账。先持久化再调用发送回调；连接或导航改变会取消旧动作，未知结果不重放；明确收到 userMessage/queue 的同一 commandId 才能对账。
+- `data/VaultEngineSessionStore.kt`：新增引擎采用独立版本化加密键，按环境/引擎/实例、会话/工作区隔离；未知回执不按数量自动淘汰。旧 Codex/ZCode 持久键原样保留，不自动迁移。
+- `app/GenericSessionUi.kt`：第三引擎可直接装配公共项目选择、会话、消息和控制界面，无需复制任一原生屏幕；原有两引擎继续保留各自高级 UI。公共详情在前台每 3 秒读取一次，后台暂停；自动轮询不重复读取模型目录。列表与历史均保留分页入口。
+- `transport/EngineEndpoint.kt` 和 BuiltinEndpoints：SSH 接收端点命令与帧协议，不再接收 zcode 布尔值。远端 dispatcher 接受可信配置中的固定 argv 映射；不执行手机传入的 shell 字符串。已有配对协议继续验证 Codex daemon，尚不包含动态插件发现。
+
+### 新 CLI 接入方式与边界
+
+1. 实现 EngineClient 的原生查询/写入适配、来源校验和确认语义，只声明真实支持的能力。
+2. 实现 EngineHost 生命周期并提供已连接客户端；SSH 类 CLI 使用 EngineEndpoint 提供固定命令与帧协议，远端管理员配置 engineEndpoints（端点名 → 绝对可执行文件及 argv 数组），由安装器验证后生成 dispatcher。初始化握手仍由该 CLI 适配器负责；每次更换连接必须增加 EngineConnection.connectionRevision，防止快速重连的中间断开状态被 StateFlow 合并。
+3. 在组合根注册 EngineUiEntry，优先使用 genericEngineEntry + EngineSessionController + VaultEngineSessionStore；特有审批/工具 UI 通过原生扩展实现。
+4. 运行共同契约测试及该引擎的真实协议验收。无需修改 Activity、应用环境管理或 SSH 中的引擎分支。
+
+这不是动态加载任意 CLI 的插件系统。原生 ViewModel 和旧 DTO 的物理目录迁移不作为功能完成条件；高级审批/工具/附件语义没有强行统一。第三假引擎验证的是公共接入面，不代表第三个真实 CLI 已经上线。远端 dispatcher 的新注册接口先以本地可执行脚本验证，未部署到开发机；既有两个端点通过现存 dispatcher 保持兼容。
+
+### 本轮验证记录
+
+- 私有证据目录：`~/.local/state/pockethelm/engine-completion/`。
+- Python 77 项通过；新增固定端点、第三端点、旧客户端命令兼容与拒绝任意命令的可执行 shell 回归。
+- JVM 新增共享流程及两原生写适配器测试；最终 **150 项：149 通过、1 专用 SSH 夹具跳过，0 失败/错误**。
+- 129 已恢复连接并检查无正在运行的本地 instrumentation，使用原测试入口重新安装、预授予权限。首次运行参数误将包名传给 class，runner 未加载任何业务测试；已改为显式类列表重跑，不计作通过。
+- 129 完整类列表回归：**155 项，149 通过、6 专用夹具跳过，0 失败**，包含新公共界面的创建/发送/停止和 Vault 持久化隔离测试。6 个跳过项分别是专用真实交互、可选原生 live fixture、扫码 QR、真实写 relay、真实空会话恢复 fixture、ZCode 已有会话 target；不把跳过视作通过。
+- 完整回归后补入快速重连代次标识，最终 APK 定向复验 **13/13 通过**：EngineBoundaryTest、EngineClientDeviceTest（含替换连接后发送/停止）、EngineSessionStoreDeviceTest、SessionRecoveryLiveTest（真实两引擎 SSH 读取/重连及阻塞握手回收）。这批与完整回归有重叠，不相加声称独立总数。
+- Start Plan / GLM-5.3-Flash / low 专用真实发送 **1/1 通过**（在最终 APK 上，独立于上述跳过项）。由 129 上 Android ZcodeEngineClient 经受限本地 relay 调用真实 bridge/server，创建临时会话、一次短消息、读回 ENGINE_OK。只允许指定临时项目/会话和一次发送，最终确认终态后原生 deleteSession、deleteProject，并读目录确认删除；标题含 [测试]。这证明 Android 原生适配器写链路，不宣称它独立覆盖 SSH 写入；SSH 原生链路另由上面两引擎重连用例覆盖。
+- 真实夹具准备中遇到 project/add 返回值缺少 roots、空会话 renameSession 被上游拒绝、legacy renameTask 不可用，均发生在模型发送前并清理临时会话/项目。修正为读取真实项目目录，使用带 [测试] 的首条输入生成标题，最后核对标题标注。最终只有 **1 次模型回合**，没有重复发送或未清理的测试任务。
+- 最终未提交源码 SHA-256：`f7206fba5613ee8120fee5660c03016607dd7ae2f4c45bc916064e50c1afa6cb`。口径：git 已跟踪及未忽略新增的 android/、scripts/ 文件，按路径排序，以 path + NUL + bytes + NUL 计算；完整清单见 verified.json，覆盖本轮所有新增代码与测试，基线 HEAD 5007b6e。
+- 最终 APK SHA-256：`0badb5c713a528dcb3e4db820b8543b35b183e35ab4242c7737362808c17e3cb`，已从 129 拉回安装包逐字节校验一致。仍为未发布测试基线 0.4.26/36；未顺延商店版本。
+- 最终记录：build-delivery.log、check-delivery.log、python-final.log、device-final.txt、device-targeted.txt、live-device-2.txt、live-events.json、verified.json。三批设备测试使用同一正常包名和权限预配置入口，确认页处理数均为 0；测试 APK 已卸载，ADB reverse 和 relay 私有 fixture 已清理，保留正常 App 数据、配对和授权基线。
+
+
+### 第三步集中自查
+
+- **R1：共享对账的草稿与气泡收尾。** 原实现收到历史证据后只清回执，仍保留旧草稿；手动确认后仍残留 UNCERTAIN 气泡。现按同一 commandId 对账，仅清除与提交文本相同的草稿，新编辑内容保留；手动确认移除对应气泡。EngineSessionControllerTest 验证，已关闭。
+- **R2：ZCode 列表失败仍显示新鲜。** `recoverCurrent` 列表失败路径原样保留 sessionsFresh=true；现保留列表内容但标记 false。已有 failedRefreshKeepsOldListExplicitlyStale 真机用例在完整回归中通过，已关闭。
+- **R3：通用详情的附着、自动更新和快速重连。** Codex inspect 先附着再读历史；通用 UI 前台轮询、后台暂停，分页读保留导航检查。连接投影新增 connectionRevision，在快速 false→true 合并时仍更换客户端；第三假引擎真机用例验证重连后发送/停止落到替换客户端，最终 13 项定向验证通过，已关闭。
+- **R4：端点注册配置必须可实际部署。** installer 从私有部署配置 engineEndpoints 读可信 argv 映射；验证映射、端点名、绝对路径、参数类型与控制字符后再写文件。可执行脚本回归覆盖两个内置端点、第三端点、旧客户端命令以及任意 shell 文本不执行；77 项 Python 测试通过。新 dispatcher 尚未部署，不把本地脚本验证当作生产部署结果。
+- **测试夹具修订说明：** 完整类列表首次运行暴露旧 ResumeLifecycleTest/ZcodeLiveStatusTest 夹具未置 RecoveryPhase.Ready，导致“已有新鲜列表”仍合法触发恢复读取；修正夹具状态。详情中切走会取消挂起读取，返回应重读一次，断言从不重读改为仅一次替换读取且之后不再重复。缓存中已删除会话的并行详情读取也应明确脚本化错误。上述调整保留取消和恢复语义，不放宽业务失败断言；列表新鲜度问题 R2 修改产品代码。
+
+
+### 第三步终审与交付
+
+**通过。** 实际两引擎创建/发送路径已使用适配器，共用气泡账本；新增引擎可使用公共会话控制器、存储和 UI，传输采用注册端点。协议差异、原生高级扩展、旧存储兼容和不自动重放写入的边界明确。R1–R4 已关闭，没有本轮已知未修复的阻塞问题。
+
+当前第三步代码保留在 refactor-engine-client 工作区，未提交、未 push、未合并、未发布商店。129 上安装最终测试 APK，正常数据和权限保留。新增真实 CLI 的握手、能力映射、远端注册与专项验收仍由该 CLI 接入任务承担；本轮没有声称已经接入第三个真实 CLI。
+
+## 发布前复审（2026-11-05，0.4.27/37）
+
+用户授权复审、提交及发布，保留此前不 push 约束。复审覆盖本轮全部已跟踪/新增代码、原生调用接线、来源与连接代次、回执落盘顺序、取消/明确拒绝/未知结果、端点注册及验证证据。
+
+### R5：公共历史分页与自动刷新互相覆盖（已修复）
+
+- 位置：EngineSessionController.moreHistory / refresh、GenericSessionUi。
+- 触发与影响：加载旧页后每 3 秒自动详情刷新会替换整个历史窗口；刷新期间旧分页返回还可能回写过期游标，导致旧消息收起或后续分页位置错误。
+- 修复：展开历史时取消在途详情刷新并推进读取代次；分页返回同时核对来源、导航、读取代次和当前游标。查看旧页期间暂停自动详情刷新，界面提示手动刷新返回最新内容；手动刷新和切换会话重置查看状态。
+- 验证：新增 expandedHistorySurvivesAutomaticRefreshUntilExplicitRefresh、lateHistoryPageCannotReplaceCursorAfterRefresh、expandingHistoryCancelsInFlightAutomaticRefresh，三项 JVM 回归通过。原生两引擎高级 UI 不走此通用分页路径。
+
+复审结论：R1–R5 均已修复；未发现其他阻塞发布问题。发行号从商店当前 0.4.26/36 顺延至 0.4.27/37。此前 77 项 Python、完整真机回归及一次 Start Plan Flash 原生发送证据沿用，原生适配器与传输运行代码未再修改；本次针对 R5 及实际发行包补验，不重复调用真实模型。
+
+
+### 发行包复验
+
+- **通过（可发布）**。0.4.27 / versionCode 37；包名 com.gmch.codexremote；不可调试；签名 SHA-256 与历史 54c2508d… 一致。
+- JVM **153 项：152 通过、1 专用 SSH 夹具跳过、0 失败/错误**。
+- 实际发行包 129 定向复验 **53 项：52 通过、1 专用真实空会话夹具跳过、0 失败**。覆盖公共界面/连接替换、Vault、原生 SSH、Codex 新会话与发送、ZCode 发送及列表失败标记。已卸载 instrumentation 包，保留权限基线与正常数据。
+- 发行 APK SHA-256：`8644be32c03e8085b8a9c769383b92f703a61cbec9be2ce26f2e3a28d45e1172`，从 129 拉回安装包校验一致。
+- 本次源文件快照：`efa1f574db3d6f52581c16899221572d18da48fa1870699d2f1fbf0c6001e281`，沿用 android/、scripts/ 已跟踪及未忽略新增文件的 path + NUL + bytes + NUL 口径。证据目录 `~/.local/state/pockethelm/release-0.4.27/`。

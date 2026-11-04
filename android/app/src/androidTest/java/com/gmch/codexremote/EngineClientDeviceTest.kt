@@ -33,12 +33,31 @@ class EngineClientDeviceTest {
         override val origin = EngineOrigin("fake-environment", "third", "primary")
         override val capabilities = EngineReadCapabilities(SessionCatalogMode.Snapshot, false)
         var historyReads = 0
+        var sends = 0
+        var stops = 0
+        var created = false
+        override val operations = setOf(EngineOperation.Create, EngineOperation.Send, EngineOperation.Interrupt)
+        override suspend fun create(request: EngineCreateRequest, beforeDispatch: suspend () -> Unit): EngineCreatedSession {
+            beforeDispatch(); created = true
+            return object : EngineCreatedSession { override val session = Row(EngineSessionRef(origin, "new")) }
+        }
+        override suspend fun send(message: EngineMessage, beforeDispatch: suspend () -> Unit): EngineReceipt {
+            beforeDispatch(); sends++
+            return EngineReceipt(message.commandId, ReceiptDelivery.Accepted, message.session)
+        }
+        override suspend fun interrupt(session: EngineSessionRef, runId: String, commandId: String) { stops++ }
+        override suspend fun inspect(session: EngineSessionRef) = EngineSessionSnapshot(session, "第三引擎会话", history(session), true, "run", true)
         override suspend fun sessions(query: SessionQuery): SessionPage<Row> {
             validate(query)
             if (query.cursor != null || query.limit != null) throw UnsupportedEngineQuery("No list pagination")
             return SessionPage(listOf(Row(EngineSessionRef(origin, "s"))), null, SessionCatalogMode.Snapshot)
         }
-        override suspend fun projects() = ProjectCatalog<EngineProject, EngineSession>(emptyList())
+        override suspend fun projects() = ProjectCatalog<EngineProject, EngineSession>(listOf(object : EngineProject {
+            override val origin = this@Client.origin
+            override val nativeId = "p"
+            override val title = "测试项目"
+            override val roots = listOf("/test")
+        }))
         override suspend fun history(session: EngineSessionRef, cursor: HistoryCursor?, onPage: (suspend (HistoryPage) -> Unit)?): HistoryPage {
             validate(session, cursor)
             if (cursor != null) throw UnsupportedEngineQuery("No history pagination")
@@ -47,7 +66,7 @@ class EngineClientDeviceTest {
             onPage?.invoke(result); return result
         }
     }
-    private class Host(val client: Client) : EngineHost {
+    private class Host(var client: Client) : EngineHost {
         override val descriptor = EngineDescriptor("third", "Third")
         override val connection = MutableStateFlow(EngineConnection(connected = true))
         override fun sessionClient() = client.takeIf { connection.value.connected }
@@ -109,4 +128,50 @@ class EngineClientDeviceTest {
             inst.targetContext.deleteSharedPreferences("zcode_load_test_${fixture.namespace}-vault")
         }
     }
+    private fun click(text: String) {
+        awaitUi { nodes().any { it.text?.toString() == text } }
+        var node = nodes().first { it.text?.toString() == text }
+        while (!node.isClickable && node.parent != null) node = node.parent
+        assertTrue(node.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+    }
+    @Test fun genericUiCreatesSendsAndStopsThirdEngineWithoutNativeScreen(): Unit = runBlocking {
+        val fixture = TestPrefsApp(UUID.randomUUID().toString()).also { it.attach(inst.targetContext) }
+        lateinit var app: AppViewModel
+        lateinit var controller: com.gmch.codexremote.application.EngineSessionController
+        val client = Client(); val host = Host(client)
+        inst.runOnMainSync {
+            app = AppViewModel(fixture)
+            controller = com.gmch.codexremote.application.EngineSessionController(app.viewModelScope,
+                com.gmch.codexremote.data.VaultEngineSessionStore(fixture))
+        }
+        val registry = EngineUiRegistry(listOf(genericEngineEntry(host, controller)))
+        try {
+            inst.runOnMainSync { app.bind(registry.runtime, EnvironmentVerifier { _, _ -> error("not used") }); app.start() }
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.onActivity { it.setContent { PocketHelmTheme { RegisteredEngineApp(app, registry) } } }
+                click("新建会话"); click("测试项目")
+                awaitUi { nodes().any { it.isEditable } }
+                // Simulate a fast reconnect whose transient disconnected state was conflated.
+                val replacement = Client()
+                inst.runOnMainSync { host.client = replacement; host.connection.value = host.connection.value.copy(connectionRevision = 1) }
+                awaitUi { replacement.historyReads > 0 && controller.state.value.choicesLoaded }
+                val input = nodes().first { it.isEditable }
+                assertTrue(input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, android.os.Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "本地假引擎测试")
+                }))
+                click("发送")
+                awaitUi { replacement.sends == 1 && !controller.state.value.working }
+                click("停止执行")
+                awaitUi { replacement.stops == 1 }
+                assertEquals(0, client.sends)
+                assertTrue(client.created)
+                assertTrue(controller.state.value.pending.isEmpty())
+                assertEquals("", controller.state.value.draft)
+            }
+        } finally {
+            inst.runOnMainSync { app.stop(); app.viewModelScope.cancel() }
+            inst.targetContext.deleteSharedPreferences("zcode_load_test_${fixture.namespace}-vault")
+        }
+    }
+
 }

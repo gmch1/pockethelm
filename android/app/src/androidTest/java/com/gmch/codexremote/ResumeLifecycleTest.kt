@@ -81,7 +81,7 @@ class ResumeLifecycleTest {
     @Test fun quickCodexReturnReusesConnectionWithoutReloading() = runBlocking {
         val vm = codex(); restored(vm)
         val flow = state<UiState>(vm)
-        main { flow.value = UiState(profile = profile, saved = true, connected = true, foreground = true,
+        main { flow.value = UiState(profile = profile, saved = true, connected = true, foreground = true, recoveryPhase = RecoveryPhase.Ready,
             items = listOf(TimelineItem("i", "agentMessage", "保留内容"))) }
         val bridge = FakeRpcBridge(vm).also { it.install(); bridges += it }
         val rpc = field(vm, "rpc").get(vm)
@@ -96,7 +96,7 @@ class ResumeLifecycleTest {
         seedProfile(); val vm = zcode(); restored(vm)
         val flow = state<ZcodeState>(vm)
         main {
-            flow.value = ZcodeState(connected = true, sessionsFresh = true)
+            flow.value = ZcodeState(connected = true, sessionsFresh = true, recoveryPhase = RecoveryPhase.Ready)
             field(vm, "active").set(vm, true); field(vm, "visible").set(vm, true)
             field(vm, "listSyncedAt").set(vm, System.currentTimeMillis())
         }
@@ -149,6 +149,7 @@ class ResumeLifecycleTest {
         val vm = zcode(); restored(vm)
         main { state<ZcodeState>(vm).value = vm.state.value.copy(connected = true) }
         val bridge = FakeRpcBridge(vm).also { it.install(); bridges += it }
+        bridge.scripted["session/read"] = { throw FakeRpcBridge.FakeRpcError(-32000, "会话已删除") }
         bridge.scripted["catalog"] = { obj("providers" to JSONArray()) }
         bridge.scripted["projects"] = { obj("projects" to JSONArray(), "sessions" to JSONArray()) }
         main { vm.refresh() }
@@ -160,7 +161,7 @@ class ResumeLifecycleTest {
         seedProfile(); val c = codex(); val z = zcode(); restored(c); restored(z)
         main {
             state<UiState>(c).value = UiState(profile = profile, saved = true, connected = true, foreground = true)
-            state<ZcodeState>(z).value = ZcodeState(connected = true, sessionsFresh = true,
+            state<ZcodeState>(z).value = ZcodeState(connected = true, sessionsFresh = true, recoveryPhase = RecoveryPhase.Ready,
                 sessions = listOf(ZSession("z", "保留列表", "/work")))
             field(z, "active").set(z, true); field(z, "visible").set(z, true)
             field(z, "listSyncedAt").set(z, System.currentTimeMillis())
@@ -200,10 +201,11 @@ class ResumeLifecycleTest {
             assertEquals("保留草稿", z.state.value.draft)
             main { z.leave(); z.enter() }
         } finally { gate.countDown() }
-        await { z.state.value.revision == 1L }
+        await { z.state.value.revision == 1L && z.state.value.recoveryPhase == RecoveryPhase.Ready }
         main { z.leave(); z.enter() }
         delay(100)
-        assertEquals(1, reads); assertTrue(bridge.unexpected.isEmpty())
+        // Leaving cancels the suspended first read; returning must perform one replacement.
+        assertEquals(2, reads); assertTrue(bridge.unexpected.isEmpty())
     }
 
     @After fun cleanup() {

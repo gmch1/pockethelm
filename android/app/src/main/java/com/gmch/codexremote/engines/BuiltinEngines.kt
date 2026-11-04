@@ -26,7 +26,7 @@ internal fun builtinEngines(scope: CoroutineScope, codex: RemoteViewModel, zcode
 
 private class CodexHost(private val vm: RemoteViewModel, scope: CoroutineScope) : EngineHost {
     override val descriptor = EngineDescriptor("codex", "Codex")
-    private fun status(s: UiState) = EngineConnection(s.connected, s.busy, s.status, s.error, s.challenge, vm.environmentRevision, s.version)
+    private fun status(s: UiState) = EngineConnection(s.connected, s.busy, s.status, s.error, s.challenge, vm.environmentRevision, s.version, vm.connectionRevision)
     override val connection = vm.state.map(::status).stateIn(scope, SharingStarted.Eagerly, status(vm.state.value))
     override fun enter() = vm.foreground()
     override fun leave() = vm.leave()
@@ -44,7 +44,7 @@ private class ZcodeHost(private val vm: ZcodeViewModel, scope: CoroutineScope) :
     override val descriptor = EngineDescriptor("zcode", "ZCode")
     private fun status(s: ZcodeState) = EngineConnection(s.connected, s.busy,
         if (s.challenge != null) "核对 SSH 主机指纹" else if (s.connected) "已连接" else if (s.busy) "正在连接…" else "尚未连接",
-        s.error, s.challenge, vm.environmentRevision)
+        s.error, s.challenge, vm.environmentRevision, connectionRevision = vm.connectionRevision)
     override val connection = vm.state.map(::status).stateIn(scope, SharingStarted.Eagerly, status(vm.state.value))
     override fun enter() = vm.enter()
     override fun leave() = vm.leave()
@@ -65,7 +65,7 @@ internal suspend fun verifyLegacyEnvironment(profile: ConnectionProfile, secrets
     val candidate = SshTransport()
     var rpc: RpcClient? = null
     try {
-        candidate.connect(profile, secrets, "", "")
+        candidate.connect(profile, secrets, "", "", com.gmch.codexremote.engines.BuiltinEndpoints.Codex)
         val client = RpcClient(candidate.input, candidate.output, {}, {}); rpc = client
         client.initialize()
     } finally { rpc?.close(); candidate.close() }

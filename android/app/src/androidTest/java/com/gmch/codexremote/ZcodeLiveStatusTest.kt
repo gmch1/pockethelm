@@ -31,7 +31,7 @@ class ZcodeLiveStatusTest {
         runBlocking { (field("restoreJob").get(vm) as Job).join() }
         @Suppress("UNCHECKED_CAST")
         state = field("mutable").get(vm) as MutableStateFlow<ZcodeState>
-        state.value = ZcodeState(connected = true, sessionsFresh = true,
+        state.value = ZcodeState(connected = true, sessionsFresh = true, recoveryPhase = RecoveryPhase.Ready,
             sessions = listOf(ZSession("s", "未打开的任务", "/work", "host-a", status = "completed")))
         bridge = FakeRpcBridge(vm).also { it.install() }
         bridge.scripted["sessions/status"] = {

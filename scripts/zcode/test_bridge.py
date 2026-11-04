@@ -295,7 +295,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_forced_dispatch_never_evaluates_original_command(self):
         script = dispatcher('/opt/codex', Path('/opt/bridge.py'))
-        self.assertIn('== "pockethelm-zcode-v1"', script)
+        self.assertIn('pockethelm-zcode-v1) exec ', script)
         self.assertNotIn('eval', script)
         self.assertNotIn('bash -c', script)
 
@@ -683,7 +683,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_forced_dispatch_never_evaluates_original_command(self):
         script = dispatcher('/opt/codex', Path('/opt/bridge.py'))
-        self.assertIn('== "pockethelm-zcode-v1"', script)
+        self.assertIn('pockethelm-zcode-v1) exec ', script)
         self.assertNotIn('eval', script)
         self.assertNotIn('bash -c', script)
         self.assertEqual(script.count('SSH_ORIGINAL_COMMAND'), 1)

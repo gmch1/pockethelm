@@ -26,6 +26,8 @@ internal data class EngineConnection(
     val status: String = "尚未连接", val error: String? = null,
     val challenge: HostChallenge? = null, val environmentRevision: Long = 0,
     val version: String = "",
+    // Increment when replacing the transport, even if a fast reconnect conflates connected states.
+    val connectionRevision: Long = 0,
 )
 
 internal class EngineRegistry(hosts: List<EngineHost>) {

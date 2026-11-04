@@ -40,11 +40,29 @@ internal data class HistoryPage(val session: EngineSessionRef, val items: List<E
     val next: HistoryCursor?)
 internal class UnsupportedEngineQuery(message: String) : UnsupportedOperationException(message)
 
-/** Read-side session port only. No JSON, native ViewModel, write/retry or fabricated
- * approval capability. Engine-specific read results may add typed native metadata. */
+/** Session port with explicit read/write capabilities. Native adapters own protocol
+ * and acknowledgement semantics; callers must not automatically replay unknown writes. */
 internal interface EngineClient {
     val origin: EngineOrigin
     val capabilities: EngineReadCapabilities
+    val operations: Set<EngineOperation> get() = emptySet()
+    suspend fun choices(): List<EngineChoice> = emptyList()
+    suspend fun resolve(operation: PendingOperation): CommandResolution =
+        throw UnsupportedEngineQuery("该引擎没有命令回执查询能力")
+    suspend fun inspect(session: EngineSessionRef): EngineSessionSnapshot {
+        validate(session, null)
+        return EngineSessionSnapshot(session, session.nativeId, history(session), running = null)
+    }
+    suspend fun create(request: EngineCreateRequest, beforeDispatch: suspend () -> Unit = {}): EngineCreatedSession =
+        throw UnsupportedEngineQuery("该引擎不支持创建会话")
+    suspend fun send(message: EngineMessage, beforeDispatch: suspend () -> Unit = {}): EngineReceipt =
+        throw UnsupportedEngineQuery("该引擎不支持发送消息")
+    suspend fun interrupt(session: EngineSessionRef, runId: String, commandId: String) {
+        throw UnsupportedEngineQuery("该引擎不支持打断")
+    }
+    suspend fun rename(session: EngineSessionRef, title: String) {
+        throw UnsupportedEngineQuery("该引擎不支持重命名")
+    }
     suspend fun sessions(query: SessionQuery = SessionQuery()): SessionPage<EngineSession>
     suspend fun projects(): ProjectCatalog<EngineProject, EngineSession>
     suspend fun history(session: EngineSessionRef, cursor: HistoryCursor? = null,

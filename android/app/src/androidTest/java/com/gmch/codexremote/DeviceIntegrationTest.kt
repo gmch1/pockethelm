@@ -85,7 +85,7 @@ class DeviceIntegrationTest {
         val ssh = SshTransport()
         var rpc: RpcClient? = null
         try {
-            ssh.connect(profile, vault, "", "")
+            ssh.connect(profile, vault, "", "", com.gmch.codexremote.engines.BuiltinEndpoints.Codex)
             val c = RpcClient(ssh.input, ssh.output, {}, {}); rpc = c
             assertTrue(c.initialize().has("userAgent"))
             val result = c.call("thread/list", obj("limit" to 2))
