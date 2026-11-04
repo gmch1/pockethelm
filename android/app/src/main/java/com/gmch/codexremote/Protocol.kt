@@ -201,9 +201,16 @@ class RpcClient(
                             // Apply snapshots in wire order, not in the caller's later continuation.
                             // The reader does not dispatch another delta until this callback returns.
                             if (!message.has("error") && request.result.isActive)
-                                request.onResult?.invoke(message.optJSONObject("result") ?: obj())
+                                withContext(request.result) {
+                                    request.onResult?.invoke(message.optJSONObject("result") ?: obj())
+                                }
                             request.result.complete(message)
-                        } catch (e: CancellationException) { request.result.completeExceptionally(e); throw e }
+                        } catch (e: CancellationException) {
+                            request.result.completeExceptionally(e)
+                            // A cancelled request callback is not a cancelled reader.
+                            // Only connection-scope cancellation stops the stream.
+                            currentCoroutineContext().ensureActive()
+                        }
                         catch (t: Throwable) { request.result.completeExceptionally(t) }
                     }
                 }
@@ -221,17 +228,60 @@ class RpcClient(
         val id = serial.incrementAndGet().toString()
         val result = CompletableDeferred<JSONObject>()
         pending[id] = Request(result, onResult)
+        // Output can block independently of the caller (JSch / pipe backpressure).
+        // Keep the worker in the connection scope, so cancellation/timeout can return
+        // and ask the transport owner to close the underlying streams.
+        val budget = minOf(timeout, currentCoroutineContext()[RecoveryDeadline]?.remainingMillis() ?: timeout,
+            if (currentCoroutineContext()[RecoveryDeadline] != null) 45_000L else timeout)
+        if (budget <= 0) { pending.remove(id); throw RecoveryTimeout() }
+        val writing = java.util.concurrent.atomic.AtomicBoolean(false)
+        val written = java.util.concurrent.atomic.AtomicBoolean(false)
+        val writeState = Any()
+        var abandoned = false
+        var writer: Deferred<Unit>? = null
+        fun abandonWrite() {
+            val incomplete = synchronized(writeState) {
+                abandoned = true
+                writing.get() && !written.get()
+            }
+            writer?.cancel()
+            if (incomplete && !closed) {
+                val error = java.io.IOException("连接写入未完成，结果待确认，请重连核对")
+                fail(error)
+                onClosed(error)
+            }
+        }
         try {
-            write(obj("id" to id, "method" to method, "params" to params))
             val response = try {
-                withTimeout(timeout) { result.await() }
+                withTimeout(budget) {
+                    writer = scope.async {
+                        writes.withLock {
+                            withContext(Dispatchers.IO) {
+                                ensureActive()
+                                synchronized(writeState) {
+                                    if (abandoned) throw CancellationException("请求已取消")
+                                    writing.set(true)
+                                }
+                                check(!closed) { "连接已关闭" }
+                                output.write((obj("id" to id, "method" to method, "params" to params).toString() + "\n").toByteArray(Charsets.UTF_8))
+                                output.flush()
+                                written.set(true)
+                            }
+                        }
+                    }
+                    writer!!.await()
+                    result.await()
+                }
             } catch (e: TimeoutCancellationException) {
-                // A single-request timeout is a transport failure, not caller cancellation:
-                // reads must surface as a normal failure and writes must keep their pending
-                // protection (never auto-retried here). If the caller itself was cancelled,
-                // that cancellation propagates as cancellation instead.
+                abandonWrite()
                 if (!currentCoroutineContext().isActive) throw e
-                throw java.io.IOException("请求超时（${timeout / 1000} 秒），请检查开发机连接")
+                throw java.io.IOException("请求超时，请检查开发机连接；结果未确认的操作不会自动重试")
+            } catch (e: CancellationException) {
+                abandonWrite()
+                throw e
+            } catch (e: Exception) {
+                abandonWrite()
+                throw e
             }
             response.optJSONObject("error")?.let { throw RpcException(it.optInt("code"), it.string("message")) }
             return response.optJSONObject("result") ?: obj()
@@ -249,11 +299,32 @@ class RpcClient(
     /** Answer a server-initiated request. The id must be echoed back verbatim, including type. */
     suspend fun respond(id: Any, result: JSONObject) = write(obj("id" to id, "result" to result))
 
-    suspend fun write(message: JSONObject) = writes.withLock {
-        withContext(Dispatchers.IO) {
-            check(!closed) { "连接已关闭" }
-            output.write((message.toString() + "\n").toByteArray(Charsets.UTF_8))
-            output.flush()
+    suspend fun write(message: JSONObject) {
+        val budget = minOf(45_000L, currentCoroutineContext()[RecoveryDeadline]?.remainingMillis() ?: 45_000L)
+        if (budget <= 0) throw RecoveryTimeout()
+        val worker = scope.async {
+            writes.withLock {
+                withContext(Dispatchers.IO) {
+                    ensureActive()
+                    check(!closed) { "连接已关闭" }
+                    output.write((message.toString() + "\n").toByteArray(Charsets.UTF_8))
+                    output.flush()
+                }
+            }
+        }
+        try {
+            withTimeout(budget) { worker.await() }
+        } catch (e: Exception) {
+            worker.cancel()
+            // Notifications / approval responses have no response frame to reconcile
+            // here. Retire the uncertain channel rather than reusing a partial write.
+            if (!closed) {
+                val error = java.io.IOException("连接写入未确认，请重连核对")
+                fail(error); onClosed(error)
+            }
+            if (e is TimeoutCancellationException && currentCoroutineContext().isActive)
+                throw java.io.IOException("连接写入超时，请重连核对")
+            throw e
         }
     }
 

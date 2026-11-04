@@ -20,6 +20,7 @@ import java.util.UUID
 private const val INTERACT_RECORDS_MAX = 128
 
 data class ZcodeState(
+    val recoveryPhase: RecoveryPhase = RecoveryPhase.Cached,
     val connected: Boolean = false, val busy: Boolean = false, val error: String? = null,
     val providers: List<ZProvider> = emptyList(), val selection: ZSelection? = null, val selectionGuard: String = "",
     val projects: List<ZProject> = emptyList(), val sessions: List<ZSession> = emptyList(),
@@ -70,6 +71,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private var visible = false
     private val actions = Mutex()
     private var transport: SshTransport? = null
+    private var retiringTransport: SshTransport? = null
     private var rpc: RpcClient? = null
     private var job: Job? = null
     private var poll: Job? = null
@@ -90,7 +92,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private var backgroundJob: Job? = null
     private var listSyncedAt = 0L
     private var historySyncedAt = 0L
-    private var resumeJob: Job? = null
+    internal val recovery = SessionRecovery(viewModelScope)
+    private var manuallyDisconnected = false
+    private val pausedAux = mutableSetOf<String>()
+    private data class EntrySelection(val session: ZSession, val navigation: Int, val choiceVersion: Int)
+    private var entrySelection: EntrySelection? = null
+    private var choiceVersion = 0
     private var navigationVersion = 0
     // Server activity watermarks acknowledged only by successful reads, persisted to the
     // vault only on navigation/connection boundaries — never on the 2.5s poll.
@@ -205,17 +212,19 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private fun client() = rpc ?: error("请先连接 ZCode")
     private suspend fun call(method: String, params: JSONObject = obj()) = client().call(method, params, timeout = 90_000)
     private fun action(block: suspend () -> Unit) = viewModelScope.launch {
+        val epoch = generation
         actions.withLock {
+            if (epoch != generation) return@withLock
             mutable.update { it.copy(busy = true, error = null) }
             try { block() }
             catch (e: CancellationException) { throw e }
-            catch (e: Exception) { mutable.update { it.copy(error = e.message ?: "请求失败") } }
-            finally { mutable.update { it.copy(busy = false) } }
+            catch (e: Exception) { if (epoch == generation) mutable.update { it.copy(error = e.message ?: "请求失败") } }
+            finally { if (epoch == generation) mutable.update { it.copy(busy = false) } }
         }
     }
     fun enter() { active = true; foreground() }
     // A tab change is not an Activity background transition. Keep the channel, pause polling.
-    fun leave() { active = false; poll?.cancel(); poll = null; pauseStatuses() }
+    fun leave() { active = false; poll?.cancel(); poll = null; pauseRecovery(all = true); pauseStatuses() }
     fun keepConnection() { visible = true; backgroundJob?.cancel(); backgroundJob = null }
     fun foreground() {
         visible = true
@@ -226,6 +235,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             disconnect()
             navigationVersion++
             profile = next
+            entrySelection = null
             listSyncedAt = 0; historySyncedAt = 0
             older = emptyList(); outgoingBySession.clear(); pending = null
             // Environment switch: records in memory belong to the old environment (their
@@ -235,27 +245,69 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             seenActivity.clear()
             mutable.value = ZcodeState()
         }
-        if (!mutable.value.connected) { connect(); return }
+        if (!mutable.value.connected) { if (!manuallyDisconnected) connect(); return }
         schedulePoll()
-        if (resumeJob?.isActive == true) return
-        // Read-only revalidation must not put the whole screen into its busy/disabled state.
-        val epoch = generation
-        resumeJob = viewModelScope.launch {
-            actions.withLock {
-                if (!active || !visible || epoch != generation) return@withLock
-                try {
-                    if (System.currentTimeMillis() - historySyncedAt > 5_000)
-                        mutable.value.selected?.let { readGuarded(it) }
-                    if (mutable.value.selected == null && System.currentTimeMillis() - listSyncedAt > 60_000)
-                        loadProjects()
-                    loadStatuses()
-                } catch (e: CancellationException) { throw e }
-                catch (e: Exception) { mutable.update { it.copy(error = "更新失败：${e.message}") } }
+        resumePausedAux()
+        if (mutable.value.selected != null) {
+            if (mutable.value.recoveryPhase != RecoveryPhase.Ready || entrySelection != null ||
+                System.currentTimeMillis() - historySyncedAt > 5_000) recoverCurrent()
+        } else if (mutable.value.recoveryPhase != RecoveryPhase.Ready ||
+            System.currentTimeMillis() - listSyncedAt > 60_000) recoverCurrent()
+        recoverAux("statuses") { loadStatuses() }
+    }
+
+    private fun recoveryTarget() = RecoveryTarget(profile?.resumeIdentity.orEmpty(), "zcode", generation,
+        mutable.value.selected?.let { "${it.path}|${it.identity}|${it.id}" } ?: "list", navigationVersion)
+    private fun currentRecovery(target: RecoveryTarget) = mutable.value.connected && recoveryTarget() == target
+
+    private fun recoverCurrent(quiet: Boolean = false): Job? {
+        if (!mutable.value.connected) return null
+        val target = recoveryTarget()
+        val session = mutable.value.selected
+        val silent = quiet && mutable.value.recoveryPhase == RecoveryPhase.Ready
+        return recovery.launch(if (session == null) "list" else "detail", target, { currentRecovery(target) },
+            started = { if (!silent) mutable.update { it.copy(recoveryPhase = RecoveryPhase.Restoring,
+                historyLoading = session != null, historyError = null, error = null) } },
+            failed = { e -> mutable.update { it.copy(recoveryPhase = RecoveryPhase.Failed, historyLoading = false,
+                historyError = if (session != null) e.message else it.historyError, error = e.message) } },
+            finished = { mutable.update { it.copy(historyLoading = false,
+                recoveryPhase = if (it.recoveryPhase == RecoveryPhase.Failed) it.recoveryPhase else RecoveryPhase.Ready) } }) {
+            if (session == null) loadProjects() else {
+                readGuarded(session)
             }
         }
     }
+    /** These are runtime/global receipt reads, not detail reads. Their result must
+     * survive navigation, but never an environment switch or connection replacement. */
+    private fun recoverAux(name: String, block: suspend () -> Unit) {
+        val target = RecoveryTarget(profile?.resumeIdentity.orEmpty(), "zcode", generation, "runtime:$name")
+        recovery.launch("aux:$name", target,
+            { mutable.value.connected && generation == target.generation && profile?.resumeIdentity.orEmpty() == target.environment },
+            failed = { e -> mutable.update { if (name == "interactions") it.copy(interactionNotice = "交互状态未核实，请刷新后核对")
+                else it.copy(notice = "辅助数据更新失败：${e.message}") } }, block = block)
+    }
+    private fun resumePausedAux() {
+        val interrupted = pausedAux.toSet(); pausedAux.clear()
+        for (lane in interrupted) when (lane) {
+            "aux:catalog" -> recoverAux("catalog") { loadCatalog() }
+            "aux:projects" -> recoverAux("projects") { loadProjects() }
+            "aux:pending" -> recoverAux("pending") { recoverPending() }
+            "aux:interactions" -> recoverAux("interactions") { recoverInteractions() }
+            "aux:statuses" -> recoverAux("statuses") { loadStatuses() }
+            "aux:quota" -> if (entrySelection == null) quota() else pausedAux.add(lane)
+        }
+    }
+    private fun pauseRecovery(all: Boolean = false) {
+        if (all) {
+            pausedAux += recovery.activeLanes().filter { it.startsWith("aux:") }
+            recovery.cancelAll()
+        } else { recovery.cancel("detail"); recovery.cancel("list") }
+        mutable.update { it.copy(historyLoading = false,
+            recoveryPhase = if (all && it.recoveryPhase == RecoveryPhase.Ready) RecoveryPhase.Ready else RecoveryPhase.Cached) }
+    }
     fun background() {
         if (!visible) return
+        pauseRecovery(all = true)
         visible = false
         poll?.cancel(); poll = null
         pauseStatuses()
@@ -266,7 +318,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         backgroundJob?.cancel()
         backgroundJob = viewModelScope.launch { delay(BACKGROUND_GRACE_MS); disconnect() }
     }
-    fun disconnectManually() = disconnect()
+    fun disconnectManually() { manuallyDisconnected = true; disconnect() }
     private fun disconnect() {
         generation++
         quotaFetchedFor = null
@@ -275,9 +327,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         backgroundJob?.cancel(); backgroundJob = null
         browser(ZcodeBrowserEvent.Disconnect)
         job?.cancel(); job = null; poll?.cancel(); poll = null
-        resumeJob?.cancel(); resumeJob = null
+        pauseRecovery(all = true)
+        pausedAux.clear() // connect() schedules the global reads on the new generation.
         rpc?.close(); rpc = null
         val old = transport; transport = null
+        if (old != null && retiringTransport == null) retiringTransport = old
         viewModelScope.launch(Dispatchers.IO) { old?.close() }
         // In-flight requests lose their channel: outcome unknown, never a failure.
         outgoingBySession.keys.toList().forEach { markOutgoingUncertain(it) }
@@ -290,7 +344,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         // attachment drafts are memory-only and dropped with an explicit re-pick prompt.
         attachmentRefs.clear(); attachmentUploading.clear()
         mutable.update {
-            it.copy(connected = false, busy = false, sending = false, historyLoading = false, sessionsFresh = false, liveStatuses = emptyList(),
+            it.copy(connected = false, busy = false, sending = false, historyLoading = false, recoveryPhase = RecoveryPhase.Cached, sessionsFresh = false, liveStatuses = emptyList(),
+                phase = "", executionId = "", interactionCount = 0, currentSelection = null, permission = "",
                 // A session opened but never loaded must not fall back to a blank timeline.
                 historyError = if (it.selected != null && it.items.isEmpty() && it.historyLoading)
                     "连接已断开，未能加载会话内容，重连后重试" else it.historyError,
@@ -303,15 +358,20 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun connect() {
+        manuallyDisconnected = false
         if (job?.isActive == true) return
         if (mutable.value.connected) { refresh(); return }
-        job = action {
+        job = viewModelScope.launch {
+            val attempt = ++generation
+            mutable.update { it.copy(busy = true, error = null) }
+            try {
             restoreJob.join()
             val raw = vault.get("profile") ?: error("请先在连接页扫码配对开发机")
             val next = ConnectionProfile.from(JSONObject(raw))
             require(next.useDeviceKey) { "ZCode 需要扫码配对的受限设备连接" }
             if (profile?.resumeIdentity != next.resumeIdentity) {
                 mutable.value = ZcodeState(busy = true)
+                entrySelection = null
                 older = emptyList()
                 // A different environment owns no local records from the previous one.
                 outgoingBySession.clear()
@@ -321,10 +381,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             profile = next
             pending = vault.get(key("pending"))?.let(::JSONObject)
             mutable.update { it.copy(pending = pending != null) }
-            val epoch = ++generation
+            val epoch = attempt
             val ssh = SshTransport(); transport = ssh
             try {
-                ssh.connect(next, vault, "", "", zcode = true)
+                retiringTransport?.let { check(it.awaitClosed()) { "旧连接尚未释放，请稍后重连" }; retiringTransport = null }
+                val connectionDeadline = System.nanoTime() + 45_000_000_000L
+                withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(next, vault, "", "", zcode = true) }
                 currentCoroutineContext().ensureActive()
                 val connection = RpcClient(ssh.input, ssh.output, {}, { error ->
                     viewModelScope.launch {
@@ -335,7 +397,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 })
                 rpc = connection
-                val hello = call("initialize", obj("clientId" to clientId))
+                val hello = withContext(RecoveryDeadline(connectionDeadline)) { call("initialize", obj("clientId" to clientId)) }
                 check(hello.string("engine") == "zcode" && hello.optInt("bridgeVersion") == 1) { "请在开发机安装 ZCode 桥接器" }
                 supportsSessionIndex = hello.optBoolean("sessionsIndex")
                 // Optional capability: an older bridge without it keeps the count-only placeholder.
@@ -350,28 +412,35 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 mutable.update { it.copy(connected = true, interactionsEnabled = interactSupport,
                     attachmentsEnabled = attachmentsEnabled,
                     queueOpsEnabled = queueOps, diffEnabled = turnSummary && fileChanges, indexMetaEnabled = indexMeta) }
-                recoverPending()
-                try { recoverInteractions() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
-                mutable.value.selected?.let { session ->
-                    try { readGuarded(session) } catch (e: CancellationException) { throw e }
-                    catch (e: Exception) { mutable.update { it.copy(error = e.message ?: "更新会话失败") } }
-                }
-                loadProjects()
-                loadStatuses()
-                loadCatalog()
+                recoverCurrent()
+                recoverAux("pending") { recoverPending() }
+                recoverAux("interactions") { recoverInteractions() }
+                recoverAux("catalog") { loadCatalog() }
+                recoverAux("projects") { loadProjects() }
+                recoverAux("statuses") { loadStatuses() }
                 schedulePoll()
             } finally {
-                if (!mutable.value.connected || epoch != generation) withContext(NonCancellable + Dispatchers.IO) { ssh.close() }
+                if (!mutable.value.connected || epoch != generation) {
+                    ssh.close()
+                    if (epoch == generation && retiringTransport == null) retiringTransport = ssh
+                }
             }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (attempt == generation) mutable.update { it.copy(connected = false,
+                    error = connectionFailureMessage(e, "跳板机")) }
+            } finally { if (attempt == generation) mutable.update { it.copy(busy = false) } }
         }
     }
     fun refresh() {
         if (!mutable.value.connected) { connect(); return }
-        action {
-            loadCatalog(); loadProjects(); loadStatuses(); recoverPending()
-            try { recoverInteractions() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
-            mutable.value.selected?.let { readGuarded(it) }; schedulePoll()
-        }
+        recoverCurrent()
+        recoverAux("catalog") { loadCatalog() }
+        recoverAux("projects") { loadProjects() }
+        recoverAux("statuses") { loadStatuses() }
+        recoverAux("pending") { recoverPending() }
+        recoverAux("interactions") { recoverInteractions() }
+        schedulePoll()
     }
     private suspend fun loadCatalog() {
         val catalog = call("catalog")
@@ -383,6 +452,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         mutable.update { it.copy(providers = providers, selection = chosen,
             quota = if (quotaValid) it.quota else "点击读取额度", quotaSummary = if (quotaValid) it.quotaSummary else "额度 ▾",
             selectionGuard = it.selectionGuard.ifBlank { providers.find { p -> p.id == chosen?.provider }?.guard.orEmpty() }) }
+        if (mutable.value.selected != null && entrySelection == null) autoRefreshQuota()
     }
     private suspend fun loadProjects() {
         val startGeneration = generation
@@ -471,6 +541,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun choose(selection: ZSelection) {
         if (mutable.value.busy || mutable.value.pending) return
+        choiceVersion++
+        entrySelection = null // An explicit user choice supersedes entry synchronization.
         mutable.update { it.copy(selection = selection, selectionGuard = it.providers.find { p -> p.id == selection.provider }?.guard.orEmpty(), quota = "点击读取额度", quotaSummary = "额度 ▾", notice = "下次发送使用此计划和模型") }
     }
     private fun selectionParams(): JSONObject {
@@ -480,12 +552,16 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         check(mutable.value.selectionGuard == provider.guard) { "额度来源已变化，请重新选择计划后发送" }
         return obj("selection" to choice.json(), "guard" to mutable.value.selectionGuard)
     }
-    fun quota() = action {
+    fun quota(): Job {
         val selected = mutable.value.selection
         val guard = mutable.value.selectionGuard
         val startGeneration = generation
         fun stillSelected() = generation == startGeneration && mutable.value.selection == selected && mutable.value.selectionGuard == guard
-        mutable.update { it.copy(quota = "正在读取…", quotaSummary = "额度 ▾") }
+        val target = RecoveryTarget(profile?.resumeIdentity.orEmpty(), "zcode", startGeneration,
+            "quota:$selected:$guard")
+        return recovery.launch("aux:quota", target, ::stillSelected,
+            started = { mutable.update { it.copy(quota = "正在读取…", quotaSummary = "额度 ▾") } },
+            failed = { mutable.update { it.copy(quota = "额度暂不可用，请重试", quotaSummary = "额度 ▾") } }) {
         try {
             val data = call("quota", selectionParams())
             if (stillSelected()) {
@@ -497,6 +573,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
         catch (e: CancellationException) { throw e }
         catch (e: Exception) { if (stillSelected()) mutable.update { it.copy(quota = "额度暂不可用，请重试", quotaSummary = "额度 ▾") } }
+        }
     }
 
     /** Automatic quota refresh on session entry: deduped per selection — same plan+model
@@ -536,37 +613,33 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             loadProjects()
         }
     }
-    fun open(session: ZSession) = action {
-        navigationVersion++
-        if (!mutable.value.connected && mutable.value.selected?.id == session.id) return@action
+    fun open(session: ZSession) {
+        if (!mutable.value.connected && sameTarget(mutable.value.selected, session)) return
         select(session)
-        if (mutable.value.connected) {
-            readGuarded(session, useSessionSelection = true)
-            // Entering a session syncs its actual plan/model — fetch quota in the
-            // background so the summary is current without a manual tap.
-            autoRefreshQuota()
-        }
+        entrySelection = EntrySelection(session, navigationVersion, choiceVersion)
+        if (mutable.value.connected) recoverCurrent()
         else mutable.update { it.copy(historyLoading = false, historyError = "连接后加载会话内容") }
     }
-    fun retryLoad() = action {
-        val session = mutable.value.selected ?: return@action
-        if (mutable.value.items.isEmpty()) mutable.update { it.copy(historyError = null, historyLoading = true) }
-        readGuarded(session)
-    }
+    fun retryLoad() { recoverCurrent() }
     // Only the first history of an empty session reports inline loading; refreshing an
     // already-loaded session keeps its messages visible instead of flashing a spinner.
     private suspend fun readGuarded(session: ZSession, useSessionSelection: Boolean = false) {
-        val scope = RequestScope(generation, sessionId = session.id)
+        val scope = RequestScope(generation, navigationVersion, session.id)
         try {
             read(session, useSessionSelection)
+            if (scope.appliesTo(generation, navigationVersion, mutable.value.selected?.id))
+                mutable.update { it.copy(recoveryPhase = RecoveryPhase.Ready) }
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
             // A result from before a reconnect must not clear the new connection's loading state.
-            if (scope.appliesToSession(generation, mutable.value.selected?.id) && mutable.value.items.isEmpty())
-                mutable.update { it.copy(historyLoading = false, historyError = e.message ?: "加载会话内容失败") }
+            if (scope.appliesTo(generation, navigationVersion, mutable.value.selected?.id) && mutable.value.items.isEmpty())
+                mutable.update { it.copy(recoveryPhase = RecoveryPhase.Failed, historyLoading = false, historyError = e.message ?: "加载会话内容失败") }
             throw e
         }
     }
     private fun select(session: ZSession) {
+        pauseRecovery()
+        navigationVersion++
+        entrySelection = null
         attachmentSelection++; attachmentSerial.incrementAndGet()
         mutable.value.selected?.let { vault.put(key("draft", it.id), mutable.value.draft) }
         persistSeen()
@@ -595,7 +668,8 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
     fun back() {
-        if (mutable.value.busy) return
+        entrySelection = null
+        pauseRecovery()
         attachmentSelection++; attachmentSerial.incrementAndGet()
         navigationVersion++
         if (mutable.value.selected == null) return
@@ -609,16 +683,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         older = emptyList()
         // Refs die with the session scope upstream; unsent attachment drafts are dropped.
         attachmentRefs.clear()
-        val epoch = generation
-        viewModelScope.launch {
-            actions.withLock {
-                if (epoch != generation || !mutable.value.connected) return@withLock
-                try {
-                    if (!supportsSessionIndex || System.currentTimeMillis() - listSyncedAt > 60_000) loadProjects()
-                    loadStatuses()
-                } catch (e: CancellationException) { throw e }
-                catch (e: Exception) { mutable.update { it.copy(sessionsFresh = false, liveStatuses = emptyList(), error = "更新列表失败：${e.message}") } }
-            }
+        if (mutable.value.connected) {
+            recoverCurrent()
+            recoverAux("statuses") { loadStatuses() }
         }
     }
 
@@ -630,10 +697,13 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     private data class SnapshotVersion(val epoch: String, val revision: Long, val retired: Set<String> = emptySet())
     private val snapshotVersions = HashMap<String, SnapshotVersion>()
     private val snapshotRequests = HashMap<String, Long>()
+    private val snapshotApplied = HashMap<String, Long>()
     private var snapshotSequence = 0L
 
     private suspend fun read(session: ZSession, useSessionSelection: Boolean = false, checkInteractionIds: List<String> = emptyList()) {
         val scope = interactionScope()
+        val navigation = navigationVersion
+        val choiceAtStart = choiceVersion
         val target = scope.owner + interactKey(session, "")
         val sequence = ++snapshotSequence
         snapshotRequests[target] = sequence
@@ -652,7 +722,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (checks.isNotEmpty() && interactSupport)
             request.put("checkInteractionIds", org.json.JSONArray(checks))
         var data = connection.call("session/read", request, timeout = 90_000)
-        fun isCurrent() = current(scope) && snapshotRequests[target] == sequence
+        fun isCurrent() = current(scope) && navigation == navigationVersion && (snapshotApplied[target] ?: 0L) <= sequence
         if (!isCurrent()) return
         val visible = mutable.value
         val previous = snapshotVersions[target] ?: if (sameTarget(visible.selected, session) && visible.logEpoch.isNotBlank())
@@ -672,6 +742,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 revision = data.optLong("revision")
             }
         }
+        snapshotApplied[target] = sequence
         snapshotVersions[target] = SnapshotVersion(epoch, revision,
             previous?.retired.orEmpty() + if (previous != null && epoch != previous.epoch) setOf(previous.epoch) else emptySet())
         if (interactSupport) {
@@ -683,6 +754,9 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val items = zcodeItems(data)
         if (epoch != mutable.value.logEpoch || revision != mutable.value.revision) older = emptyList()
         val actual = ZSelection.parse(data.optJSONObject("selection"))
+        val entering = entrySelection?.takeIf { it.navigation == navigation &&
+            it.choiceVersion == choiceVersion && sameTarget(it.session, session) }
+        val syncChoice = entering != null || (useSessionSelection && choiceAtStart == choiceVersion)
         val queue = queueEntries(data)
         val first = if (data.isNull("firstRowId")) null else data.optDouble("firstRowId")
         val interactions = if (interactSupport) zcodeInteractions(data) else emptyList()
@@ -693,14 +767,19 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             interactionCount = data.optInt("interactionCount"), currentSelection = actual,
             interactions = interactions, interactionsComplete = data.optBoolean("interactionsComplete"),
             interactionPresence = interactionPresence(data),
-            selection = if (useSessionSelection) actual ?: it.selection else it.selection,
-            selectionGuard = if (useSessionSelection && actual != null) it.providers.find { p -> p.id == actual.provider }?.guard.orEmpty() else it.selectionGuard,
+            selection = if (syncChoice) actual ?: it.selection else it.selection,
+            selectionGuard = if (syncChoice && actual != null) it.providers.find { p -> p.id == actual.provider }?.guard.orEmpty() else it.selectionGuard,
             permission = if (data.string("mode") == "yolo") "完全访问" else data.string("mode"),
             historyLoading = false, historyError = null, historyCached = false,
             beforeRow = if (older.isNotEmpty()) it.beforeRow else first?.takeIf { _ -> data.optBoolean("hasMore") },
             logEpoch = epoch, revision = revision,
             turn = ZTurn.parse(data.optJSONObject("turn")),
             notice = noticeForPhase(data.string("phase"), data.string("lastError").ifBlank { it.notice })) }
+        if (entering != null && entrySelection === entering) {
+            entrySelection = null
+            pausedAux.remove("aux:quota")
+            autoRefreshQuota()
+        }
         reconcileOutgoing(session.id)
         // Snooze intent may predate this snapshot (question arrived first), and a failed
         // earlier attempt becomes eligible again: re-arm against the fresh state.
@@ -1011,12 +1090,15 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     private suspend fun recoverPending() {
         val pending = pending ?: return
+        val epoch = generation
+        val navigation = navigationVersion
         val params = pending.getJSONObject("params")
         val sessionTarget = params.string("sessionId")
         val commandId = params.string("commandId")
         // Captured before the query: a late result must never be keyed with a newer profile.
         val targetKey = if (sessionTarget.isNotBlank()) outgoingKey(sessionTarget) else null
         val result = call("command/query", params).optJSONObject("ack")
+        if (epoch != generation || this.pending !== pending) return
         if (result == null) {
             mutable.update { it.copy(pendingUnknown = true, notice = "上一条命令结果未知。请核对会话后再解除发送保护。") }
             return
@@ -1055,7 +1137,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (pending.string("method") == "session/create") {
             val id = result.optJSONObject("result")?.string("sessionId").orEmpty()
-            if (id.isNotBlank()) select(ZSession(id, "新会话", params.string("workspacePath"), project = params.string("projectId")))
+            if (id.isNotBlank() && navigation == navigationVersion) {
+                select(ZSession(id, "新会话", params.string("workspacePath"), project = params.string("projectId")))
+                recoverCurrent()
+            }
         }
     }
     fun dismissError() { mutable.update { it.copy(error = null) } }
@@ -1463,27 +1548,21 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (!supportsSessionIndex) return
         val epoch = generation
         viewModelScope.launch {
-            actions.withLock {
-                if (epoch != generation || (active && visible) || !mutable.value.connected) return@withLock
-                try { call("sessions/pause") }
-                catch (e: CancellationException) { throw e }
-                catch (_: Exception) { /* Channel close also releases native subscriptions. */ }
-            }
+            if (epoch != generation || (active && visible) || !mutable.value.connected) return@launch
+            try { withContext(RecoveryDeadline(System.nanoTime() + 45_000_000_000L)) { call("sessions/pause") } }
+            catch (e: CancellationException) { throw e }
+            catch (_: Exception) { /* Channel close also releases native subscriptions. */ }
         }
     }
+
     private fun schedulePoll() {
         poll?.cancel()
         poll = viewModelScope.launch {
             while (isActive && visible && active) {
                 delay(2500)
-                if (actions.tryLock()) {
-                    try {
-                        loadStatuses()
-                        mutable.value.selected?.let { read(it) }
-                    }
-                    catch (e: CancellationException) { throw e }
-                    catch (e: Exception) { mutable.update { it.copy(error = "刷新会话失败：${e.message}") } }
-                    finally { actions.unlock() }
+                if (!mutable.value.busy) {
+                    recoverAux("statuses") { loadStatuses() }
+                    if (mutable.value.selected != null) recoverCurrent(quiet = true)
                 }
             }
         }

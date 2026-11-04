@@ -143,6 +143,7 @@ private fun ChatScreen(state: UiState, vm: RemoteViewModel, detail: (String, Str
     Column(Modifier.fillMaxSize()) {
         ChatRunHeader(codexAgentRun(state.connected, session.runtime, approvals.size), session.status, state.historyCached, state.connected,
             session.runtime == "active", state.connected && !state.busy && session.activeTurnId.isNotBlank(), vm::interrupt)
+        if (state.recoveryPhase == RecoveryPhase.Restoring) Text("正在恢复会话…", modifier = Modifier.padding(horizontal = 16.dp), fontSize = 12.sp)
         if (approvals.isNotEmpty()) InteractionBanner(approvalLabel(approvals), approvals.size) { approvalSheet = true }
         if (pendingProtectionVisible(state.uncertain != null, state.sending)) Surface(color = Color(0xfffaf0dc)) {
             Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -387,7 +388,7 @@ internal fun OutgoingCard(message: OutgoingMessage, detail: (String, String) -> 
 
 @Composable
 internal fun ConnectionScreen(state: UiState, vm: RemoteViewModel,
-    reconnect: () -> Unit = { vm.connect() }, disconnect: () -> Unit = { vm.disconnect() }) {
+    reconnect: () -> Unit = { vm.connect() }, disconnect: () -> Unit = { vm.disconnectManually() }) {
     var profile by remember(state.profile) { mutableStateOf(state.profile) }
     var advanced by rememberSaveable { mutableStateOf(false) }
     val scanner = rememberLauncherForActivityResult(ScanContract()) { result -> result.contents?.let(vm::pair) }

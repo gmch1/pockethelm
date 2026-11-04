@@ -331,6 +331,8 @@ class ZcodeSendRealtimeTest {
         // connect() order: recoverPending runs while the target session was never selected,
         // so the outgoing map is empty — the rejection must still create the FAILED record.
         freshViewModel()
+        // Real connect publishes the restored pending flag before asynchronous recovery.
+        state.value = state.value.copy(pending = true)
         vault().put(draftKey("sessA"), "恢复E")
         val pendingField = ZcodeViewModel::class.java.getDeclaredField("pending").apply { isAccessible = true }
         pendingField.set(vm, obj("method" to "session/send",

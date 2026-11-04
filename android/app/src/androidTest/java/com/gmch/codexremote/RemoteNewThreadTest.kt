@@ -138,6 +138,7 @@ class RemoteNewThreadTest {
         instrumentation.runOnMainSync { vm.createThread("/tmp/new-thread", "") }
         settled()
         assertEquals("新会话", state.value.selected?.title)
+        assertEquals(RecoveryPhase.Ready, state.value.recoveryPhase)
         assertEquals("新会话", calls("thread/name/set").single().getJSONObject("params").getString("name"))
         assertNull(state.value.historyError); assertFalse(state.value.historyLoading)
         assertFalse(state.value.historyCached); assertFalse(state.value.sending)

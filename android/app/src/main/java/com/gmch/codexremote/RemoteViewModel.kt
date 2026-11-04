@@ -23,6 +23,7 @@ import java.util.UUID
 
 data class UiState(
     val profile: ConnectionProfile = ConnectionProfile(), val saved: Boolean = false,
+    val recoveryPhase: RecoveryPhase = RecoveryPhase.Cached,
     val connected: Boolean = false, val busy: Boolean = false, val foreground: Boolean = false,
     val engine: String = "codex", val sessionsCached: Boolean = false, val historyCached: Boolean = false,
     val status: String = "尚未连接", val error: String? = null, val challenge: HostChallenge? = null,
@@ -47,6 +48,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     val state = mutable.asStateFlow()
     private val actions = Mutex()
     private var transport: SshTransport? = null
+    private var retiringTransport: SshTransport? = null
     private var rpc: RpcClient? = null
     private var connectionJob: Job? = null
     private var refreshJob: Job? = null
@@ -55,6 +57,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var quotaDeferred = false
     private var quotaRefreshPending = false
     private var accountVersion = 0
+    private var modelsRequest = 0
+    private var quotaRequest = 0
     private val settingsRevisions = mutableMapOf<String, Long>()
     private var epoch = 0
     private var targetPassphrase = ""
@@ -79,7 +83,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var backgroundJob: Job? = null
     private var statusJob: Job? = null
     private var listVersion = 0
-    private var resumeJob: Job? = null
+    internal val recovery = SessionRecovery(viewModelScope)
+    private var manuallyDisconnected = false
+    private val pausedAux = mutableSetOf<String>()
     private var backgroundAt = 0L
     private var listSyncedAt = 0L
     private var projectsSyncedAt = 0L
@@ -135,10 +141,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun localKey(type: String, id: String) = "$type:${mutable.value.profile.identity}:$id"
     private fun client() = rpc ?: error("请先连接开发机")
     private fun action(block: suspend () -> Unit) = viewModelScope.launch {
+        val generation = epoch
         actions.withLock {
+            if (generation != epoch) return@withLock
             mutable.update { it.copy(busy = true, error = null) }
-            try { block() } catch (e: CancellationException) { throw e } catch (t: Throwable) { fail(t) }
-            finally { mutable.update { it.copy(busy = false) } }
+            try { block() } catch (e: CancellationException) { throw e }
+            catch (t: Throwable) { if (generation == epoch) fail(t) }
+            finally { if (generation == epoch) mutable.update { it.copy(busy = false) } }
         }
     }
 
@@ -147,29 +156,64 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         backgroundJob?.cancel(); backgroundJob = null
         mutable.update { it.copy(foreground = true) }
         if (!mutable.value.saved) return
-        if (!mutable.value.connected) { connect(); return }
+        if (!mutable.value.connected) { if (!manuallyDisconnected) connect(); return }
         if (alreadyVisible) return
         scheduleRefresh()
-        if (System.currentTimeMillis() - backgroundAt < 5_000) return
-        if (resumeJob?.isActive == true) return
-        val generation = epoch
-        resumeJob = viewModelScope.launch {
-            actions.withLock {
-                if (epoch != generation || !mutable.value.foreground) return@withLock
-                try {
-                    mutable.value.selected?.let { loadThreadGuarded(it.id) }
-                    if (mutable.value.selected == null && System.currentTimeMillis() - listSyncedAt > 20_000) loadSessions(false)
-                } catch (e: CancellationException) { throw e } catch (t: Throwable) { fail(t) }
+        val interruptedAux = pausedAux.toSet(); pausedAux.clear()
+        if ("aux:refreshModels" in interruptedAux) refreshModels()
+        if ("aux:refreshQuota" in interruptedAux) refreshQuota()
+        if ("aux:session-status" in interruptedAux) refreshSessionStatuses()
+        // The age shortcut is valid only after a completed read. A canceled first
+        // read/refresh must restart even when the background visit lasted one frame.
+        if (mutable.value.recoveryPhase == RecoveryPhase.Ready &&
+            System.currentTimeMillis() - backgroundAt < 5_000) return
+        recoverCurrent()
+    }
+
+    /** One current detail target; list refreshes cannot swallow a selected-session read. */
+    private fun recoverCurrent(): Job? {
+        if (!mutable.value.connected) return null
+        val session = mutable.value.selected
+        val target = RecoveryTarget(mutable.value.profile.resumeIdentity, "codex", epoch,
+            session?.id ?: "list", selectionVersion)
+        fun current() = epoch == target.generation && selectionVersion == target.selection &&
+            mutable.value.profile.resumeIdentity == target.environment && mutable.value.selected?.id == session?.id
+        return recovery.launch(if (session == null) "list" else "detail", target, ::current,
+            started = { mutable.update { it.copy(recoveryPhase = RecoveryPhase.Restoring,
+                historyLoading = session != null, historyError = null, error = null) } },
+            failed = { e -> mutable.update { it.copy(recoveryPhase = RecoveryPhase.Failed,
+                historyLoading = false, historyError = if (session != null) e.message else it.historyError,
+                error = e.message) } },
+            finished = { mutable.update { it.copy(historyLoading = false,
+                recoveryPhase = if (it.recoveryPhase == RecoveryPhase.Failed) it.recoveryPhase else RecoveryPhase.Ready) } }) {
+            if (session != null) loadThreadGuarded(session.id)
+            else {
+                loadSessions(false)
+                if (mutable.value.projects.isEmpty() || System.currentTimeMillis() - projectsSyncedAt > 60_000) loadProjects()
             }
         }
     }
+
+    private fun pauseRecovery(all: Boolean = false) {
+        if (all) {
+            pausedAux += recovery.activeLanes().filter { it == "aux:refreshModels" || it == "aux:refreshQuota" || it == "aux:session-status" }
+            recovery.cancelAll()
+        } else { recovery.cancel("detail"); recovery.cancel("list") }
+        // Keep a successfully loaded target fresh across short pauses; navigation
+        // always invalidates it, and interrupted/failed reads remain eligible to retry.
+        mutable.update { it.copy(historyLoading = false,
+            recoveryPhase = if (all && it.recoveryPhase == RecoveryPhase.Ready) RecoveryPhase.Ready else RecoveryPhase.Cached) }
+    }
+    fun disconnectManually() { manuallyDisconnected = true; disconnect() }
     fun keepConnection() { backgroundJob?.cancel(); backgroundJob = null }
     fun leave() {
         mutable.update { it.copy(foreground = false) }
         backgroundAt = System.currentTimeMillis()
         refreshJob?.cancel()
+        pauseRecovery(all = true)
     }
     fun background() {
+        pauseRecovery(all = true)
         mutable.update { it.copy(foreground = false) }
         backgroundAt = System.currentTimeMillis()
         refreshJob?.cancel()
@@ -189,15 +233,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         attachmentSerial.incrementAndGet()
         backgroundJob?.cancel(); backgroundJob = null; statusJob?.cancel()
         connectionJob?.cancel(); connectionJob = null; refreshJob?.cancel()
-        resumeJob?.cancel(); resumeJob = null
+        pauseRecovery(all = true)
+        pausedAux.clear() // A new connection starts fresh global reads itself.
         modelsJob?.cancel(); quotaJob?.cancel(); quotaRefreshPending = false
         rpc?.close(); rpc = null
         val old = transport; transport = null
+        if (old != null && retiringTransport == null) retiringTransport = old
         viewModelScope.launch(Dispatchers.IO) { old?.close() }
         // A request still in flight loses its channel: the outcome is unknown, never a failure.
         outgoingBySession.keys.toList().forEach { markOutgoingUncertain(it) }
         mutable.update {
-            it.copy(connected = false, busy = false, sending = false, historyLoading = false,
+            it.copy(connected = false, busy = false, sending = false, historyLoading = false, recoveryPhase = RecoveryPhase.Cached,
+                selected = it.selected?.copy(runtime = "notLoaded", activeTurnId = "", lastTurnStatus = ""),
                 // A session opened but never loaded must not fall back to the new-thread empty state.
                 historyError = if (it.selected != null && it.items.isEmpty() && it.historyLoading)
                     "连接已断开，未能加载会话内容，重连后重试" else it.historyError,
@@ -219,7 +266,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             disconnect()
             vault.put("profile", profile.json().toString())
             targetPassphrase = targetPass; jumpPassphrase = jumpPass
-            selectionVersion++; timeline.clear()
+            pauseRecovery(); selectionVersion++; timeline.clear()
             // A different environment owns no local records from the previous one.
             outgoingBySession.clear()
             mutable.update { it.copy(profile = profile, saved = true, sessions = emptyList(), selected = null,
@@ -310,17 +357,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun connect() {
+        manuallyDisconnected = false
         if (connectionJob?.isActive == true) return
         if (mutable.value.connected) { refresh(); return }
         connectionJob = viewModelScope.launch {
             restoreJob.join()
-            actions.withLock {
+            run {
                 val generation = ++epoch
                 val ssh = SshTransport()
                 transport = ssh
                 mutable.update { it.copy(busy = true, error = null, status = "正在连接 SSH…", challenge = null) }
                 try {
-                    ssh.connect(mutable.value.profile, vault, targetPassphrase, jumpPassphrase)
+                    retiringTransport?.let { check(it.awaitClosed()) { "旧连接尚未释放，请稍后重连" }; retiringTransport = null }
+                    val connectionDeadline = System.nanoTime() + 45_000_000_000L
+                    withContext(RecoveryDeadline(connectionDeadline)) { ssh.connect(mutable.value.profile, vault, targetPassphrase, jumpPassphrase) }
                     ensureActive()
                     val connection = RpcClient(ssh.input, ssh.output, { event ->
                         withContext(Dispatchers.Main) { if (generation == epoch) handle(event) }
@@ -331,26 +381,24 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     } })
                     rpc = connection
-                    val initialized = connection.initialize()
+                    val initialized = withContext(RecoveryDeadline(connectionDeadline)) { connection.initialize() }
                     ensureActive()
                     mutable.update { it.copy(connected = true, status = "已连接", version = initialized.string("userAgent")) }
                     refreshModels(); refreshQuota()
-                    // Current conversation is useful before directory/catalog/list enrichment.
-                    mutable.value.selected?.let { session ->
-                        try { loadThreadGuarded(session.id) } catch (e: CancellationException) { throw e } catch (e: Exception) { fail(e) }
-                    }
-                    loadSessions(false)
-                    if (mutable.value.projects.isEmpty() || System.currentTimeMillis() - projectsSyncedAt > 60_000) loadProjects()
+                    recoverCurrent()
                     scheduleRefresh()
                 } catch (e: HostIdentityException) {
-                    mutable.update { it.copy(challenge = e.challenge, connected = false, status = "核对 SSH 主机指纹") }
+                    if (generation == epoch) mutable.update { it.copy(challenge = e.challenge, connected = false, status = "核对 SSH 主机指纹") }
                 } catch (e: CancellationException) { throw e }
                 catch (t: Throwable) {
                     val label = if (mutable.value.profile.useJump) "跳板机" else "开发机"
-                    mutable.update { it.copy(connected = false, status = "连接失败", error = connectionFailureMessage(t, label)) }
+                    if (generation == epoch) mutable.update { it.copy(connected = false, status = "连接失败", error = connectionFailureMessage(t, label)) }
                 }
                 finally {
-                    if (!mutable.value.connected || generation != epoch) withContext(NonCancellable + Dispatchers.IO) { ssh.close() }
+                    if (!mutable.value.connected || generation != epoch) {
+                        ssh.close()
+                        if (generation == epoch && retiringTransport == null) retiringTransport = ssh
+                    }
                     if (generation == epoch) mutable.update { it.copy(busy = false) }
                 }
             }
@@ -360,13 +408,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun refresh() {
         if (!mutable.value.connected) { connect(); return }
         refreshModels(); refreshQuota()
-        action { loadSessions(false); mutable.value.selected?.let { loadThreadGuarded(it.id) }; loadProjects() }
+        recoverCurrent()
     }
 
     fun refreshModels() {
         if (!mutable.value.connected || modelsJob?.isActive == true) return
         val generation = epoch; val account = accountVersion; val connection = client()
-        modelsJob = viewModelScope.launch {
+        val request = ++modelsRequest
+        val target = RecoveryTarget(mutable.value.profile.resumeIdentity, "codex", generation, "refreshModels", account)
+        modelsJob = recovery.launch("aux:refreshModels", target,
+            { generation == epoch && account == accountVersion && request == modelsRequest },
+            failed = { e -> mutable.update { it.copy(modelsLoading = false, modelsError = e.message) } }) {
             mutable.update { it.copy(modelsLoading = true, modelsError = null) }
             try {
                 val models = mutableListOf<ModelOption>(); val cursors = mutableSetOf<String>()
@@ -377,12 +429,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     cursor = page.string("nextCursor").ifBlank { null }
                     check(cursor == null || cursors.add(cursor)) { "模型分页游标重复" }
                 } while (cursor != null)
-                if (generation == epoch && account == accountVersion) mutable.update { it.copy(models = models.distinctBy { m -> m.id }) }
-            } catch (e: TimeoutCancellationException) {
-                if (generation == epoch && account == accountVersion) mutable.update { it.copy(modelsError = "读取模型列表超时，请重试") }
+                if (generation == epoch && account == accountVersion && request == modelsRequest) mutable.update { it.copy(models = models.distinctBy { m -> m.id }) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (generation == epoch && account == accountVersion) mutable.update { it.copy(modelsError = e.message ?: "模型列表暂不可用") } }
-            finally { if (generation == epoch && account == accountVersion) mutable.update { it.copy(modelsLoading = false) } }
+            catch (e: Exception) { if (generation == epoch && account == accountVersion && request == modelsRequest) mutable.update { it.copy(modelsError = e.message ?: "模型列表暂不可用") } }
+            finally { if (generation == epoch && account == accountVersion && request == modelsRequest) mutable.update { it.copy(modelsLoading = false) } }
         }
     }
 
@@ -393,22 +443,27 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             else { if (fromEvent && !quotaDeferred) quotaRefreshPending = true; return }
         }
         val generation = epoch; val account = accountVersion; val connection = client()
+        val request = ++quotaRequest
+        val target = RecoveryTarget(mutable.value.profile.resumeIdentity, "codex", generation, "refreshQuota", account)
         quotaDeferred = fromEvent
-        quotaJob = viewModelScope.launch {
+        quotaJob = recovery.launch("aux:refreshQuota", target,
+            { generation == epoch && account == accountVersion && request == quotaRequest },
+            failed = { e -> mutable.update { it.copy(quotaLoading = false, quotaError = e.message) } }) {
             // Notifications are sparse. Fetch an authoritative snapshot, coalescing rapid updates.
             if (fromEvent) delay((10_000L - (System.currentTimeMillis() - (mutable.value.quota?.updatedAt ?: 0))).coerceAtLeast(300))
             quotaDeferred = false
             mutable.update { it.copy(quotaLoading = true, quotaError = null) }
             try {
                 val result = connection.call("account/rateLimits/read", obj("excludeResetCreditDetails" to true), timeout = 20_000)
-                if (generation == epoch && account == accountVersion) mutable.update { it.copy(quota = AccountQuota.parse(result)) }
-            } catch (e: TimeoutCancellationException) {
-                if (generation == epoch && account == accountVersion) mutable.update { it.copy(quotaError = "读取额度超时，请重试") }
+                if (generation == epoch && account == accountVersion && request == quotaRequest) mutable.update { it.copy(quota = AccountQuota.parse(result)) }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (generation == epoch && account == accountVersion) mutable.update { it.copy(quotaError = e.message ?: "额度暂不可用") } }
-            finally { if (generation == epoch && account == accountVersion) {
+            catch (e: Exception) { if (generation == epoch && account == accountVersion && request == quotaRequest) mutable.update { it.copy(quotaError = e.message ?: "额度暂不可用") } }
+            finally { if (generation == epoch && account == accountVersion && request == quotaRequest) {
                 mutable.update { it.copy(quotaLoading = false) }
-                if (quotaRefreshPending) { quotaRefreshPending = false; quotaJob = null; refreshQuota(fromEvent = true) }
+                if (quotaRefreshPending && mutable.value.foreground) {
+                    quotaRefreshPending = false
+                    viewModelScope.launch { yield(); if (generation == epoch && request == quotaRequest) { quotaJob = null; refreshQuota(fromEvent = true) } }
+                }
             } }
         }
     }
@@ -488,7 +543,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 delay(20_000)
                 if (mutable.value.connected && mutable.value.foreground && !mutable.value.busy) {
-                    actions.withLock { refreshTick() }
+                    if (mutable.value.selected == null) recoverCurrent()
                 }
             }
         }
@@ -522,9 +577,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // Publish the first RPC immediately. Slow per-session status queries never block navigation.
         mutable.update { state -> state.copy(sessions = (if (more) state.sessions + base else base).distinctBy { it.id },
             sessionsCached = false, cursor = page.string("nextCursor").ifBlank { null }, lastSync = listSyncedAt) }
+        refreshSessionStatuses(base, connection, generation, request)
+    }
+
+    private fun refreshSessionStatuses(base: List<SessionInfo> = mutable.value.sessions,
+        connection: RpcClient = client(), generation: Int = epoch, request: Int = listVersion) {
         statusJob?.cancel()
-        statusJob = viewModelScope.launch {
-            val semaphore = Semaphore(4)
+        statusJob = recovery.launch("aux:session-status",
+            RecoveryTarget(mutable.value.profile.resumeIdentity, "codex", generation, "session-status", request),
+            { generation == epoch && request == listVersion }, failed = { /* Base list remains available. */ }) {
+            val semaphore = Semaphore(1)
+            coroutineScope {
             base.filter { it.lastTurnStatus.isBlank() || it.runtime == "active" }.map { session -> launch {
                 semaphore.withPermit {
                     val revision = turnRevisions[session.id] ?: 0L
@@ -541,6 +604,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     } catch (e: CancellationException) { throw e } catch (_: Exception) { /* Base metadata remains usable. */ }
                 }
             } }.joinAll()
+            }
         }
     }
     fun moreSessions() = action { if (mutable.value.cursor != null) loadSessions(true) }
@@ -554,6 +618,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openThread(session: SessionInfo) {
+        pauseRecovery()
         selectionVersion++
         timeline.clear()
         discardAttachmentDraft("切换会话")
@@ -583,12 +648,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         receipt.string("text"), OutgoingState.UNCERTAIN))
             }
         }
-        if (mutable.value.connected) action { loadThreadGuarded(session.id) }
+        if (mutable.value.connected) recoverCurrent()
     }
-    fun retryHistory() = action {
-        val id = mutable.value.selected?.id ?: return@action
-        loadThreadGuarded(id)
-    }
+    fun retryHistory() { recoverCurrent() }
     // Only the first history of an empty session reports inline loading; refreshing an
     // already-loaded session keeps its messages visible instead of flashing a spinner.
     private suspend fun loadThreadGuarded(id: String) {
@@ -603,7 +665,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             throw t
         }
     }
-    fun back() { selectionVersion++; discardAttachmentDraft("返回列表"); mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", uncertain = null, diff = "", historyLoading = false, historyError = null, sending = false, outgoing = emptyList(), attachments = emptyList(), attachmentsBusy = false) }; timeline.clear() }
+    fun back() { pauseRecovery(); selectionVersion++; discardAttachmentDraft("返回列表"); mutable.update { it.copy(selected = null, items = emptyList(), queue = emptyList(), draft = "", uncertain = null, diff = "", historyLoading = false, historyError = null, sending = false, outgoing = emptyList(), attachments = emptyList(), attachmentsBusy = false) }; timeline.clear() }
 
     private suspend fun loadThread(id: String) {
         val version = selectionVersion
@@ -704,8 +766,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // title too; never claim creation succeeded until the server confirms it.
         val title = name.trim().take(120).ifBlank { "新会话" }
         client().call("thread/name/set", obj("threadId" to session.id, "name" to title))
-        selectionVersion++; timeline.clear()
-        mutable.update { it.copy(selected = session.copy(title = title), items = emptyList(), queue = emptyList(),
+        pauseRecovery(); selectionVersion++; timeline.clear()
+        mutable.update { it.copy(recoveryPhase = RecoveryPhase.Ready, selected = session.copy(title = title), items = emptyList(), queue = emptyList(),
             historyCursor = null, draft = "", uncertain = null, diff = "", tab = 0, modelSettings = ModelSettings.parse(result), settingsNotice = null,
             historyLoading = false, historyError = null, historyCached = false, sending = false, outgoing = emptyList()) }
         loadSessions(false)

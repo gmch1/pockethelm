@@ -190,7 +190,8 @@ class ApprovalInteractionTest {
         zState = ZcodeViewModel::class.java.getDeclaredField("mutable").let {
             it.isAccessible = true; it.get(zvm) as MutableStateFlow<ZcodeState>
         }
-        zState.value = ZcodeState(connected = true, selected = zSession, interactionsEnabled = true,
+        // This fixture represents an already loaded interaction window, not a canceled first read.
+        zState.value = ZcodeState(connected = true, recoveryPhase = RecoveryPhase.Ready, selected = zSession, interactionsEnabled = true,
             interactions = listOf(zFormInteraction, zFreeTextInteraction))
         ZcodeViewModel::class.java.getDeclaredField("interactSupport").let {
             it.isAccessible = true; it.set(zvm, true)
@@ -615,7 +616,11 @@ class ApprovalInteractionTest {
             reviewOpenBanner("ZCode 等待输入")
             reviewAwait { reviewNodes().any { it.isEditable && it.isPassword && it.text?.length == 19 } }
             assertEquals(1, snoozes.get())
-            reviewScreenshot("zcode-sensitive-draft")
+            // MIUI's secure IME can intentionally deny whole-display screenshots.
+            // Draft/IME assertions above are the test; dismiss the keyboard before
+            // capturing non-sensitive review evidence, without disabling its policy.
+            instrumentation.uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+            reviewScreenshot("zcode-sensitive-draft-after-dismiss")
         }
     }
 
@@ -806,7 +811,9 @@ class ApprovalInteractionTest {
     private fun reviewScreenshot(name: String) {
         instrumentation.waitForIdleSync(); Thread.sleep(700)
         val folder = java.io.File(instrumentation.targetContext.cacheDir, "interaction-review").apply { mkdirs() }
-        val bitmap = instrumentation.uiAutomation.takeScreenshot()
+        var captured = instrumentation.uiAutomation.takeScreenshot()
+        repeat(4) { if (captured == null) { Thread.sleep(250); captured = instrumentation.uiAutomation.takeScreenshot() } }
+        val bitmap = checkNotNull(captured) { "UI screenshot unavailable after keyboard dismissal" }
         try { java.io.File(folder, "$name.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) } } finally { bitmap.recycle() }
     }
     @Test fun reviewSingleChoiceCustomAnswerUi() = runBlocking {

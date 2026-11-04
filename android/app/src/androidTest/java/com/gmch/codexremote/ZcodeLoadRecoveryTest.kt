@@ -179,7 +179,7 @@ class ZcodeLoadRecoveryTest {
     }
 
     @Test fun createFailsFirstReadThenRetryRecovers() = runBlocking {
-        freshViewModel()
+        freshViewModel(connected = true)
         seedSelection()
         val reads = AtomicInteger()
         scripted["session/create"] = { obj("status" to "accepted", "result" to obj("sessionId" to "sess_create")) }

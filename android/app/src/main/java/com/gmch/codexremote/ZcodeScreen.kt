@@ -97,6 +97,7 @@ private fun ZcodeScreen(vm: ZcodeViewModel, codex: RemoteViewModel) {
             pages.SaveableStateProvider("chat:${state.selected!!.id}") {
                 Column(Modifier.fillMaxSize()) {
                     var showSettings by remember { mutableStateOf(false) }
+                    if (state.recoveryPhase == RecoveryPhase.Restoring) Text("正在恢复会话…", modifier = Modifier.padding(horizontal = 16.dp), fontSize = 12.sp)
                     ChatRunHeader(zcodeAgentRun(state.connected, state.phase, state.interactionCount), phaseLabel(state.phase),
                         state.historyCached, state.connected, state.executionId.isNotBlank(),
                         state.connected && !state.busy && !state.pending && !state.commandInFlight, vm::stop)
