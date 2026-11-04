@@ -82,6 +82,6 @@
 ## 发布或完成
 
 - R11 备份引用清理（2026-11-04）：filter-branch 保留的 `refs/original/refs/heads/fix-connection-error-leaks`（指向含凭据的 2a7c498）已删除，reflog 过期并 `gc --prune=now`；`git log -p --all` 对任务文档的凭据匹配复核为 0。远端对象在 force push 后由服务器侧 GC 处理，不受本地控制。
-- 发布：0.4.24 / versionCode 34 已上传原商店条目并返回 published；公开索引与完整下载包校验通过。发布前在 0.4.23 构建重跑真机 37/37（额度 5 + 回归 32），0.4.24 的 App 代码 delta 仅为本任务两处修复。证据：`~/.local/state/pockethelm/release-0.4.24/`。
+- 发布：0.4.24 / versionCode 34 已上传原商店条目并返回 published；公开索引与完整下载包校验通过（APK SHA-256 `44644e44edec79b6d29737b0b8f25229f3d8a9c1fb315e7bf8d9cbc7eb237b9a`，签名 `54c2508d…` 与历史一致）。发布前在 0.4.23 构建重跑真机 37/37（额度 5 + 回归 32），0.4.24 的 App 代码 delta 仅为本任务两处修复。证据：`~/.local/state/pockethelm/release-0.4.24/`（notes.txt、index-v1.jar、download.apk、store-verified.json）。
 - 合并：分支快进合并至 `main` 并推送。
 - 待办：真实 DNS 场景的长期观察（Private DNS 注入为模拟）；此前声称但一度缺失的 manualRefreshUpdatesTtlWatermark 已随 0.4.24 发布补齐并真机验证。
