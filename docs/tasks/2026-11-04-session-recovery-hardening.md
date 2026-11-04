@@ -1,6 +1,6 @@
 # 借鉴 Agents Anywhere：会话恢复、状态管理与回归验证计划
 
-状态：批次 A 实现复查通过，R4–R6 已关闭；准备发布 0.4.26/36。批次 B–D 尚未实施，按用户要求不 push。
+状态：批次 A 已发布 0.4.26/36，R4–R6 已关闭。批次 B–D 尚未实施；本地提交完成，按用户要求未 push。
 
 ## 需求与验收
 
@@ -424,3 +424,14 @@ I/O 和锁的具体约束：
 ### 发布授权与候选版本
 
 用户授权本地提交并更新商店，不 push。已核对公开索引最高版本为 0.4.25/35，本次批次 A 顺延为 0.4.26/36。产品与测试源码快照仍与已批复的 c556f3f3… 一致，仅发行版本元数据变化；最终发行包验证进行中。
+
+
+### 0.4.26 / versionCode 36 发布记录（2026-11-04）
+
+- 用户授权本地提交并更新商店，明确不 push。实现与发行版本提交：`bcf11e4`；分支 `feat-session-recovery-hardening`。没有推送远程或合并该实现分支到 main。
+- 已核对 Kotlin 产品/测试源码与复查通过的 c556f3f3… 快照一致，发行变更仅为 versionName 0.4.26 / versionCode 36。签名 release 构建成功，包名 `com.gmch.codexremote`，Manifest 未启用 debuggable；证书 SHA-256 仍为 `54c2508d89048ef721e3d67d0a192397f103886a9f40e65ba31d696c2e2fbab5`。
+- 最终 APK SHA-256：`8d495ef40a32f972fc9cb1a99fafaf7e31b797520249be5e9cd41d84988ae75d`。在 129 覆盖安装后重跑生命周期、协调器、原生 SSH/握手停滞和新会话回归：**29 项，28 通过、1 专用真实模型夹具跳过、0 失败**。这不替代上方全量修复阶段的 110 通过/2 跳过记录；本次版本元数据变化后完成发行包定向补验。
+- 从设备拉取已安装 APK，与待上传文件逐字节一致。测试包已卸载，用户 App 数据、配对及持久权限基线保留；没有真实模型回合。
+- 上传商店返回 `published`；公开 HTTPS 索引确认 0.4.26/36，完整下载 `com.gmch.codexremote_36.apk`，其 SHA-256 与索引、已测本地包及已安装包一致。
+- 证据：`~/.local/state/pockethelm/release-0.4.26/`（build.log、device.txt、verified-local.json、upload.json、index-v1.jar、download.apk、store-verified.json、notes.txt、app-release.apk）。
+- 本次只发布批次 A；P2–P4/批次 B–D 仍未实施，不属于本次发行内容。
