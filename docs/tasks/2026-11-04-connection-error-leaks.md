@@ -57,3 +57,24 @@
 - **回复与修正（2026-11-04）**：接受——文档审计表述已收窄为「其余 runCatching 为静默路径或非挂起调用（草稿 vault 写入 onFailure(::fail) 不涉及协程取消），未发现同类泄漏」。
 - 本轮实际执行 release JVM 单测成功；XML 为 **总计 116，115 通过、1 条件跳过、0 失败/错误**，不是“116 通过另加 1 跳过”。完整分支 diff --check 通过。绿色单测未覆盖 R10 的真实异常类型。
 - 用户已明确真机中断不阻塞本次代码 review；本轮未重复操作 129，也未把尚未完成的 DNS/后台/重连真机验收记为通过。修复以上问题后可复查代码；最终发布仍需如实记录真机验收状态。
+
+
+### 实现 review 复查：a372722（2026-11-04，当前有效结论）
+
+**通过（代码 review）。R10、R11 的分支修复关闭，未发现新的代码阻塞问题。** 已先执行 `git fetch origin`，确认本地 HEAD 与 `origin/fix-connection-error-leaks` 同为 `a372722ff6efc9ad2feff94ae509dca86e5c9672`；实际提交链为 `f8c3669 → 908cfe5 → c566d52 → fc7754e → a372722`，审查基于重写后的全部改动，而非旧 efe8b86。
+
+- **R10：关闭。** connectionFailureMessage 最多遍历 8 层 cause（循环引用也会在上限结束），可以识别 JSch 包装及多层包装的 UnknownHostException；空/超长信息使用无主机回退，非 DNS 维持原 message。连接失败入口按 useJump 区分跳板机/开发机。包装异常、双层包装、空主机以及原有普通异常/超长信息测试已核对。单层测试的外层 message 未完全复刻此前探针中的类名前缀，但 cause 类型与包装结构准确，另一个多层测试覆盖含原始类名前缀的 message，故不影响验收。
+- **取消路径：代码正确。** scheduleRefresh 在原锁区间内调用 refreshTick，取消异常重抛，普通异常继续 fail。新增 RemoteRefreshCancelTest 使用真实 RpcClient + 管道假桥接，等待 thread/list 已进入后取消客户端协程，检查 error 不被写入；另测普通失败仍展示。编译检查通过；设备执行仍待恢复，不能称为真机验证通过。
+- **R11：当前分支历史清理关闭。** 对上述五个提交各自完整跟踪文件树检索原凭据值，均无命中，当前正文使用管理员配置的解锁方式。此结论仅说明当前待合并分支提交树已清理，不意味着已暴露凭据失效，也不保证远端旧对象、缓存或他人克隆被撤回；凭据更换仍按文档已有说明另行跟进，不把它记为已完成。
+- **文档残留更正（非阻塞）**：当前“根因”第 1 项和“实现与验证”RemoteViewModel 条目仍写“取消挂起中的 delay(20_000)”；本节明确替代该旧口径：被旧 runCatching 捕获的是 loadSessions/RPC 内的取消，外层 delay 不在捕获范围内。实现摘要“主机名截断 200 字符”亦应以代码为准：超过 200 字符时省略主机信息，采用回退文案。此前声称这些正文均已改完不准确，但不改变本轮代码结论。
+
+验证：执行 `:app:testReleaseUnitTest :app:compileReleaseAndroidTestKotlin` 成功（本轮 Gradle 任务均为 UP-TO-DATE，复用现有产物/报告，未声称重新执行测试体）；读取 JVM XML 汇总为 **119 项，118 通过、1 跳过、0 失败/错误**。完整范围 `git diff --check d28e8d1..a372722` 通过。新增 instrumentation 与真实 DNS/后台/重连真机验证仍未执行，按用户约定不阻塞本次代码 review；本结论不是发布验收通过。本轮只追加任务文档，未操作离线设备、修改产品代码、提交、推送或发布。
+
+
+### 环境探测与 R10/R11 再确认（2026-11-04，HEAD a372722）
+
+已在 `/home/ming/projects/codex-remote-android` 实际执行用户指定的三组命令。HEAD 输出为 `a372722 docs: narrow audit wording and correct the cancellation root cause`；cause 链锚点实际命中 `73:    while (cause != null && depth < 8) {`。当前实现确实包含 R10 修复，未使用旧快照，**R10 保持关闭**。
+
+**R11 范围澄清：当前分支代码 review 保持通过；全引用历史清理尚有本地备份残留。** 用户指定的 `git log -p --all` 凭据匹配计数实际为 **2，而非预期 0**。进一步逐引用检查，唯一命中来源为 `refs/original/refs/heads/fix-connection-error-leaks`（指向 `2a7c498`），是 filter-branch 保留的旧历史备份；HEAD 与 `origin/fix-connection-error-leaks` 各自历史计数均为 **0**。因此此前“当前待合并分支提交树已清理”的结论成立，但不能扩展为“本地 --all 所有引用已清理”。按用户本次新增的全引用检查口径，R11 尚需处理该备份引用并重新验证；未新增重复问题编号。
+
+本轮只记录复核结果，未自行删除历史备份、改写提交或推送；不将本地备份残留误报为远端当前分支仍包含凭据，也不声称远端旧对象及副本已经销毁。未重跑此前无变化的测试；真实 DNS 与 RemoteRefreshCancelTest 真机执行仍待设备恢复，不阻塞当前代码 review。
