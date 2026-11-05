@@ -1,6 +1,6 @@
 # ZCode 运行中加载更早消息误报版本冲突
 
-状态：已修复，JVM/129 真机验证及自查通过；未提交、未发布。
+状态：已修复、验证并发布 0.4.28/38；代码提交 17afcf0，分支 fix-zcode-history-revision。
 
 ## 需求与验收
 
@@ -38,7 +38,7 @@
 - 源码快照（本次变更和新增 Kotlin 文件，path + NUL + bytes + NUL 排序）：`fc7890e67a63b7746385b7869bbd1940c295f43bc7b3d332f68a72c684ca6b79`；完整文件列表见 verified.json。
 - 最终测试 APK：`ac2a0850365b10b173262b032bf3b338be6eeed19e171004a24aa932609b97a9`，已与 129 安装包校验一致，仍为测试基线 0.4.27/37，非商店发布包。
 - 证据：build-final.log、device.txt、device-final.txt、verified.json。测试包已卸载，正常数据和权限基线保留；模型调用为 0，未读取或修改截图中的真实任务。
-- 代码位于 fix-zcode-history-revision 工作区，未提交、未发布、未 push。
+- 上述为发布前验证记录；最终发行记录见下文。
 
 
 ## 0.4.28/38 发行复验
@@ -49,3 +49,12 @@
 - APK SHA-256：`ca60fbcef4a1accb6c086ba4cc66e3b42489daa085d994fe64db7813980b8cae`；与 129 安装包一致。签名沿用 54c2508d…，不可调试，包名 com.gmch.codexremote。
 - 完整 android/、scripts/ 源文件快照（含新增，排序 path + NUL + bytes + NUL）：`07d9403ee7843a949de1d2aa3503671b4fda3dedec08f45ae5d79ec105ad7ad5`，清单见 verified-local.json。
 - 证据：`~/.local/state/pockethelm/release-0.4.28/`。复审结论：**通过（可发布）**。
+
+
+## 商店发布记录
+
+- 代码提交 `17afcf0`，已核对提交源码与已测发行包的源文件快照一致。
+- 商店 API 返回 published。公开 HTTPS 索引为 **0.4.28 / versionCode 38**，包名、历史签名及 SHA-256 均一致；完整下载 `com.gmch.codexremote_38.apk` 校验通过。
+- 下载包、本地发行包及 129 安装包 SHA-256：`ca60fbcef4a1accb6c086ba4cc66e3b42489daa085d994fe64db7813980b8cae`。
+- 发布证据位于 `~/.local/state/pockethelm/release-0.4.28/`：build.log、device.txt、verified-local.json、source-commit.json、upload.json、index-v1.jar、download.apk、store-verified.json。
+- 按用户授权推送 fix-zcode-history-revision 分支；其祖先包含之前仅本地提交但已发布的 0.4.25–0.4.27 依赖提交，不单独推送其他分支，不合并 main。
