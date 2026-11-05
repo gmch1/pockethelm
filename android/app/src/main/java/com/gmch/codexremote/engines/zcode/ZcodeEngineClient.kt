@@ -46,8 +46,10 @@ internal class ZcodeEngineClient(override val origin: EngineOrigin, private val 
         return JSONObject(cursor.token).getDouble("before")
     }
     private fun page(session: EngineSessionRef, data: JSONObject, expected: JSONObject?): HistoryPage {
+        // Row-boundary pagination remains valid as the same log advances. Only a
+        // different log generation or a response older than the cursor is unsafe.
         if (expected != null) check(data.string("logEpoch") == expected.getString("epoch") &&
-            data.optLong("revision") == expected.getLong("revision")) { "会话已更新，请刷新后重试" }
+            data.optLong("revision") >= expected.getLong("revision")) { "会话已更新，请刷新后重试" }
         val rowField = if (expected == null) "firstRowId" else "beforeRowId"
         val next = if (data.optBoolean("hasMore") && !data.isNull(rowField))
             cursor(session, data.getDouble(rowField), data.string("logEpoch"), data.optLong("revision")) else null

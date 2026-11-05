@@ -116,9 +116,22 @@ class EngineClientContractTest {
         assertEquals("identity", wire.requests.single().params.getString("workspaceIdentity"))
         assertEquals(10.0, client.before(page.next!!), 0.0)
         assertTrue(runCatching { client.history(ref.copy(workspaceIdentity = "other"), cursor) }.exceptionOrNull() is IllegalArgumentException)
-        val stale = ZcodeEngineClient(origin("zcode"), zcodeWire(revision = 2))
+        val stale = ZcodeEngineClient(origin("zcode"), zcodeWire(revision = 0))
         var applied = false
         assertTrue(runCatching { stale.history(ref, cursor) { applied = true } }.exceptionOrNull() is IllegalStateException)
+        assertFalse(applied)
+    }
+    @Test fun zcodeHistoryAcceptsAdvancingRevisionButRejectsAnotherLog() = runBlocking {
+        val client = ZcodeEngineClient(origin("zcode"), zcodeWire(revision = 20))
+        val ref = client.session(ZSession("s", "session", "/work", "identity"))
+        val cursor = client.cursor(ref, 20.0, "e", 1)
+        var applied = false
+        val page = client.history(ref, cursor) { applied = true }
+        assertTrue(applied)
+        assertEquals(20L, JSONObject(page.next!!.token).getLong("revision"))
+        val reset = ZcodeEngineClient(origin("zcode"), zcodeWire(epoch = "other", revision = 21))
+        applied = false
+        assertTrue(runCatching { reset.history(ref, cursor) { applied = true } }.exceptionOrNull() is IllegalStateException)
         assertFalse(applied)
     }
     @Test fun errorsAndCancellationPropagateWithoutRetry() = runBlocking {

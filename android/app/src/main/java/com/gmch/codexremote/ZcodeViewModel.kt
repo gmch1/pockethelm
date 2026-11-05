@@ -761,7 +761,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         if (!isCurrent() || !sameTarget(mutable.value.selected, session)) return
         historySyncedAt = System.currentTimeMillis()
         val items = data.items
-        if (epoch != mutable.value.logEpoch || revision != mutable.value.revision) older = emptyList()
+        if (epoch != mutable.value.logEpoch) older = emptyList()
         val actual = data.selection
         val entering = entrySelection?.takeIf { it.navigation == navigation &&
             it.choiceVersion == choiceVersion && sameTarget(it.session, session) }
@@ -771,7 +771,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val interactions = if (interactSupport) data.interactions else emptyList()
         activityBeforeRead?.let { seenActivity[session.id] = maxOf(seenActivity[session.id] ?: 0, it) }
         mutable.update { it.copy(selected = session.copy(title = data.title.ifBlank { session.title }),
-            items = (older + items).distinctBy { row -> row.id }, phase = data.phase, queue = queue,
+            items = (older + items).associateBy { row -> row.id }.values.toList(), phase = data.phase, queue = queue,
             executionId = if (data.canStop) data.executionId else "",
             interactionCount = data.interactionCount, currentSelection = actual,
             interactions = interactions, interactionsComplete = data.interactionsComplete,
@@ -805,9 +805,10 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             val reader = sessionClient()
             val ref = reader.session(session)
             val data = reader.history(ref, reader.cursor(ref, cursor, state.logEpoch, state.revision))
-            if (!scope.appliesTo(generation, navigationVersion, mutable.value.selected?.id)) return@action
+            if (!scope.appliesTo(generation, navigationVersion, mutable.value.selected?.id) ||
+                mutable.value.logEpoch != state.logEpoch) return@action
             older = (data.items.map { it.presentationItem() } + older).distinctBy { it.id }
-            mutable.update { it.copy(items = (older + it.items).distinctBy { row -> row.id },
+            mutable.update { it.copy(items = (older + it.items).associateBy { row -> row.id }.values.toList(),
                 beforeRow = data.next?.let(reader::before)) }
             // An older page may contain the formal message of a local record; drop it only
             // after the paginated items are published and the scope still applies.
