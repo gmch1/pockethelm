@@ -1,6 +1,6 @@
 # 会话与消息时间展示
 
-状态：实现、自查及 129 真机验证通过；未提交、未发布 App。
+状态：已提交并发布 0.4.29/39；代码提交 44d8be2，分支 feat-conversation-times，未 push。
 
 ## 需求与验收
 
@@ -32,7 +32,7 @@
 
 ## 发布或完成
 
-- 分支 feat-conversation-times，未提交、未发布商店、未 push。
+- 以下为实现验收时记录；当前发行状态见末尾发布记录。
 - 已将 bridge.py 的可选 createdAt 投影原子同步到现有开发机部署位置；部署前确认与本任务基线一致，原文件备份在私有证据目录。未改 dispatcher、未重启服务、未打断已有连接；新连接 initialize 冒烟成功，bridgeVersion 仍为 1，兼容旧客户端。
 - 时间均按手机时区展示。原生没有提供时间的历史或队列保留明确的未知提示；旧 bridge 连接在下一次正常重连前也可能缺少该字段。无需为本任务调用模型，真实模型调用为 0。
 
@@ -45,3 +45,12 @@
 - 发行 APK SHA-256：`a2383c7844dacec4f28ad6eed795a8ab66189faed393d121727e4dc1544677a0`，已与 129 安装包校验一致；沿用签名 54c2508d…，不可调试。
 - 完整 android/、scripts/ 源文件快照（含未忽略新增文件，排序 path + NUL + bytes + NUL）：`0f06debd2f1ffa990d85344ad579da2606a2d1f2049580c0bedd5f6a01f3b22c`。
 - 证据目录：`~/.local/state/pockethelm/release-0.4.29/`。发行复审：通过。
+
+
+## 商店发布记录
+
+- 代码提交 `44d8be2`，提交前核对暂存源码与已测发行构建的完整源码快照一致。
+- **已发布 PocketHelm 0.4.29 / versionCode 39**；上传 API 返回 published。公开 HTTPS 索引的版本、包名、签名与哈希一致，完整下载 `com.gmch.codexremote_39.apk` 已校验。
+- 下载包、本地发行包及 129 安装包 SHA-256 均为 `a2383c7844dacec4f28ad6eed795a8ab66189faed393d121727e4dc1544677a0`。
+- 证据：`~/.local/state/pockethelm/release-0.4.29/`，含 build.log、device.txt、verified-local.json、signature.txt、badging.txt、source-commit.json、upload.json、index-v1.jar、download.apk、store-verified.json。
+- 按用户要求仅本地提交，**未 push、未合并 main**。正常 App 数据与测试权限基线保留；测试包、设备截图缓存已清理。
