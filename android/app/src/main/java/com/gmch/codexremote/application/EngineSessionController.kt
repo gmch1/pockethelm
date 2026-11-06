@@ -43,7 +43,7 @@ internal class EngineSessionController(private val scope: CoroutineScope, privat
         val records = store.pending(origin)
         if (mutable.value.origin == origin) {
             for (record in records) if (record.kind == PendingKind.Send && record.session != null && ledger.records[key(record.session)]?.any { it.clientId == record.id } != true)
-                ledger.add(key(record.session), OutgoingMessage(record.session.nativeId, record.id, record.text, OutgoingState.UNCERTAIN))
+                ledger.add(key(record.session), OutgoingMessage(record.session.nativeId, record.id, record.text, OutgoingState.UNCERTAIN, createdAt = record.submittedAtMs))
             mutable.update { it.copy(pending = records, storeHealthy = it.selected !in unsavedDrafts) }
         }
     }
@@ -197,8 +197,8 @@ internal class EngineSessionController(private val scope: CoroutineScope, privat
         check(EngineOperation.Send in connection.operations)
         check(store.pending(connection.origin).none { it.session == ref }) { "上一条操作结果待确认，请先核对" }
         val message = EngineMessage(ref, UUID.randomUUID().toString(), text, delivery, mutable.value.snapshot?.runId.orEmpty(), mutable.value.choice)
-        val record = PendingOperation(connection.origin, message.commandId, PendingKind.Send, ref, text = text)
-        ledger.add(key(ref), OutgoingMessage(ref.nativeId, message.commandId, text, OutgoingState.SENDING))
+        val record = PendingOperation(connection.origin, message.commandId, PendingKind.Send, ref, text = text, submittedAtMs = System.currentTimeMillis())
+        ledger.add(key(ref), OutgoingMessage(ref.nativeId, message.commandId, text, OutgoingState.SENDING, createdAt = record.submittedAtMs))
         var dispatched = false
         try {
             val receipt = connection.send(message) { store.savePending(record); dispatched = true; publishPending(connection.origin) }

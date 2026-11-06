@@ -65,7 +65,7 @@ fun zcodeItems(j: JSONObject) = j.optJSONArray("items").objects().map {
     val text = if (kind == "userMessage")
         it.string("text") + AttachmentUploadPlan.rowAttachmentText(it.optJSONArray("attachments"))
     else it.string("text")
-    TimelineItem(it.getString("id"), kind, text, status, it.string("commandId"), it.string("entityId"))
+    TimelineItem(it.getString("id"), kind, text, status, it.string("commandId"), it.string("entityId"), messageTimestamp(it.opt("createdAt")))
 }
 
 /**

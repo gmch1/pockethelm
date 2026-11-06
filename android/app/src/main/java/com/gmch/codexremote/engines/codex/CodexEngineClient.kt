@@ -54,7 +54,10 @@ internal class CodexEngineClient(override val origin: EngineOrigin, private val 
         return turn?.let { CodexTurnHead(it.string("id"), it.string("status")) }
     }
     private fun page(session: EngineSessionRef, value: JSONObject) = HistoryPage(session,
-        value.optJSONArray("data").objects().mapNotNull { it.optJSONObject("item") }.map(TimelineItem::parse).reversed().map { it.engineItem() },
+        value.optJSONArray("data").objects().mapNotNull { entry -> entry.optJSONObject("item")?.let { raw ->
+            val item = TimelineItem.parse(raw)
+            item.copy(timestampMs = messageTimestamp(entry.opt("startedAtMs")).takeIf { it > 0 } ?: item.timestampMs)
+        } }.reversed().map { it.engineItem() },
         value.string("nextCursor").takeIf { it.isNotBlank() }?.let { HistoryCursor(session, it) })
     override suspend fun history(session: EngineSessionRef, cursor: HistoryCursor?, onPage: (suspend (HistoryPage) -> Unit)?): HistoryPage {
         validateTarget(session, cursor)

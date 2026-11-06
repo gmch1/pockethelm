@@ -551,7 +551,7 @@ internal fun ChatTimeline(sessionId: String, agent: String, items: List<Timeline
                         TextButton({ dismissFailed(row.outgoing) }) { Text("移除失败记录") }
                 }
                 row.queued != null -> Column {
-                    OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队"), detail)
+                    OutgoingCard(OutgoingMessage(sessionId, row.queued.clientId, row.queued.text, OutgoingState.QUEUED, "已排队", createdAt = 0), detail)
                     QueuedItemActions(row.queued, connected && !busy, removeQueued, promoteQueued,
                         onEdit = if (editQueued != null) { { saveQueueEdit = editQueued; editingQueue = it } } else null)
                 }

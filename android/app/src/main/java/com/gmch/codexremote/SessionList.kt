@@ -102,6 +102,7 @@ internal fun SessionRow(title: String, project: String, status: String, updatedA
                     }
                     if (background) Text("后台", fontSize = 11.sp, lineHeight = 18.sp, color = MaterialTheme.colorScheme.primary)
                 }
+                if (updatedAt > 0) Text("更新于 ${messageTime(updatedAt)}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(relativeActivityTime(updatedAt), fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }

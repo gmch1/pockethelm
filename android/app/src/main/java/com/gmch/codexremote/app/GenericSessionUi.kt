@@ -63,14 +63,14 @@ internal fun genericEngineEntry(host: EngineHost, controller: EngineSessionContr
             if (state.selected == null) {
                 if (client != null && EngineOperation.Create in client.operations)
                     Button({ create = true }, enabled = state.choicesLoaded && !state.working) { Text("新建会话") }
-                state.sessions.forEach { session -> TextButton({ controller.open(session.ref) }) { Text(session.title) } }
+                state.sessions.forEach { session -> TextButton({ controller.open(session.ref) }) { Column { Text(session.title); Text("更新于 ${messageTime(session.updatedAtMillis)}", style = MaterialTheme.typography.labelSmall) } } }
                 if (state.sessionCursor != null) TextButton({ controller.moreSessions() }) { Text("加载更多会话") }
             } else {
                 if (state.snapshot == null) Text("会话尚未加载，请连接并刷新")
                 if (state.readingOlder) Text("正在查看较早消息，点击刷新返回最新内容")
                 state.snapshot?.history?.next?.let { TextButton({ controller.moreHistory() }) { Text("加载更早消息") } }
-                state.snapshot?.history?.items?.forEach { item -> Text(item.text, Modifier.padding(vertical = 6.dp)) }
-                state.outgoing.forEach { row -> Text("${row.text}\n${outgoingStatusLabel(row)}") }
+                state.snapshot?.history?.items?.forEach { item -> Column { Text(messageTime(item.timestampMs), style = MaterialTheme.typography.labelSmall); Text(item.text, Modifier.padding(vertical = 6.dp)) } }
+                state.outgoing.forEach { row -> Text("${row.text}\n${outgoingStatusLabel(row)} · " + if (row.createdAt > 0) "本机提交 ${messageTime(row.createdAt)}" else "提交时间未提供") }
                 OutlinedTextField(state.draft, controller::draft, Modifier.fillMaxWidth(), label = { Text("消息") })
                 if (client != null && EngineOperation.Send in client.operations)
                     Button({ controller.send() }, enabled = !state.working && state.storeHealthy && state.choicesLoaded && state.draft.isNotBlank()) { Text("发送") }

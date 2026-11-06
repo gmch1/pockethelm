@@ -594,7 +594,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 // an in-flight SENDING or a settled receipt must never be downgraded.
                 if (outgoingBySession[key]?.any { it.clientId == clientId } != true)
                     addOutgoing(key, OutgoingMessage(session.id, clientId,
-                        receipt.string("text"), OutgoingState.UNCERTAIN))
+                        receipt.string("text"), OutgoingState.UNCERTAIN, createdAt = messageTimestamp(receipt.opt("submittedAtMs"))))
             }
         }
         if (mutable.value.connected) recoverCurrent()
@@ -685,7 +685,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             if (!scope.appliesTo(epoch, selectionVersion, mutable.value.selected?.id)) return@action
             val old = timeline.toMap(); timeline.clear()
             result.items.map { it.presentationItem() }.forEach { timeline[it.id] = it }
-            timeline.putAll(old)
+            old.forEach { (id, item) -> timeline[id] = item.copy(timestampMs = item.timestampMs.takeIf { it > 0 } ?: timeline[id]?.timestampMs ?: 0) }
             mutable.update { it.copy(items = timeline.values.toList(), historyCursor = result.next?.token) }
             reconcilePending(id)
             reconcileOutgoing(id)
@@ -823,12 +823,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // receipt must not be overwritten by a second dispatch.
         check(mutable.value.outgoing.none { it.state == OutgoingState.SENDING }) { "上一条消息仍在发送中，请稍候" }
         val clientId = UUID.randomUUID().toString()
-        val receipt = obj("clientId" to clientId, "text" to text)
+        val submittedAt = System.currentTimeMillis()
+        val receipt = obj("clientId" to clientId, "text" to text, "submittedAtMs" to submittedAt)
         // The bubble appears before any RPC: resumeSettings, the dispatch, and the first
         // streamed output all happen after the user already sees the message with 发送中.
         addOutgoing(key, OutgoingMessage(selected.id, clientId,
             listOf(text, attachments.joinToString(" ") { "[图片]" }).filter { it.isNotBlank() }.joinToString(" "),
-            OutgoingState.SENDING, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
+            OutgoingState.SENDING, createdAt = submittedAt, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
         mutable.update { it.copy(sending = true, attachmentsBusy = attachments.isNotEmpty()) }
         var dispatched = false
         var ackAccepted = false
@@ -1080,7 +1081,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (threadId != mutable.value.selected?.id) return
         when (method) {
-            "item/started", "item/completed" -> p.optJSONObject("item")?.let { val item = TimelineItem.parse(it); timeline[item.id] = item; paint() }
+            "item/started", "item/completed" -> p.optJSONObject("item")?.let { val item = TimelineItem.parse(it); timeline[item.id] = item.copy(timestampMs = messageTimestamp(p.opt("startedAtMs")).takeIf { time -> time > 0 } ?: item.timestampMs.takeIf { time -> time > 0 } ?: timeline[item.id]?.timestampMs ?: 0); paint() }
             "item/agentMessage/delta", "item/commandExecution/outputDelta", "item/plan/delta" -> {
                 val id = p.string("itemId")
                 val kind = if (method.contains("commandExecution")) "commandExecution" else if (method.contains("plan")) "plan" else "agentMessage"

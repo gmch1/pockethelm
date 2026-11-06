@@ -260,7 +260,7 @@ internal fun UserMessageBar(
             Column(Modifier.weight(1f).clickable {
                 if (latest != null) onJump(latest.id) else showMessages = true
             }.padding(horizontal = 16.dp, vertical = if (compact) 4.dp else 8.dp)) {
-                if (!compact) Text("你的消息 · 点击定位", fontSize = 10.sp, color = Green)
+                if (!compact) Text("你的消息 · 点击定位" + (latest?.let { " · ${messageTime(it.timestampMs)}" } ?: ""), fontSize = 10.sp, color = Green)
                 Text(latest?.text?.take(300)?.ifBlank { "查看消息" } ?: "加载更早的消息", fontSize = 12.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
@@ -273,6 +273,7 @@ internal fun UserMessageBar(
         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
             items(messages.asReversed(), key = { it.id }) { message ->
                 Column(Modifier.fillMaxWidth().clickable { showMessages = false; onJump(message.id) }.padding(horizontal = 20.dp, vertical = 12.dp)) {
+                    Text(messageTime(message.timestampMs), fontSize = 10.sp, color = Muted)
                     Text(message.text.take(1200).ifBlank { "查看消息" }, maxLines = 3, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
                 }
                 HorizontalDivider(color = Line)
@@ -295,9 +296,11 @@ internal fun ActivitySummary(items: List<TimelineItem>, detail: (String, String)
         contentPadding = PaddingValues(horizontal = 0.dp, vertical = 4.dp)) {
         Icon(if (failed) Icons.Outlined.ErrorOutline else Icons.Outlined.MoreHoriz,
             null, Modifier.size(18.dp), tint = if (failed) MaterialTheme.colorScheme.error else Muted)
-        Text(activityLabel(items), Modifier.weight(1f).padding(horizontal = 8.dp), fontSize = 12.sp,
-            color = if (failed) MaterialTheme.colorScheme.error else Muted,
-            maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Start)
+        Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+            Text(activityLabel(items), fontSize = 12.sp, color = if (failed) MaterialTheme.colorScheme.error else Muted,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(messageTime(items.firstOrNull()?.timestampMs ?: 0), fontSize = 10.sp, color = Muted)
+        }
         Icon(Icons.Outlined.ChevronRight, "展开工作过程", Modifier.size(18.dp), tint = Muted)
     }
     if (expanded) ModalBottomSheet(onDismissRequest = { expanded = false }, containerColor = Paper,
@@ -334,8 +337,10 @@ internal fun TimelineCard(item: TimelineItem, agentName: String = "Codex", detai
         Surface(onClick = { detail(title, item.text) }, color = Color(0xfff0f3ec), shape = RoundedCornerShape(10.dp)) {
             Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 10.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(title + if (summary.isNotBlank()) " · $summary" else "", Modifier.weight(1f),
-                    fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Column(Modifier.weight(1f)) {
+                    Text(title + if (summary.isNotBlank()) " · $summary" else "", fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(messageTime(item.timestampMs), fontSize = 10.sp, color = Muted)
+                }
                 if (status.isNotBlank()) Text(status, Modifier.widthIn(max = 72.dp), fontSize = 10.sp,
                     color = if (item.status == "failed" || item.status == "declined") MaterialTheme.colorScheme.error else Muted,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -346,7 +351,7 @@ internal fun TimelineCard(item: TimelineItem, agentName: String = "Codex", detai
     }
     Column(Modifier.fillMaxWidth().padding(start = if (user) 24.dp else 0.dp)) {
         val statusLabel = timelineStatusLabel(item.status)
-        Text(title + if (statusLabel.isNotBlank()) " · $statusLabel" else "", fontSize = 10.sp, color = Muted, modifier = Modifier.padding(bottom = 6.dp))
+        Text(listOf(title, statusLabel, messageTime(item.timestampMs)).filter { it.isNotBlank() }.joinToString(" · "), fontSize = 10.sp, color = Muted, modifier = Modifier.padding(bottom = 6.dp))
         Surface(color = if (user) Color(0xffeaf0e4) else if (message) Paper else Color(0xfff0f3ec), shape = RoundedCornerShape(12.dp)) {
             Column(Modifier.fillMaxWidth().padding(if (message && !user) 0.dp else 12.dp)) {
                 SelectionContainer {
@@ -371,7 +376,7 @@ internal fun OutgoingCard(message: OutgoingMessage, detail: (String, String) -> 
         else -> Muted
     }
     Column(Modifier.fillMaxWidth().padding(start = 24.dp)) {
-        Text("你 · $label", fontSize = 10.sp, color = labelColor, modifier = Modifier.padding(bottom = 6.dp))
+        Text("你 · $label · " + if (message.createdAt > 0) "本机提交 ${messageTime(message.createdAt)}" else "提交时间未提供", fontSize = 10.sp, color = labelColor, modifier = Modifier.padding(bottom = 6.dp))
         Surface(color = Color(0xffeaf0e4), shape = RoundedCornerShape(12.dp)) {
             // Same completeness as a settled user message: full text, with a detail sheet
             // only when the hard 24k cap truncates it.

@@ -154,6 +154,9 @@ def project_rows(rows):
         if kind == 'turnHeader':
             continue
         item = {'id': str(row['rowId']), 'kind': kind, 'status': row.get('state', row.get('status', ''))}
+        created = row.get('createdAt')
+        if type(created) in (int, float) and math.isfinite(created) and 0 < created <= 253402300799999:
+            item['createdAt'] = int(created)
         # Row identity for detail queries and (P2) row-targeted commands; display rows
         # never re-key on it, and an absent or malformed value simply omits the field.
         entity = row.get('entityId')

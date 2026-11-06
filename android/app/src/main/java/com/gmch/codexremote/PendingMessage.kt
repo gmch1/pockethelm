@@ -67,6 +67,7 @@ data class ChatRow(
 ) {
     val id: String get() = item?.id ?: outgoing?.clientId ?: queued?.id.orEmpty()
     val text: String get() = outgoing?.text ?: queued?.text ?: item?.text.orEmpty()
+    val timestampMs: Long get() = outgoing?.createdAt ?: item?.timestampMs ?: activity.firstOrNull()?.timestampMs ?: 0
     val isUserRow: Boolean get() = item?.kind == "userMessage" || outgoing != null || queued != null
 }
 

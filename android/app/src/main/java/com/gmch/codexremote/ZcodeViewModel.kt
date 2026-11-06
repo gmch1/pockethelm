@@ -671,7 +671,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
             // an in-flight SENDING or a settled receipt must never be downgraded.
             if (id.isNotBlank() && p.string("sessionId") == session.id &&
                 outgoingBySession[outKey]?.any { it.clientId == id } != true)
-                addOutgoing(outKey, OutgoingMessage(session.id, id, p.string("text"), OutgoingState.UNCERTAIN))
+                addOutgoing(outKey, OutgoingMessage(session.id, id, p.string("text"), OutgoingState.UNCERTAIN, createdAt = messageTimestamp(pending?.opt("submittedAtMs"))))
         }
     }
     fun back() {
@@ -834,11 +834,12 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
         val key = outgoingKey(session.id)
         val draftKey = key("draft", session.id)
         val commandId = UUID.randomUUID().toString()
+        val submittedAt = System.currentTimeMillis()
         // The bubble appears before any RPC: pending persistence, the dispatch, and the ack
         // all happen after the user already sees the message with 发送中.
         addOutgoing(key, OutgoingMessage(session.id, commandId,
             listOf(text, attachments.joinToString(" ") { "[图片]" }).filter { it.isNotBlank() }.joinToString(" "),
-            OutgoingState.SENDING, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
+            OutgoingState.SENDING, createdAt = submittedAt, precedingItemIds = mutable.value.items.takeLast(32).map { it.id }))
         mutable.update { it.copy(sending = true, attachmentsBusy = true) }
         var dispatched = false
         var ackAccepted = false
@@ -854,7 +855,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                     EngineAttachment(ref, attachmentRefs[item.id] ?: error("图片尚未上传完成：${item.displayName}"),
                         item.fileName, item.mime, item.bytes.toLong())
                 })
-            val result = commandTransaction("session/send", adapter.messageParams(request), commandId, { dispatched = true }) {
+            val result = commandTransaction("session/send", adapter.messageParams(request), commandId, { dispatched = true }, submittedAt) {
                 adapter.send(request)
             }
             run {
@@ -1058,11 +1059,11 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun clearTurnDiff() { mutable.update { it.copy(diffText = null) } }
     private suspend fun <T> commandTransaction(method: String, params: JSONObject, commandId: String? = null,
-        onDispatch: () -> Unit = {}, execute: suspend (JSONObject) -> T): T {
+        onDispatch: () -> Unit = {}, submittedAt: Long = 0, execute: suspend (JSONObject) -> T): T {
         check(pending == null) { "上一条命令结果尚未确认，请先刷新查询" }
         val ownerGeneration = generation
         val command = params.put("commandId", commandId ?: UUID.randomUUID().toString())
-        val record = obj("method" to method, "params" to command)
+        val record = obj("method" to method, "params" to command, "submittedAtMs" to submittedAt)
         vault.put(key("pending"), record.toString())
         pending = record
         mutable.update { it.copy(pending = true, pendingUnknown = false, commandInFlight = true) }
@@ -1134,7 +1135,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 else
                     addOutgoing(targetKey, OutgoingMessage(sessionTarget, commandId,
-                        params.string("text"), OutgoingState.FAILED))
+                        params.string("text"), OutgoingState.FAILED, createdAt = messageTimestamp(pending.opt("submittedAtMs"))))
             }
             throw e
         }
@@ -1149,7 +1150,7 @@ class ZcodeViewModel(app: Application) : AndroidViewModel(app) {
                 val delivery = result.optJSONObject("result")?.string("delivery").orEmpty()
                 addOutgoing(outgoingKey(id), OutgoingMessage(id, commandId, params.string("text"),
                     if (delivery == "queue") OutgoingState.QUEUED else OutgoingState.ACCEPTED,
-                    deliveryReceipt(delivery)))
+                    deliveryReceipt(delivery), createdAt = messageTimestamp(pending.opt("submittedAtMs"))))
             }
         }
         if (pending.string("method") == "session/create") {

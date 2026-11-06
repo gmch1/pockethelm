@@ -25,7 +25,7 @@ internal class EngineCreationUnconfirmed(val session: EngineSessionRef?, cause: 
 
 internal enum class PendingKind { Create, Send, Interrupt }
 internal data class PendingOperation(val origin: EngineOrigin, val id: String, val kind: PendingKind,
-    val session: EngineSessionRef? = null, val workspacePath: String = "", val projectId: String = "", val text: String = "")
+    val session: EngineSessionRef? = null, val workspacePath: String = "", val projectId: String = "", val text: String = "", val submittedAtMs: Long = 0)
 
 internal enum class CommandResolutionState { Accepted, Rejected, Unknown }
 internal data class CommandResolution(val state: CommandResolutionState, val session: EngineSessionRef? = null,

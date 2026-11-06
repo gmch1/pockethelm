@@ -67,7 +67,7 @@ data class SessionInfo(
 }
 
 data class TimelineItem(val id: String, val kind: String, val text: String, val status: String = "", val clientId: String = "",
-                        val entityId: String = "") {
+                        val entityId: String = "", val timestampMs: Long = 0) {
     companion object {
         fun parse(j: JSONObject): TimelineItem {
             val type = j.string("type")
@@ -82,7 +82,7 @@ data class TimelineItem(val id: String, val kind: String, val text: String, val 
                 "contextCompaction" -> "正在整理上下文"
                 else -> j.toString(2)
             }
-            return TimelineItem(j.string("id"), type, text.takeLast(120_000), j.string("status"), j.string("clientId"))
+            return TimelineItem(j.string("id"), type, text.takeLast(120_000), j.string("status"), j.string("clientId"), timestampMs = messageTimestamp(j.opt("startedAtMs")))
         }
     }
 }
@@ -162,8 +162,9 @@ internal fun applyHistorySnapshot(
 ) {
     val snapshotIds = snapshot.mapTo(HashSet()) { it.id }
     val unlisted = timeline.filter { (id, item) -> id !in snapshotIds && baseline[id] != item }
+    val knownTimes = timeline.mapValues { it.value.timestampMs }
     timeline.clear()
-    snapshot.forEach { timeline[it.id] = it }
+    snapshot.forEach { item -> timeline[item.id] = item.copy(timestampMs = item.timestampMs.takeIf { it > 0 } ?: knownTimes[item.id] ?: 0) }
     // Keep new live items that were not included in this history page.
     timeline.putAll(unlisted)
 }

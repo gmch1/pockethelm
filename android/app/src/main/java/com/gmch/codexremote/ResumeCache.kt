@@ -24,7 +24,7 @@ internal data class ResumeSnapshot(
         "sessions" to JSONArray(sessions.take(60).map(::sessionJson)), "projects" to JSONArray(projects.take(100)),
         "selected" to selected?.let(::sessionJson),
         "items" to JSONArray(boundedItems(items).map { obj("id" to it.id, "kind" to it.kind, "text" to it.text,
-            "status" to it.status, "clientId" to it.clientId) }),
+            "status" to it.status, "clientId" to it.clientId, "entityId" to it.entityId, "timestampMs" to it.timestampMs) }),
         "zSessions" to JSONArray(zSessions.take(100).map(::zSessionJson)),
         "zProjects" to JSONArray(zProjects.take(100).map { obj("id" to it.id, "name" to it.name, "roots" to JSONArray(it.roots)) }),
         "zSelected" to zSelected?.let(::zSessionJson), "choice" to choice?.json(), "guard" to guard)
@@ -54,7 +54,7 @@ internal data class ResumeSnapshot(
             return ResumeSnapshot(j.getString("environment"), j.optInt("tab").coerceIn(0, 2),
                 j.optJSONArray("sessions").objects().take(60).map(SessionInfo::parse), j.optJSONArray("projects").strings().take(100),
                 j.optJSONObject("selected")?.let(SessionInfo::parse),
-                j.optJSONArray("items").objects().takeLast(80).map { TimelineItem(it.getString("id"), it.getString("kind"), it.getString("text"), it.string("status"), it.string("clientId")) },
+                j.optJSONArray("items").objects().takeLast(80).map { TimelineItem(it.getString("id"), it.getString("kind"), it.getString("text"), it.string("status"), it.string("clientId"), it.string("entityId"), messageTimestamp(it.opt("timestampMs"))) },
                 j.optJSONArray("zSessions").objects().take(100).map(ZSession::parse),
                 j.optJSONArray("zProjects").objects().take(100).map { ZProject(it.getString("id"), it.getString("name"), it.optJSONArray("roots").strings()) },
                 j.optJSONObject("zSelected")?.let(ZSession::parse), ZSelection.parse(j.optJSONObject("choice")), j.string("guard"))

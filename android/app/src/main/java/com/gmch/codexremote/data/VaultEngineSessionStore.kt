@@ -40,7 +40,7 @@ internal class VaultEngineSessionStore(context: Context) : EngineSessionStore {
         values.keys().asSequence().map { id ->
             val j = values.getJSONObject(id)
             PendingOperation(origin, id, PendingKind.valueOf(j.getString("kind")), j.optJSONObject("session")?.let { ref(origin, it) },
-                j.string("workspace"), j.string("project"), j.string("text"))
+                j.string("workspace"), j.string("project"), j.string("text"), messageTimestamp(j.opt("submittedAtMs")))
         }.toList()
     }
     override fun savePending(operation: PendingOperation) = synchronized(lock) {
@@ -48,7 +48,7 @@ internal class VaultEngineSessionStore(context: Context) : EngineSessionStore {
         val value = load(operation.origin); val pending = value.getJSONObject("pending")
         check(pending.has(operation.id) || pending.length() < 128) { "待确认记录过多，请先核对" }
         pending.put(operation.id, obj("kind" to operation.kind.name, "session" to operation.session?.let(::ref),
-            "workspace" to operation.workspacePath, "project" to operation.projectId, "text" to operation.text))
+            "workspace" to operation.workspacePath, "project" to operation.projectId, "text" to operation.text, "submittedAtMs" to operation.submittedAtMs))
         save(operation.origin, value)
     }
     override fun clearPending(origin: EngineOrigin, commandId: String) = synchronized(lock) {

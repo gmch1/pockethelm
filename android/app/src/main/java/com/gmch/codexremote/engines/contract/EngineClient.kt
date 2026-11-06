@@ -34,7 +34,7 @@ internal data class SessionPage<out S : EngineSession>(val items: List<S>, val n
 internal data class ProjectCatalog<out P : EngineProject, out S : EngineSession>(
     val projects: List<P>, val sessions: SessionPage<S>? = null)
 internal data class EngineTimelineItem(val id: String, val kind: String, val text: String,
-    val status: String = "", val clientId: String = "", val entityId: String = "")
+    val status: String = "", val clientId: String = "", val entityId: String = "", val timestampMs: Long = 0)
 /** Items are oldest-to-newest within this window; this is not a full-history reset. */
 internal data class HistoryPage(val session: EngineSessionRef, val items: List<EngineTimelineItem>,
     val next: HistoryCursor?)

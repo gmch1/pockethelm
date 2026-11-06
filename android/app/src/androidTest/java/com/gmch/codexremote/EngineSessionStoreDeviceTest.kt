@@ -20,7 +20,7 @@ class EngineSessionStoreDeviceTest {
             val ref = EngineSessionRef(origin, "s", "/a")
             val other = ref.copy(workspacePath = "/b")
             val foreign = ref.copy(origin = origin.copy(instance = "two"))
-            val record = PendingOperation(origin, "command", PendingKind.Send, ref, text = "pending")
+            val record = PendingOperation(origin, "command", PendingKind.Send, ref, text = "pending", submittedAtMs = 1793896200000L)
             store.saveDraft(ref, "draft"); store.saveDraft(other, "other"); store.savePending(record)
             val recreated = VaultEngineSessionStore(fixture)
             assertEquals("draft", recreated.draft(ref)); assertEquals("other", recreated.draft(other))
