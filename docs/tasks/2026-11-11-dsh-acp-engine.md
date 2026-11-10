@@ -1,6 +1,6 @@
 # DeepSeek dsh 引擎接入（ACP 入口）
 
-状态：待实现（方案已定，分阶段执行，每阶段有独立验证门）。
+状态：P0 已完成（探针三轮全绿，见下）；P1 待实施。
 
 ## 需求与验收
 
@@ -32,7 +32,7 @@
 | `rename()` | 抛 `UnsupportedEngineQuery` | dsh 未实现 |
 | `history()` | 返回空页 + UI 明示不回放 | 断连重连后同规则，不因重连假装有历史 |
 | `close()` | `session/close` | 仅从本进程卸载会话，**不删磁盘**；close 后同一连接内 `session/list` 会再次列出该会话（见风险） |
-| `choices()` / 设置 | `session/new` 返回的配置选项全量状态；修改走 `session/set_config_option`（`configId`=`model` / `reasoning_effort`） | 每会话粒度，改完以服务端返回状态刷新显示 |
+| `choices()` / 设置 | `session/new` 返回的配置选项全量状态；修改走 `session/set_config_option`（`configId`=`model` / `reasoning_effort`），返回 `{configOptions: [...]}`（与 session/new 同包装） | 每会话粒度，改完以服务端返回状态刷新显示；model 选项 value 是 `["provider","model"]` 的 JSON 数组字符串，客户端按不透明字符串处理 |
 | 审批 | `session/request_permission` → `allowed-once` / `rejected` | 线上 `optionId` 为 `allow-once` / `reject-once`；仅一次性，无“总是允许”。`outcome.outcome=="cancelled"` 时不是拒绝 |
 | 时间线 | `session/update` 通知：agent_message_chunk、agent_thought_chunk、tool_call、tool_call_update、config_option_update、usage_update | 投影在 Kotlin 侧做（`EngineTimelineItem`），tool_call 映射现有单行折叠 UI；usage_update 一期忽略 |
 
@@ -42,7 +42,21 @@
 - **`session/list` 会隐藏已激活会话**：服务端过滤掉本进程内 active / activating / 已注册的会话，因此本连接刚 `session/new` 出来的会话不会出现在列表里；同一原因下 `session/close` 后的会话会重新出现（见风险）。
 - **`resume` 不回放**：`session/resume` 只返回 `configOptions`，不推送任何历史 `session/update`；且要求 `cwd` 与持久化 header 一致，不一致直接 invalid params。这与“历史不回放”的验收一致。
 - **`prompt` 单在途**：服务端对同会话第二个在途 prompt 直接报错 `a prompt is already in flight for this session`，客户端本地串行队列因此是必要条件而非优化。
-- **图片能力**：`initialize` 时按配置的 provider/model 探测 `promptCapabilities.image`，仅在模型声明 image 输入且附件存储可用时为 `true`；为 `false` 时收到 image block 报错。一期据此仅控制入口显隐。
+- **图片能力**：`initialize` 时按配置的 provider/model 探测 `promptCapabilities.image`，仅在模型声明 image 输入且附件存储可用时为 `true`；为 `false` 时收到 image block 报错。实测：无凭据 test home 为 `false`，qwen 路由 + 视觉模型下为 `true`。一期据此仅控制入口显隐。
+- **配置 patch 替换语义**：profile 用户层 `cordis.patch.yml` 中同 `id` 条目的 `config` **整体替换** bundle 层配置，不是合并。dsh-acp bundle 自带 `provider: deepseek-official, model: deepseek-v4-flash` 默认值；用户层只写 `sessionListPageSize` 会把 provider/model 抹掉，新会话将没有任何模型选择（探针实测）。部署时用户层必须写完整的 acp config。
+- **凭据与 provider 路由**：`deepseek-official` 路由需要 DEEPSEEK_API_KEY（本机未配置，prompt 报错原文：`llm-deepseek: no API key for provider route "deepseek-official"; store DEEPSEEK_API_KEY through the credentials service (the web Models page …)`）。本机可用路由为 `qwen-token-plan-cn`（凭据在 `$DSH_HOME/.credentials.yaml` 凭据服务中，模型目录 21 项，含 deepseek-v3.2/v4-flash/v4.1-flash-1017/v4-pro/glm-5.x 等）。**P1 部署时 acp profile 必须显式配置本机实际可用的 provider/model**，不能依赖 bundle 默认值。
+- **reasoning_effort 按 route 解析**：选项为 `["", "low", "high", "max"]`，`""` 表示 provider default；deepseek-official 默认 `high`，qwen 路由默认 `""`。选项集依赖所选模型，客户端只渲染服务端返回的选项。
+- **切换模型失败要可恢复**：探针曾因 crash 把会话留在不可用模型（v3.2 → API 403 `Access to model denied`）导致后续 prompt 全部失败。App 端 set_config_option 成功后立即以服务端返回状态为准；失败时下次 prompt 用回原模型即可（每会话选择独立持久）。
+
+#### P0 实测记录（2026-11-11，dsh 0.2.2-rc.1）
+
+探针 `scripts/dsh/probe.py`，证据目录 `~/.local/state/pockethelm/dsh/probe-2026111*/`（不入库）。三轮：
+
+1. **无凭据协议遍**（probe-20261111-013502，14 步全绿）：initialize protocolVersion 1，`sessionCapabilities` 仅 `close/list/resume`（无 delete/fork），`authMethods: []`；`session/new` 无凭据可创建；列表隐藏本进程活跃会话；`itemKeys` 线上仅 `["cwd","sessionId"]`；非法 cursor `-32602 Invalid params: session/list cursor is invalid`；resume 仅返回 configOptions、4s 窗口 0 回放；cwd 不匹配 `-32602 session cwd does not match: <path>`；close 后会话重现（卸载非删除）；close-all 后三者按 createdAt 倒序可见；stdin EOF 退出码 0。
+2. **分页遍**（probe-20261111-014530，15 步全绿）：profile patch `sessionListPageSize: 2` 后 12 个持久会话分 6 页走完 keyset 闭环，无重复、无遗漏、顺序 createdAt 倒序；同时确认 patch 替换语义（见上）。
+3. **真实回合遍**（probe-20261111-015114，14 步全绿）：qwen-token-plan-cn 路由 + `deepseek-v4.1-flash-1017`（用户既有 plan 凭据，最便宜 flash 档，单轮"回复 ok"成本 < $0.001，费用依据见风险节）；`stopReason: "end_turn"`，updates 序列 `agent_message_chunk → usage_update`；set_config_option 切换/恢复闭环（21 模型目录）；`promptCapabilities.image: true`。
+
+未在 E2E 触发、按计划转移的项目：单在途 prompt 拒绝（flash 模型单轮过快，P2 假服务 JVM 测试覆盖；错误原文 `a prompt is already in flight for this session` 已源码确认）；`session/request_permission`（默认预设未触发，P3 真机再验，ACP 客户端需实现该 server→client 请求的应答通道）。
 
 ## 分阶段实施与验证
 
@@ -102,12 +116,13 @@
 - 会话标题为客户端合成：无服务端 title，一期取 `cwd` 末段；同一目录下多个会话标题会重复，需在 UI 上以时间或其他字段区分，不伪装成引擎级标题。
 - 待确认：`session/request_permission` 的 `cancelled` 结局与“用户拒绝”语义不同（前者是请求被取消），客户端应答映射需分别处理，避免把取消记为拒绝。
 - nvm 路径漂移：部署配置持有绝对路径，文档注明 node 升级影响。
+- 测试费用依据（2026-11-11 WebSearch）：deepseek-v4-flash 档 off-peak 约 $0.15/M input、$0.60/M output（高峰约 2 倍），为 DeepSeek 各档中最低价档位；探针/真机每轮提示词仅"回复 ok"级别（几百 token），单轮成本 < $0.001。qwen-token-plan-cn 路由走用户既有 token plan 额度。
 
 ## 实现与验证
 
-- 改动摘要与关键文件：（待各阶段填写）
-- 代码版本或源码快照标识（含未提交与新增文件）：（待填）
-- 自动化检查：命令、结果、通过/失败/跳过数、日志位置。（待填）
+- 改动摘要与关键文件：P0 新增 `scripts/dsh/probe.py`（ACP 换行分帧 JSON-RPC 客户端 + 14 步探针：initialize/创建/列表分页/配置切换/resume/close/prompt/EOF 退出，支持 `--run-turn`、`--provider/--model`、`--page-size`、`--keep-home`，证据落盘 `~/.local/state/pockethelm/dsh/`）；任务文档映射表按实测修订。
+- 代码版本或源码快照标识：分支 `feat-dsh-acp-engine`（基于 5150a6d / 0.4.29），P0 提交含未提交快照见提交记录；dsh 版本 0.2.2-rc.1（`dsh --version` 已存证）。
+- 自动化检查：`python3 scripts/dsh/probe.py` 三轮（无凭据协议遍 / `--page-size 2` 分页遍 / `--provider qwen-token-plan-cn --model deepseek-v4.1-flash-1017 --run-turn` 真实回合遍）全部 `failed steps: 0`；证据目录 `probe-20261111-013502 / -014530 / -015114`（wire.jsonl、summary.json、dsh-stderr.log、initialize/session-new 结果 JSON）。既有 Codex/ZCode 套件未受影响（P0 无产品代码改动），P1 完成后按 G1 重跑。
 - 真机环境：设备代号、Android 版本、应用版本、包名。（待填）
 - 真机验证：步骤、预期、实际结果、证据位置。（待填）
 - 待发布 APK：本地位置、SHA-256、版本号、签名摘要、debuggable 检查。（待填）
