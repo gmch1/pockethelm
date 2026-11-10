@@ -13,9 +13,10 @@ Evidence layout (default ~/.local/state/pockethelm/dsh/probe-<timestamp>/):
   initialize-result.json  full initialize result
   session-new-result.json full session/new result of the first session
   summary.json            machine-readable step results
-Exit status: 0 only when no step failed unexpectedly. Steps marked
-expected-error verify that the server DOES reject malformed input; a success
-there is a failure.
+Exit status: 0 only when no step failed. Negative steps (invalid cursor,
+cwd mismatch, missing provider) encode their expectation inside the step
+function: the server rejecting the input is the passing path, so a ProbeFailure
+from their require() calls is always a real failure.
 """
 import argparse
 import json
@@ -48,6 +49,9 @@ class AcpClient:
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=self.stderr_file, env=env, cwd=str(cwd), text=True, bufsize=1)
         self._lock = threading.Lock()
+        # Guards raw_log writes and stdin writes, both shared by the reader
+        # thread (server-request replies) and request callers.
+        self._io_lock = threading.Lock()
         self._next_id = 0
         self._pending = {}
         self.notifications = []
@@ -80,13 +84,18 @@ class AcpClient:
 
     def _record(self, direction, line):
         if self.raw_log is not None:
-            self.raw_log.write(json.dumps({"dir": direction, "ts": round(time.time(), 3), "line": line}) + "\n")
-            self.raw_log.flush()
+            with self._io_lock:  # plain Lock: callers must not hold it here
+                self.raw_log.write(json.dumps({"dir": direction, "ts": round(time.time(), 3), "line": line}) + "\n")
+                self.raw_log.flush()
 
     def _send_raw(self, line):
-        self._record("out", line)
-        self.proc.stdin.write(line + "\n")
-        self.proc.stdin.flush()
+        frame = json.dumps({"dir": "out", "ts": round(time.time(), 3), "line": line})
+        with self._io_lock:
+            if self.raw_log is not None:
+                self.raw_log.write(frame + "\n")
+                self.raw_log.flush()
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
 
     def request(self, method, params, timeout=STEP_TIMEOUT):
         with self._lock:
@@ -164,7 +173,7 @@ class Probe:
         self.config_options = None
 
     # -- step harness ---------------------------------------------------
-    def step(self, name, expected="ok"):
+    def step(self, name):
         def wrap(fn):
             started = time.monotonic()
             try:
@@ -172,7 +181,7 @@ class Probe:
                 status = "ok"
             except ProbeFailure as failure:
                 detail = str(failure)
-                status = "expected-error" if expected == "error" else "error"
+                status = "error"
             except Exception as unexpected:  # keep probing; record and continue
                 detail = f"{type(unexpected).__name__}: {unexpected}"
                 status = "error"
@@ -188,17 +197,17 @@ class Probe:
         self.step("initialize")(self._initialize)
         self.step("session-new-x3")(self._new_three)
         self.step("list-hides-active")(self._list_hides_active)
-        self.step("invalid-cursor-rejected", expected="error")(self._invalid_cursor)
+        self.step("invalid-cursor-rejected")(self._invalid_cursor)
         self.step("set-config-option")(self._set_config)
         self.step("close-then-listed")(self._close_then_listed)
         self.step("list-item-shape")(self._list_item_shape)
         self.step("resume-no-replay")(self._resume_no_replay)
-        self.step("resume-cwd-mismatch", expected="error")(self._resume_cwd_mismatch)
+        self.step("resume-cwd-mismatch")(self._resume_cwd_mismatch)
         if self.args.run_turn:
             self.step("prompt-real-turn")(self._prompt_real)
             self.step("concurrent-prompt-observation")(self._concurrent_prompt)
         else:
-            self.step("prompt-no-provider", expected="error")(self._prompt_no_provider)
+            self.step("prompt-no-provider")(self._prompt_no_provider)
         self.step("close-all-then-listed")(self._close_all_listed)
         if self.args.page_size is not None:
             self.step("list-paging")(self._list_paging)
@@ -230,9 +239,11 @@ class Probe:
         self.client = AcpClient([self.args.dsh, "--profile", "acp"], env,
             self.workspace, self.evidence / "dsh-stderr.log")
         self.client.raw_log = self.raw_log
-        deadline = time.monotonic() + 10
+        # Bounded early-exit window for a clear diagnostic; process readiness is
+        # gated by the initialize response, not by a fixed boot sleep.
+        deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and self.client.proc.poll() is None:
-            time.sleep(0.1)
+            time.sleep(0.05)
         require(self.client.proc.poll() is None, "dsh exited during boot, see dsh-stderr.log")
         return f"pid {self.client.proc.pid}"
 
@@ -328,8 +339,9 @@ class Probe:
                 require(error is None, f"set_config_option(model={alternative}) rejected: {error}")
                 after_model = next((o for o in self._options_list(result)
                     if o.get("id") == "model"), {})
+                require(after_model.get("currentValue") == alternative,
+                    f"model switch not reflected: current={after_model.get('currentValue')!r}")
                 detail["switchedTo"] = alternative
-                detail["switchReflected"] = after_model.get("currentValue") == alternative
             finally:
                 response = self.client.request("session/set_config_option",
                     {"sessionId": s1, "configId": "model", "value": current})

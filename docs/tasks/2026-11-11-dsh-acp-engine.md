@@ -1,6 +1,6 @@
 # DeepSeek dsh 引擎接入（ACP 入口）
 
-状态：P0 已完成（探针三轮全绿，见下）；P1 待实施。
+状态：P0 已完成并通过 review（R1–R4 已修复验证，R5 记录在案）；P1 待实施。
 
 ## 需求与验收
 
@@ -48,7 +48,7 @@
 - **reasoning_effort 按 route 解析**：选项为 `["", "low", "high", "max"]`，`""` 表示 provider default；deepseek-official 默认 `high`，qwen 路由默认 `""`。选项集依赖所选模型，客户端只渲染服务端返回的选项。
 - **切换模型失败要可恢复**：探针曾因 crash 把会话留在不可用模型（v3.2 → API 403 `Access to model denied`）导致后续 prompt 全部失败。App 端 set_config_option 成功后立即以服务端返回状态为准；失败时下次 prompt 用回原模型即可（每会话选择独立持久）。
 
-#### P0 实测记录（2026-11-11，dsh 0.2.2-rc.1）
+### P0 实测记录（2026-11-11，dsh 0.2.2-rc.1）
 
 探针 `scripts/dsh/probe.py`，证据目录 `~/.local/state/pockethelm/dsh/probe-2026111*/`（不入库）。三轮：
 
@@ -56,7 +56,47 @@
 2. **分页遍**（probe-20261111-014530，15 步全绿）：profile patch `sessionListPageSize: 2` 后 12 个持久会话分 6 页走完 keyset 闭环，无重复、无遗漏、顺序 createdAt 倒序；同时确认 patch 替换语义（见上）。
 3. **真实回合遍**（probe-20261111-015114，14 步全绿）：qwen-token-plan-cn 路由 + `deepseek-v4.1-flash-1017`（用户既有 plan 凭据，最便宜 flash 档，单轮"回复 ok"成本 < $0.001，费用依据见风险节）；`stopReason: "end_turn"`，updates 序列 `agent_message_chunk → usage_update`；set_config_option 切换/恢复闭环（21 模型目录）；`promptCapabilities.image: true`。
 
-未在 E2E 触发、按计划转移的项目：单在途 prompt 拒绝（flash 模型单轮过快，P2 假服务 JVM 测试覆盖；错误原文 `a prompt is already in flight for this session` 已源码确认）；`session/request_permission`（默认预设未触发，P3 真机再验，ACP 客户端需实现该 server→client 请求的应答通道）。
+未在 E2E 触发、按计划转移的项目：`session/request_permission`（默认预设未触发，P3 真机再验，ACP 客户端需实现该 server→client 请求的应答通道）。单在途 prompt 拒绝原计划移交 P2 假服务，但 review 复测轮（probe-20261111-063014）中"数数"任务在途窗口足够长，第二个 prompt 实测收到 `-32602 Invalid params: a prompt is already in flight for this session`，E2E 断言已通过，P2 假服务测试仍保留作为确定性覆盖。
+
+### P0 review（2026-11-11）
+
+#### R1 expected-error 状态掩盖断言失败
+
+- 状态：已关闭。
+- 位置：`scripts/dsh/probe.py` `Probe.step`。触发条件：三个反向断言步骤（invalid-cursor / resume-cwd-mismatch / prompt-no-provider）中服务端错误地**接受**非法输入时，步骤内 `require` 抛 ProbeFailure 被标为 `expected-error`，不计入 failed，探针退出 0。影响：反向断言失效被静默掩盖（本轮三跑未实际触发，掩盖路径存在）。
+- 修复验收要求：删除 expected 机制，失败口径只认 `error`；重跑全绿。
+- 修复与验证：`step` 去掉 expected 参数，负面步骤的预期内化在函数内（拒绝→返回 payload=ok；接受→require 抛错=error）；`grep -c expected-error` = 0；协议遍复测（probe-20261111-062955）14 步全绿。
+- Codex 复查结论：掩盖路径消除，语义正确。
+
+#### R2 set_config 切换生效只记录不断言
+
+- 状态：已关闭。
+- 位置：`_set_config`。触发条件：`set_config_option` 成功返回但 `currentValue` 未变化。影响：切换失效静默通过——与 v3.2 事故教训（切换后必须核对）直接冲突。
+- 修复验收要求：改为 `require` 并在真实路由下复测。
+- 修复与验证：已改 `require`；真实回合遍复测（probe-20261111-063014）set-config-option 步骤通过（qwen 路由 21 模型目录，切换/恢复闭环）。
+- Codex 复查结论：断言恢复，路径实测。
+
+#### R3 wire.jsonl 与 stdin 跨线程写入无锁
+
+- 状态：已关闭。
+- 位置：`AcpClient._record` / `_send_raw`（reader 线程回 server 请求与主线程 request 并发）。影响：极端时证据文件行交错或 stdin 帧交错。本轮未观察到（46/46 行可解析），属证据完整性预防修复。
+- 修复验收要求：加 `_io_lock`，且不得引入重入死锁；复测 wire 逐行可解析。
+- 修复与验证：`_io_lock` 保护日志帧与 stdin 写；首次修复曾引入 `_send_raw` 持锁调 `_record` 的重入死锁，review 时当场发现并改为内联帧构造；复测 wire.jsonl 72/72 行可解析。
+- Codex 复查结论：锁正确（单一临界区，不自嵌套）。
+
+#### R4 boot 固定 10s 等待代替完成判断
+
+- 状态：已关闭。
+- 位置：`_boot`。违反全局约定"不用固定 sleep 替代完成判断"；真正就绪门是 initialize 响应。
+- 修复验收要求：改为有界早期退出检测 + initialize 作为就绪门；boot 步骤时间显著下降且全绿。
+- 修复与验证：早期退出检测窗口 2s（诊断用），就绪由 initialize 响应把关；复测 boot 10.0s → 2.0s，全绿。
+- Codex 复查结论：符合约定。
+
+#### R5 记录性限制（不修）
+
+- `--provider` 派生的 `apiKeyEnv` 名仅对 `qwen-token-plan-cn` 验证过；真实密钥来自凭据服务（`.credentials.yaml`），`apiKeyEnv` 是惰性回退。P1 部署配置直接写明实际 provider 名。
+- 探针对所有 server→client 请求回 `-32601`：真实回合若触发 `request_permission` 等于自动拒绝；属 P0 边界，P3 真机验证应答通道。
+- P0 记录中的三轮证据目录为修复前运行；review 复测证据为 `probe-20261111-062955`（协议遍）与 `probe-20261111-063014`（真实回合遍，含 E2E 并发拒绝实测）。
 
 ## 分阶段实施与验证
 
@@ -121,7 +161,7 @@
 ## 实现与验证
 
 - 改动摘要与关键文件：P0 新增 `scripts/dsh/probe.py`（ACP 换行分帧 JSON-RPC 客户端 + 14 步探针：initialize/创建/列表分页/配置切换/resume/close/prompt/EOF 退出，支持 `--run-turn`、`--provider/--model`、`--page-size`、`--keep-home`，证据落盘 `~/.local/state/pockethelm/dsh/`）；任务文档映射表按实测修订。
-- 代码版本或源码快照标识：分支 `feat-dsh-acp-engine`（基于 5150a6d / 0.4.29），P0 提交含未提交快照见提交记录；dsh 版本 0.2.2-rc.1（`dsh --version` 已存证）。
+- 代码版本或源码快照标识：分支 `feat-dsh-acp-engine`（基于 5150a6d / 0.4.29）；P0 提交 784632d，review 修复为随后提交（见 git log）；dsh 版本 0.2.2-rc.1（`dsh --version` 已存证）。
 - 自动化检查：`python3 scripts/dsh/probe.py` 三轮（无凭据协议遍 / `--page-size 2` 分页遍 / `--provider qwen-token-plan-cn --model deepseek-v4.1-flash-1017 --run-turn` 真实回合遍）全部 `failed steps: 0`；证据目录 `probe-20261111-013502 / -014530 / -015114`（wire.jsonl、summary.json、dsh-stderr.log、initialize/session-new 结果 JSON）。既有 Codex/ZCode 套件未受影响（P0 无产品代码改动），P1 完成后按 G1 重跑。
 - 真机环境：设备代号、Android 版本、应用版本、包名。（待填）
 - 真机验证：步骤、预期、实际结果、证据位置。（待填）
@@ -131,7 +171,7 @@
 
 ## Review
 
-（待实现完成后集中 review，问题按编号记录。）
+P0 集中 review 见「P0 review」节（R1–R5）。整体结论：R1–R4 修复并复测通过，R5 记录在案，P0 review 通过。后续阶段 review 问题在下方按编号追加。
 
 ## 发布或完成
 
